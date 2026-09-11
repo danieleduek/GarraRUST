@@ -229,8 +229,11 @@ enum Commands {
         #[arg(long, short = 'u')]
         url: Option<String>,
 
-        /// Per-turn LLM call timeout in seconds. Default 120, range [1, 600].
-        /// On timeout the turn is discarded and the REPL keeps running.
+        /// Per-turn **inactivity** timeout in seconds. Default 120, range
+        /// [1, 600]. The clock is rearmed by every streamed event, so a slow
+        /// but live turn is never cut off — only a provider that goes
+        /// silent for the whole window trips it. On timeout the turn is
+        /// discarded and the REPL keeps running.
         #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=600))]
         timeout_secs: u64,
 

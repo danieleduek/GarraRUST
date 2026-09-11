@@ -139,17 +139,24 @@ impl ErrorCard {
         }
     }
 
-    /// O turno estourou o tempo do proprio GarraIA (nao do provedor).
+    /// O turno estourou o prazo de **inatividade** do proprio GarraIA (nao do
+    /// provedor): ficou `timeout_secs` inteiros sem receber um unico evento.
+    ///
+    /// O texto fala em silencio, e nao em duracao, porque o prazo
+    /// passou a ser rearmado a cada `TurnEvent` — um turno longo mas vivo nao
+    /// cai mais aqui. Quem cai aqui tem um provedor mudo, e a terceira acao
+    /// aponta para o comando que diz qual.
     pub fn timeout_local(timeout_secs: u64) -> Self {
         Self {
             titulo: "Tempo esgotado".to_string(),
             detalhe: format!(
-                "A resposta passou de {timeout_secs}s e foi descartada. O histórico da \
-                 conversa continua intacto."
+                "O provedor ficou {timeout_secs}s sem mandar nada e o turno foi \
+                 descartado. O histórico da conversa continua intacto."
             ),
             acoes: vec![
                 "Tente de novo".to_string(),
                 format!("--timeout-secs <n> para esperar mais que {timeout_secs}s"),
+                "garra doctor para checar provedor, credencial e daemon local".to_string(),
             ],
         }
     }
@@ -336,6 +343,13 @@ mod tests {
         assert!(c.detalhe.contains("120s"), "{}", c.detalhe);
         assert!(c.detalhe.contains("histórico"), "{}", c.detalhe);
         assert!(c.acoes.iter().any(|a| a.contains("--timeout-secs")));
+        // O card precisa apontar para onde se descobre *por que* o
+        // provedor emudeceu, senao o usuario so sabe aumentar o numero.
+        assert!(
+            c.acoes.iter().any(|a| a.contains("garra doctor")),
+            "{:?}",
+            c.acoes
+        );
     }
 
     #[test]
