@@ -968,9 +968,14 @@ enum TurnOutcome<T, E> {
 /// polled during the call — draining only after completion deadlocks the
 /// producer once the buffer fills (the original `garra chat` hang).
 ///
-/// Returns `TurnOutcome::TimedOut` on timeout. In every path the call future
-/// is dropped before the final drain, which closes the sender side so the
-/// drain terminates once buffered deltas are consumed.
+/// `timeout` e um prazo de **inatividade**, nao de duracao total do turno
+///: cada `TurnEvent` recebido rearma o relogio, e so uma janela
+/// inteira sem nenhum evento devolve `TurnOutcome::TimedOut`. Um turno que
+/// leva dez minutos mas segue emitindo token nunca e descartado; um stream
+/// que morreu no meio cai no prazo como antes. Em todo caminho o future da
+/// chamada e descartado antes da drenagem final, o que fecha o lado do sender
+/// para que a drenagem termine assim que os deltas bufferizados forem
+/// consumidos.
 ///
 /// # Indicador de atividade
 ///
@@ -1002,7 +1007,19 @@ async fn stream_turn<F, T, E>(
 where
     F: Future<Output = std::result::Result<T, E>>,
 {
-    let mut call = Box::pin(tokio::time::timeout(timeout, call));
+    // O prazo e de **inatividade**, nao de duracao total do turno.
+    //
+    // Ate aqui o turno inteiro vinha embrulhado num `tokio::time::timeout`,
+    // entao um turno saudavel que simplesmente demorasse mais que o limite era
+    // descartado no meio do stream — exatamente o caso de um modelo local
+    // grande (o default do Ollama e um 27B de ~18 GB) ou de um turno agentico
+    // com varias voltas de ferramenta. O `stream_turn` sempre quis pegar
+    // *stream morto* (ver o teste `stream_turn_times_out_and_flushes_buffered_deltas`,
+    // que simula com `future::pending`), e stream morto e ausencia de evento —
+    // nao tempo de parede. Cada `TurnEvent` que chega rearma o prazo.
+    let mut call = Box::pin(call);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
     let mut rx_open = true;
 
     // O primeiro tick de `interval` dispara imediatamente; quem segura a
@@ -1024,10 +1041,11 @@ where
     // travamento original do `garra chat`, e é o invariante 1 da ADR 0017.
     let result = loop {
         tokio::select! {
-            r = &mut call => break match r {
-                Ok(inner) => TurnOutcome::Done(inner),
-                Err(_elapsed) => TurnOutcome::TimedOut,
-            },
+            r = &mut call => break TurnOutcome::Done(r),
+            // Prazo de inatividade estourado: nenhum `TurnEvent` chegou dentro
+            // da janela. O `drop(call)` logo abaixo fecha o sender e encerra o
+            // turno; os deltas ja bufferizados ainda sao drenados.
+            _ = &mut deadline => break TurnOutcome::TimedOut,
             // Cancelamento do turno, sinalizado pelo vigia de SIGINT criado em
             // `run_chat`. Sem este braço o Ctrl+C matava o processo inteiro no
             // meio do stream, levando junto o histórico da sessão.
@@ -1041,7 +1059,14 @@ where
                 renderer.handle(UiEvent::ActivityTick, out);
             }
             maybe = rx.recv(), if rx_open => match maybe {
-                Some(evento) => render_turn_event(&evento, renderer, tool_log, out),
+                Some(evento) => {
+                    // Sinal de vida: o turno esta progredindo, entao o prazo
+                    // de inatividade recomeca do zero.
+                    deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + timeout);
+                    render_turn_event(&evento, renderer, tool_log, out);
+                }
                 None => rx_open = false,
             },
         }
@@ -2495,6 +2520,83 @@ mod tests {
 
         assert_eq!(outcome, TurnOutcome::TimedOut);
         assert_eq!(String::from_utf8(out).expect("utf8"), "partial ");
+    }
+
+    /// O prazo e de inatividade, nao de duracao total do turno.
+    ///
+    /// Este turno leva 400ms com uma janela de 100ms — sob a regra antiga
+    /// (`timeout` em volta do turno inteiro) ele era descartado no meio do
+    /// stream, que e exatamente o que acontecia com modelo local grande e com
+    /// turno agentico de varias voltas. Como o maior silencio e de 40ms, o
+    /// prazo nunca fecha e o turno chega ao fim.
+    #[tokio::test(start_paused = true)]
+    async fn stream_turn_nao_expira_enquanto_o_stream_estiver_vivo() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let call = async move {
+            for i in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                tx.send(TurnEvent::TextDelta(format!("d{i} ")))
+                    .await
+                    .map_err(|_| "receiver dropped")?;
+            }
+            Ok::<String, &'static str>("completo".to_string())
+        };
+
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = stream_turn(
+            call,
+            rx,
+            std::time::Duration::from_millis(100),
+            &mut out,
+            &mut test_renderer(None),
+            &mut ToolLog::new(),
+            &tokio::sync::Notify::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, TurnOutcome::Done(Ok("completo".to_string())));
+        let printed = String::from_utf8(out).expect("utf8");
+        for i in 0..10 {
+            assert!(printed.contains(&format!("d{i}")), "faltou o delta d{i}");
+        }
+    }
+
+    /// O outro lado da mesma regra: silencio de uma janela inteira ainda
+    /// expira, mesmo depois de o turno ter dado sinal de vida. Sem esta
+    /// garantia o prazo de inatividade viraria "sem prazo nenhum".
+    #[tokio::test(start_paused = true)]
+    async fn stream_turn_expira_quando_o_stream_emudece_no_meio() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let call = async move {
+            for i in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                tx.send(TurnEvent::TextDelta(format!("d{i} ")))
+                    .await
+                    .map_err(|_| "receiver dropped")?;
+            }
+            // Emudece: o provedor morreu no meio do stream.
+            std::future::pending::<()>().await;
+            Ok::<String, &'static str>("inalcancavel".to_string())
+        };
+
+        let mut out: Vec<u8> = Vec::new();
+        let outcome = stream_turn(
+            call,
+            rx,
+            std::time::Duration::from_millis(100),
+            &mut out,
+            &mut test_renderer(None),
+            &mut ToolLog::new(),
+            &tokio::sync::Notify::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, TurnOutcome::TimedOut);
+        // Os deltas que chegaram antes do silencio continuam na tela.
+        assert!(
+            String::from_utf8(out).expect("utf8").contains("d2"),
+            "deltas anteriores ao silencio devem sobreviver"
+        );
     }
 
     // ---- Ajuda para os testes do indicador de atividade -------------------
