@@ -1,4 +1,4 @@
-- **`garra chat` para de descartar turno saudavel no meio do stream (#1152).**
+- **`garra chat` para de descartar turno saudavel no meio do stream (#1).**
   `--timeout-secs` era prazo de duracao total do turno, entao um turno lento
   porem vivo — loop agentico com varias voltas de ferramenta, ou o modelo local
   default, um 27B de ~18 GB — era jogado fora aos 120s, e o texto ja impresso
