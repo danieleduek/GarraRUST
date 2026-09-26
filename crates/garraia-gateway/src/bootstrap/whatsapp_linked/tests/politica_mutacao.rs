@@ -769,3 +769,54 @@ fn remover_tira_de_todas_as_listas_e_e_idempotente() {
         "unowner"
     );
 }
+
+/// #1411: a matriz cobre web e memoria, alem de arquivos, MCP, shell,
+/// dispositivo e mensagem. Web e a ferramenta real (`web_fetch`); memoria e
+/// pela classe (`memory.read`/`memory.write`): no piso `search`, que nomeia
+/// o que libera, ela e falsa para todo mundo; no piso `code` do dono no pod
+/// ela segue o teto — e o dono nao tem teto.
+#[test]
+fn a_matriz_cobre_web_e_memoria() {
+    let s = secao(json!({
+        "owners": [DONO],
+        "access": { "users": { USUARIO: { "level": "read", "write": true } } }
+    }));
+    let de = |linhas: &[impacto::LinhaDaMatriz], principal: &str| {
+        linhas
+            .iter()
+            .find(|l| l.principal == principal)
+            .unwrap_or_else(|| panic!("{principal} ausente"))
+            .efetivo
+            .capacidades
+    };
+    // `standard`: todo mundo no piso `search` (nomeia `web_fetch`, nao memoria).
+    let padrao = impacto::matriz(&settings_de(&s), ExecutionProfile::Standard);
+    let dono = de(&padrao, "dono");
+    assert!(dono.web, "{dono:?}");
+    assert!(!dono.memoria_leitura && !dono.memoria_escrita, "{dono:?}");
+    let usuario = de(&padrao, "usuario");
+    assert!(usuario.web && usuario.leitura, "{usuario:?}");
+    assert!(
+        !usuario.memoria_leitura && !usuario.memoria_escrita,
+        "{usuario:?}"
+    );
+    assert!(
+        !usuario.escrita,
+        "read+write no piso search continua sem escrita: {usuario:?}"
+    );
+    // `isolated-pod`: o dono 1:1 sobe ao piso `code`, sem teto — memoria vem
+    // junto; o usuario continua no piso `search`.
+    let pod = impacto::matriz(&settings_de(&s), ExecutionProfile::IsolatedPod);
+    let dono = de(&pod, "dono");
+    assert!(
+        dono.web && dono.memoria_leitura && dono.memoria_escrita && dono.shell,
+        "{dono:?}"
+    );
+    let usuario = de(&pod, "usuario");
+    assert!(!usuario.memoria_leitura && !usuario.shell, "{usuario:?}");
+    // Os nomes ligados carregam as colunas novas, na ordem da tabela.
+    let nomes = dono.ligadas();
+    for esperado in ["web", "memoria leitura", "memoria escrita"] {
+        assert!(nomes.contains(&esperado), "{nomes:?}");
+    }
+}

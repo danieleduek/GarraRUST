@@ -637,8 +637,9 @@ channels:
   alvo `…1234`, resumo antes/depois — nunca identidade inteira, chave ou
   mensagem; rotacao por tamanho, `audit_max_bytes` na secao). Toda mutacao
   aceita `--dry-run`: imprime o que mudaria e o **impacto por principal**
-  (o que ganha e perde: escrita de arquivo, shell, dispositivo, mensagem,
-  MCP), calculado pelo motor real, sem gravar nem auditar. `access audit`
+  (o que ganha e perde: leitura e escrita de arquivo, web, memoria, shell,
+  dispositivo, mensagem, MCP leitura e escrita — #1411), calculado pelo
+  motor real, sem gravar nem auditar. `access audit`
   le a trilha.
 - **Pela API admin (e o Web Console).** `GET /admin/api/whatsapp/access`
   devolve o mesmo documento de `access --json` (mais `hot_reload`);
@@ -655,7 +656,8 @@ channels:
 - **Pelo Web Console.** A pagina **WhatsApp Access** (`/admin` → sidebar)
   mostra o resumo, a admissao, o default do desconhecido, os grupos, o
   formulario "Add phone / identity" e a matriz por principal (piso, nivel,
-  write, o que pode de fato), com seletor de nivel, toggle de write,
+  write, o que pode de fato: arquivos, web, memoria, shell, dispositivo,
+  mensagem, MCP), com seletor de nivel, toggle de write,
   Block/Unblock, Make owner/Demote, Remove e "Reset to safe defaults" — e
   a trilha de audit. **Toda mudanca passa por um preview** (as mudancas e
   o que cada principal ganha e perde, calculados pelo motor) antes de
