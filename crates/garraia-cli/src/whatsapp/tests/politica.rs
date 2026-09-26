@@ -655,3 +655,169 @@ fn audit_lista_mais_recente_primeiro_e_e_vazio_sem_arquivo() {
         0
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1414: os comandos legados tambem auditam
+// ---------------------------------------------------------------------------
+
+/// Um evento por escrita que de fato mudou algo, com o nome do subcomando
+/// como acao, `cli` como origem e o alvo mascarado — nunca a identidade.
+fn ultimo_evento(ctx: &Context, acao: &str) -> auditoria::Evento {
+    let eventos = audit(ctx);
+    let e = eventos.first().cloned().expect("ha evento");
+    assert_eq!(e.acao, acao);
+    assert_eq!(e.origem, "cli");
+    assert_eq!(e.alvo.as_deref(), Some("…8888"));
+    assert!(!e.ator.is_empty(), "quem rodou o comando");
+    e
+}
+
+/// A entrada de `…8888` no resumo `depois` de um evento.
+fn entrada_no_depois(e: &auditoria::Evento) -> Option<serde_json::Value> {
+    e.depois["users"]
+        .as_array()
+        .and_then(|us| us.iter().find(|u| u["alvo"] == "…8888").cloned())
+}
+
+/// `allow` e `remove` gravam `allow` por fora do motor de mutacao — e ate a
+/// #1414 gravavam SEM audit. Agora cada escrita que muda algo deixa um
+/// evento; a repeticao idempotente (nada mudou) nao deixa nada.
+#[test]
+fn allow_e_remove_legados_auditam_com_o_nome_do_subcomando() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = preparar(&dir, serde_json::json!({}));
+    let p = ScriptedPrompter::default();
+
+    assert_eq!(
+        run(Action::Allow(pedido(ENTRADA, false, false)), &ctx, &p),
+        0
+    );
+    assert_eq!(lista(&ctx, "allow"), vec![NUMERO.to_string()]);
+    let e = ultimo_evento(&ctx, "allow");
+    assert_eq!(audit(&ctx).len(), 1);
+    let entrada = entrada_no_depois(&e).expect("…8888 no depois");
+    assert_eq!(entrada["owner"], serde_json::json!(false));
+    assert!(
+        entrada_no_depois(&auditoria::Evento {
+            depois: e.antes.clone(),
+            ..e.clone()
+        })
+        .is_none(),
+        "no antes …8888 ainda nao existia"
+    );
+
+    // De novo: ja estava, nada mudou, nada e auditado.
+    assert_eq!(
+        run(Action::Allow(pedido(ENTRADA, false, false)), &ctx, &p),
+        0
+    );
+    assert_eq!(audit(&ctx).len(), 1, "o que nao mudou nao e auditado");
+
+    assert_eq!(run(Action::Remove(remocao(ENTRADA, false)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "remove");
+    assert_eq!(audit(&ctx).len(), 2);
+    assert!(entrada_no_depois(&e).is_none(), "saiu: {}", e.depois);
+
+    // Remover quem nao esta: sai 0 e nao audita.
+    assert_eq!(run(Action::Remove(remocao(ENTRADA, false)), &ctx, &p), 0);
+    assert_eq!(audit(&ctx).len(), 2);
+
+    let bruto = arquivo_de_audit(&ctx);
+    assert!(!bruto.contains(NUMERO), "audit com numero inteiro: {bruto}");
+}
+
+/// `owner` e `unowner` idem: `owner` (so no pod) e `unowner` deixam o nome do
+/// subcomando, e o `depois` diz o papel que ficou.
+#[test]
+fn owner_e_unowner_legados_auditam_com_o_nome_do_subcomando() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, false);
+    grava_config(
+        &ctx,
+        pod(),
+        Some(serde_json::json!({ "allow": [NUMERO] })),
+        Some(true),
+    );
+    let p = ScriptedPrompter::default();
+
+    assert_eq!(run(Action::Owner(papel(ENTRADA, true)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "owner");
+    assert_eq!(audit(&ctx).len(), 1);
+    assert_eq!(
+        entrada_no_depois(&e).expect("…8888")["owner"],
+        serde_json::json!(true)
+    );
+    // Ja era dono: nada muda, nada e auditado.
+    assert_eq!(run(Action::Owner(papel(ENTRADA, true)), &ctx, &p), 0);
+    assert_eq!(audit(&ctx).len(), 1);
+
+    assert_eq!(run(Action::Unowner(papel(ENTRADA, true)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "unowner");
+    assert_eq!(audit(&ctx).len(), 2);
+    let entrada = entrada_no_depois(&e).expect("o acesso sobrevive ao rebaixamento");
+    assert_eq!(entrada["owner"], serde_json::json!(false));
+    // Nao era mais dono: nada muda, nada e auditado.
+    assert_eq!(run(Action::Unowner(papel(ENTRADA, true)), &ctx, &p), 0);
+    assert_eq!(audit(&ctx).len(), 2);
+
+    let bruto = arquivo_de_audit(&ctx);
+    assert!(!bruto.contains(NUMERO), "audit com numero inteiro: {bruto}");
+}
+
+/// `allow --owner` e o subcomando `allow`: a acao e `allow`, e e o resumo
+/// `depois` que diz que o alvo entrou como dono.
+#[test]
+fn allow_owner_audita_como_allow_e_o_depois_diz_dono() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, false);
+    grava_config(&ctx, pod(), Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default();
+    assert_eq!(run(Action::Allow(pedido(ENTRADA, true, true)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "allow");
+    assert_eq!(
+        entrada_no_depois(&e).expect("…8888")["owner"],
+        serde_json::json!(true)
+    );
+    assert!(!arquivo_de_audit(&ctx).contains(NUMERO));
+}
+
+/// A recusa (65) e o cancelamento nao auditam — nada foi gravado.
+#[test]
+fn comandos_legados_recusados_nao_auditam() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = preparar(&dir, serde_json::json!({ "owners": [NUMERO] }));
+    let p = ScriptedPrompter::default();
+    assert_eq!(
+        run(Action::Allow(pedido("abc", false, false)), &ctx, &p),
+        acesso::EX_DATAERR
+    );
+    assert_eq!(
+        run(Action::Remove(remocao(ENTRADA, false)), &ctx, &p),
+        acesso::EX_USAGE,
+        "dono sem terminal e sem --yes"
+    );
+    assert!(audit(&ctx).is_empty());
+    assert!(!ctx.data_dir.join(auditoria::ARQUIVO).exists());
+}
+
+/// O mesmo contrato dos comandos novos: a mudanca gravada com o audit
+/// indisponivel sai 73 — a config ficou, e o operador fica sabendo.
+#[test]
+fn comando_legado_com_audit_indisponivel_grava_e_sai_73() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = preparar(&dir, serde_json::json!({}));
+    // Um ARQUIVO onde o audit quer um diretorio: `registrar` nao consegue
+    // criar `audit/`.
+    std::fs::create_dir_all(&ctx.data_dir).expect("data dir");
+    std::fs::write(ctx.data_dir.join("audit"), b"no lugar do diretorio").expect("arquivo");
+    let p = ScriptedPrompter::default();
+    assert_eq!(
+        run(Action::Allow(pedido(ENTRADA, false, false)), &ctx, &p),
+        73
+    );
+    assert_eq!(
+        lista(&ctx, "allow"),
+        vec![NUMERO.to_string()],
+        "a mudanca foi gravada mesmo assim"
+    );
+}

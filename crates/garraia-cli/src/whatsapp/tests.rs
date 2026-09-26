@@ -1610,7 +1610,9 @@ fn autorizar_numa_instalacao_nova_cria_a_secao_sem_ligar_o_canal() {
     let loader = ctx.loader.as_ref().expect("loader");
 
     assert_eq!(
-        autorizar(loader, NUMERO, Papel::Autorizado).expect("grava"),
+        autorizar(loader, NUMERO, Papel::Autorizado)
+            .expect("grava")
+            .0,
         Gravado::Novo
     );
     let secao = secao_de(&ctx).expect("secao criada");
@@ -1650,11 +1652,15 @@ fn autorizar_num_upgrade_preserva_tudo_e_nao_duplica() {
     let loader = ctx.loader.as_ref().expect("loader");
 
     assert_eq!(
-        autorizar(loader, NUMERO, Papel::Autorizado).expect("grava"),
+        autorizar(loader, NUMERO, Papel::Autorizado)
+            .expect("grava")
+            .0,
         Gravado::Novo
     );
     assert_eq!(
-        autorizar(loader, "5511900000001", Papel::Autorizado).expect("grava"),
+        autorizar(loader, "5511900000001", Papel::Autorizado)
+            .expect("grava")
+            .0,
         Gravado::JaEstava,
         "o que ja estava, em outra grafia, nao duplica"
     );
@@ -1824,11 +1830,15 @@ fn autorizar_nao_duplica_o_celular_com_e_sem_o_nono_digito() {
     let ctx = ctx_in(&dir, false);
     let loader = ctx.loader.as_ref().expect("loader");
     assert_eq!(
-        autorizar(loader, "5531999998888", Papel::Autorizado).expect("grava"),
+        autorizar(loader, "5531999998888", Papel::Autorizado)
+            .expect("grava")
+            .0,
         Gravado::Novo
     );
     assert_eq!(
-        autorizar(loader, "553199998888", Papel::Autorizado).expect("grava"),
+        autorizar(loader, "553199998888", Papel::Autorizado)
+            .expect("grava")
+            .0,
         Gravado::JaEstava
     );
     assert_eq!(lista(&ctx, "allow"), vec!["5531999998888".to_string()]);
@@ -2193,7 +2203,8 @@ fn remove_casa_pela_chave_do_portao_e_sai_das_duas_listas() {
         None,
     );
 
-    let (fora, depois) = remover(loader, "5531999998888").expect("remove");
+    let (fora, gravada) = remover(loader, "5531999998888").expect("remove");
+    let depois = acesso_da_config(&gravada);
     assert_eq!((fora.de_allow, fora.de_owners), (1, 1));
     assert!(fora.era_dono());
     assert!(lista(&ctx, "allow").is_empty());
@@ -2216,7 +2227,8 @@ fn remover_numa_config_sem_a_secao_nao_cria_nem_escreve() {
     let loader = ctx.loader.as_ref().expect("loader");
     loader.ensure_dirs().expect("dirs");
 
-    let (fora, depois) = remover(loader, NUMERO).expect("remove");
+    let (fora, gravada) = remover(loader, NUMERO).expect("remove");
+    let depois = acesso_da_config(&gravada);
     assert_eq!(fora.total(), 0);
     assert_eq!(depois.autorizados, 0);
     assert!(secao_de(&ctx).is_none());
@@ -2390,7 +2402,8 @@ fn promover_grava_em_owners_e_e_idempotente() {
         Some(true),
     );
 
-    let (promovido, depois) = promover(loader, NUMERO).expect("promover");
+    let (promovido, gravada) = promover(loader, NUMERO).expect("promover");
+    let depois = acesso_da_config(&gravada);
     assert_eq!(
         promovido,
         Promovido::Novo {
@@ -2427,7 +2440,8 @@ fn promover_quem_nao_estava_autorizado_avisa_que_deu_acesso() {
     let loader = ctx.loader.as_ref().expect("loader");
     grava_config(&ctx, pod(), None, None);
 
-    let (promovido, depois) = promover(loader, NUMERO).expect("promover");
+    let (promovido, gravada) = promover(loader, NUMERO).expect("promover");
+    let depois = acesso_da_config(&gravada);
     assert_eq!(
         promovido,
         Promovido::Novo {
@@ -2458,7 +2472,8 @@ fn rebaixar_preserva_o_acesso_movendo_a_entrada_para_allow() {
         Some(true),
     );
 
-    let (rebaixado, depois) = rebaixar(loader, NUMERO).expect("rebaixar");
+    let (rebaixado, gravada) = rebaixar(loader, NUMERO).expect("rebaixar");
+    let depois = acesso_da_config(&gravada);
     assert_eq!(
         rebaixado,
         Rebaixado::Feito {
@@ -2514,7 +2529,8 @@ fn rebaixar_copia_a_entrada_como_ela_estava_gravada() {
     );
     assert_eq!(lista(&ctx, "owners"), vec![LID.to_string()]);
 
-    let (rebaixado, depois) = rebaixar(loader, LID).expect("rebaixar");
+    let (rebaixado, gravada) = rebaixar(loader, LID).expect("rebaixar");
+    let depois = acesso_da_config(&gravada);
     assert_eq!(
         rebaixado,
         Rebaixado::Feito {
@@ -2540,7 +2556,8 @@ fn rebaixar_quem_ja_estava_em_allow_nao_duplica_a_entrada() {
         None,
     );
 
-    let (rebaixado, depois) = rebaixar(loader, "553199998888").expect("rebaixar");
+    let (rebaixado, gravada) = rebaixar(loader, "553199998888").expect("rebaixar");
+    let depois = acesso_da_config(&gravada);
     assert_eq!(
         rebaixado,
         Rebaixado::Feito {
@@ -2561,7 +2578,8 @@ fn rebaixar_quem_nao_e_dono_nao_escreve_nada() {
     let loader = ctx.loader.as_ref().expect("loader");
     loader.ensure_dirs().expect("dirs");
 
-    let (rebaixado, depois) = rebaixar(loader, NUMERO).expect("rebaixar");
+    let (rebaixado, gravada) = rebaixar(loader, NUMERO).expect("rebaixar");
+    let depois = acesso_da_config(&gravada);
     assert_eq!(rebaixado, Rebaixado::NaoEra);
     assert_eq!(depois.autorizados, 0);
     assert!(secao_de(&ctx).is_none());

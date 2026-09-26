@@ -26,7 +26,7 @@ use garraia_gateway::bootstrap::whatsapp_linked_politica::visao::{
 };
 use garraia_gateway::bootstrap::whatsapp_linked_politica::{Admission, Alcance, auditoria};
 use garraia_gateway::bootstrap::{
-    WHATSAPP_LINKED_CONFIG_KEY as CONFIG_KEY, whatsapp_linked_settings,
+    WHATSAPP_LINKED_CONFIG_KEY as CONFIG_KEY, WhatsAppLinkedSettings, whatsapp_linked_settings,
 };
 
 use super::acesso::{
@@ -36,7 +36,7 @@ use super::{Context, EX_CANCELLED, EX_SOFTWARE, Lang, t, tb};
 use crate::wizard::prompts::Prompter;
 
 /// Mudanca gravada, audit nao (sysexits `EX_CANTCREAT`).
-const EX_CANTCREAT: i32 = 73;
+pub(crate) const EX_CANTCREAT: i32 = 73;
 
 /// `garraia whatsapp access <subcomando>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +126,65 @@ fn teto_do_audit(config: &AppConfig) -> u64 {
         .unwrap_or(auditoria::MAX_BYTES_DEFAULT)
 }
 
+/// O evento de uma mudanca JA gravada, no audit local: origem `cli`, o
+/// usuario do SO como ator, o alvo mascarado por `Evento::novo` e o resumo
+/// antes/depois pelo mesmo leitor do gateway. `Err` traz a mensagem do SO;
+/// quem chama decide como avisar.
+fn registrar_evento(
+    ctx: &Context,
+    acao: &str,
+    alvo: Option<&str>,
+    antes: &WhatsAppLinkedSettings,
+    depois: &WhatsAppLinkedSettings,
+    teto: u64,
+) -> Result<(), String> {
+    let evento = auditoria::Evento::novo("cli", &ator(), acao, alvo, antes, depois);
+    auditoria::registrar(&ctx.data_dir, &evento, teto)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// A frase de "gravou, mas o audit nao" — a MESMA em todos os comandos que
+/// mexem no acesso, para o operador reconhecer o estado de longe.
+pub(crate) fn aviso_de_audit_falhou(lang: Lang, erro: &str) -> String {
+    match lang {
+        Lang::Pt => format!(
+            "A mudanca foi gravada, mas o audit local nao: {erro} (arquivo `{}`).",
+            auditoria::ARQUIVO
+        ),
+        Lang::En => format!(
+            "The change was written, but the local audit was not: {erro} (file `{}`).",
+            auditoria::ARQUIVO
+        ),
+    }
+}
+
+/// Audita uma mudanca que um comando LEGADO ja gravou por fora do motor de
+/// mutacao — `allow`, `remove`, `owner`, `unowner` e o passo pos-QR do `link`
+/// (#1414).
+///
+/// Ate a #1414 esses comandos gravavam `allow`/`owners` sem deixar rastro, e
+/// a trilha de `access audit` so contava metade da historia. O evento e o
+/// MESMO que [`aplicar`] grava — `acao` e o nome do subcomando, `antes` e
+/// `depois` sao as duas configs (a lida e a gravada), resumidas pelo mesmo
+/// leitor do gateway, e o alvo sai mascarado (`…1234`). Falha vira o mesmo
+/// aviso e o mesmo exit 73 (`Err`, ja impresso): a mudanca ficou, o audit
+/// nao, e o operador tem de saber.
+pub(crate) fn auditar(
+    ctx: &Context,
+    acao: &str,
+    alvo: &str,
+    antes: &AppConfig,
+    depois: &AppConfig,
+) -> Result<(), i32> {
+    let de = whatsapp_linked_settings(antes);
+    let para = whatsapp_linked_settings(depois);
+    registrar_evento(ctx, acao, Some(alvo), &de, &para, teto_do_audit(depois)).map_err(|erro| {
+        eprintln!("{}", aviso_de_audit_falhou(ctx.lang, &erro));
+        EX_CANTCREAT
+    })
+}
+
 /// Aplica uma mutacao a config em disco (ou so simula, com `dry_run`).
 ///
 /// Carrega, aplica pelo motor, calcula o impacto e — fora do `dry_run` e so
@@ -166,16 +225,15 @@ pub fn aplicar(ctx: &Context, mutacao: &Mutacao, dry_run: bool) -> Result<Aplica
         return Err(EX_SOFTWARE);
     }
     aplicacao.gravou = true;
-    let evento = auditoria::Evento::novo(
-        "cli",
-        &ator(),
+    if let Err(erro) = registrar_evento(
+        ctx,
         mutacao.acao(),
         mutacao.alvo(),
         &antes,
         &depois,
-    );
-    if let Err(e) = auditoria::registrar(&ctx.data_dir, &evento, teto_do_audit(&config)) {
-        aplicacao.audit_falhou = Some(e.to_string());
+        teto_do_audit(&config),
+    ) {
+        aplicacao.audit_falhou = Some(erro);
     }
     Ok(aplicacao)
 }
@@ -688,19 +746,7 @@ fn executar(ctx: &Context, prompter: &dyn Prompter, comando: &ComandoDeAcesso) -
         }
     }
     if let Some(erro) = &aplicacao.audit_falhou {
-        eprintln!(
-            "{}",
-            match ctx.lang {
-                Lang::Pt => format!(
-                    "A mudanca foi gravada, mas o audit local nao: {erro} (arquivo `{}`).",
-                    auditoria::ARQUIVO
-                ),
-                Lang::En => format!(
-                    "The change was written, but the local audit was not: {erro} (file `{}`).",
-                    auditoria::ARQUIVO
-                ),
-            }
-        );
+        eprintln!("{}", aviso_de_audit_falhou(ctx.lang, erro));
         return Ok(EX_CANTCREAT);
     }
     Ok(0)

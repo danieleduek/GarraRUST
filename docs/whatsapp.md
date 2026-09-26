@@ -96,11 +96,11 @@ apaga nada: ele valida e responde `✓ Sessão encontrada e válida`.
 | `garraia doctor whatsapp [--json] [--strict]` | o caminho inteiro numa passada: vinculo, chave da sessao, gateway e ponte, acesso, perfil de execucao, workspace, MCP visivel no piso, provider — cada linha com o proximo passo, no vocabulario do `/api/diagnostics` (#1419) | 0 tudo verde · 2 aviso com `--strict` · 69 algo vermelho |
 | `garraia whatsapp logout` | apaga a sessao e desliga o canal | 0 · 1 cancelado |
 | `garraia whatsapp restore` | devolve o `session.enc.prev` ao lugar | 0 · 69 nao ha arquivada, ou ha sessao em uso · 70 erro interno |
-| `garraia whatsapp allow <numero> [--owner] [--yes]` | autoriza um numero a falar com o GarraIA; funciona sem terminal | 0 · 1 cancelado · 64 `--owner` fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido (inclusive `*`, ver abaixo) · 70 config ilegivel |
+| `garraia whatsapp allow <numero> [--owner] [--yes]` | autoriza um numero a falar com o GarraIA; funciona sem terminal | 0 · 1 cancelado · 64 `--owner` fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido (inclusive `*`, ver abaixo) · 70 config ilegivel · 73 gravou mas o audit falhou |
 | `garraia whatsapp users [--json]` | lista quem esta autorizado: papel (`allow`/`owners`) e os quatro ultimos digitos de cada identidade | 0 · 70 config ilegivel |
-| `garraia whatsapp remove <numero> [--yes]` | revoga o acesso: tira a identidade de `allow` **e** de `owners`; dono exige confirmacao | 0 (inclusive quem nao estava na lista) · 1 cancelado · 64 dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel |
-| `garraia whatsapp owner <numero> [--yes]` | promove a DONO: grava em `owners`, a mesma escrita do `allow --owner` | 0 (inclusive quem ja era dono) · 1 cancelado · 64 fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel |
-| `garraia whatsapp unowner <numero> [--yes]` | tira o papel de DONO **sem** tirar o acesso; o ultimo dono exige confirmacao | 0 (inclusive quem nao era dono) · 1 cancelado · 64 ultimo dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel |
+| `garraia whatsapp remove <numero> [--yes]` | revoga o acesso: tira a identidade de `allow` **e** de `owners`; dono exige confirmacao | 0 (inclusive quem nao estava na lista) · 1 cancelado · 64 dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel · 73 gravou mas o audit falhou |
+| `garraia whatsapp owner <numero> [--yes]` | promove a DONO: grava em `owners`, a mesma escrita do `allow --owner` | 0 (inclusive quem ja era dono) · 1 cancelado · 64 fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel · 73 gravou mas o audit falhou |
+| `garraia whatsapp unowner <numero> [--yes]` | tira o papel de DONO **sem** tirar o acesso; o ultimo dono exige confirmacao | 0 (inclusive quem nao era dono) · 1 cancelado · 64 ultimo dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel · 73 gravou mas o audit falhou |
 | `garraia whatsapp access [--json] [--reveal]` | a politica efetiva inteira (ADR 0025): admissao, default do desconhecido, grupos e cada principal com piso, nivel e o que pode de fato — pelo MESMO `ToolGate` do turno; identidades so por `…1234`, `--reveal` mostra os valores da config (local) | 0 · 70 config ilegivel |
 | `garraia whatsapp access open [--yes] [--dry-run]` / `access restricted` | troca a admissao; `open` avisa (QUALQUER numero passa a entrar, com o default) e pede confirmacao | 0 · 1 cancelado · 64 `open` sem terminal e sem `--yes` · 70 |
 | `garraia whatsapp access default chat\|read [--write] [--dry-run]` | o que um desconhecido recebe em `open` (`full` e recusado; guardado mesmo em `restricted`) | 0 · 65 combinacao invalida · 70 |
@@ -589,7 +589,12 @@ channels:
   aceita `--dry-run`: imprime o que mudaria e o **impacto por principal**
   (o que ganha e perde: escrita de arquivo, shell, dispositivo, mensagem,
   MCP), calculado pelo motor real, sem gravar nem auditar. `access audit`
-  le a trilha.
+  le a trilha. Os comandos legados `allow`, `remove`, `owner` e `unowner`
+  tambem vao para o mesmo audit (#1414), com o nome do subcomando como acao
+  — so quando a escrita mudou algo, e com o mesmo exit 73 quando a mudanca
+  ficou gravada mas o audit falhou. O passo pos-QR do `link` e a mesma
+  escrita do `allow` e audita do mesmo jeito, mas la o audit indisponivel so
+  avisa: o vinculo valeu, e o exit continua 0.
 - **Pela API admin (e o Web Console).** `GET /admin/api/whatsapp/access`
   devolve o mesmo documento de `access --json` (mais `hot_reload`);
   `POST /admin/api/whatsapp/access` com `{ "action": "level", "identity":

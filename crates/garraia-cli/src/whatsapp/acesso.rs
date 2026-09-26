@@ -417,22 +417,36 @@ fn contem_em(secao: &ChannelConfig, chave: &str, alvo: &str) -> bool {
 ///
 /// Nunca remove: quem revoga e [`remover`] (#1394), e o gateway rele a lista
 /// a quente.
-pub fn autorizar(loader: &ConfigLoader, numero: &str, papel: Papel) -> Result<Gravado> {
+///
+/// Devolve tambem a config **como foi gravada** (ou como foi lida, quando
+/// nada mudou): e dela que o chamador tira o estado depois e o `depois` do
+/// audit (#1414), sem reler o arquivo — pela mesma razao do [`remover`].
+pub fn autorizar(
+    loader: &ConfigLoader,
+    numero: &str,
+    papel: Papel,
+) -> Result<(Gravado, AppConfig)> {
     loader.ensure_dirs()?;
     // Sem a env do perfil: ela nao vai ao disco (`#[serde(skip)]`) e nao
     // decide nada aqui — so o `--owner` depende dela, e ja foi validado.
     let mut config = loader.load_sem_env()?;
-    let secao = secao_criando(&mut config)?;
-    let itens = lista_mut(secao, papel.chave())?;
-    // A mesma chave que o portao compara: `+55 31 99999-8888` ja cobre
-    // `553199998888` (o nono digito, ver [`chave_do_portao`]).
-    let alvo = chave_do_portao(numero);
-    if contem(itens, &alvo) {
-        return Ok(Gravado::JaEstava);
+    let gravado = {
+        let secao = secao_criando(&mut config)?;
+        let itens = lista_mut(secao, papel.chave())?;
+        // A mesma chave que o portao compara: `+55 31 99999-8888` ja cobre
+        // `553199998888` (o nono digito, ver [`chave_do_portao`]).
+        let alvo = chave_do_portao(numero);
+        if contem(itens, &alvo) {
+            Gravado::JaEstava
+        } else {
+            itens.push(serde_json::Value::String(numero.to_string()));
+            Gravado::Novo
+        }
+    };
+    if gravado == Gravado::Novo {
+        loader.save(&config)?;
     }
-    itens.push(serde_json::Value::String(numero.to_string()));
-    loader.save(&config)?;
-    Ok(Gravado::Novo)
+    Ok((gravado, config))
 }
 
 /// Quantas entradas sairam de cada lista (#1394).
@@ -472,13 +486,14 @@ impl Remocao {
 /// nao e reescrito. Como todo `save`, comentarios do `config.yml` nao
 /// sobrevivem a uma remocao que de fato grava.
 ///
-/// Devolve tambem o [`Acesso`] **depois** da remocao, calculado da config que
-/// acabou de ir ao disco. Reler o arquivo para descobrir se o portao ficou
-/// vazio custava uma leitura que pode falhar bem no momento em que o operador
-/// mais precisa do aviso — e engolir esse `Err` esconderia, de uma so vez,
-/// "ninguem mais esta autorizado" e "a config ficou ilegivel logo depois de
-/// eu grava-la".
-pub fn remover(loader: &ConfigLoader, numero: &str) -> Result<(Remocao, Acesso)> {
+/// Devolve tambem a config **depois** da remocao — a que acabou de ir ao
+/// disco —, de onde o chamador tira o [`Acesso`] (via [`acesso_da_config`])
+/// e o `depois` do audit (#1414). Reler o arquivo para descobrir se o portao
+/// ficou vazio custava uma leitura que pode falhar bem no momento em que o
+/// operador mais precisa do aviso — e engolir esse `Err` esconderia, de uma
+/// so vez, "ninguem mais esta autorizado" e "a config ficou ilegivel logo
+/// depois de eu grava-la".
+pub fn remover(loader: &ConfigLoader, numero: &str) -> Result<(Remocao, AppConfig)> {
     loader.ensure_dirs()?;
     let mut config = loader.load_sem_env()?;
     let alvo = chave_do_portao(numero);
@@ -504,8 +519,8 @@ pub fn remover(loader: &ConfigLoader, numero: &str) -> Result<(Remocao, Acesso)>
     if fora.total() > 0 {
         loader.save(&config)?;
     }
-    // Do MESMO `config` que foi gravado: e o estado que o gateway vai ler.
-    Ok((fora, acesso_da_config(&config)))
+    // O MESMO `config` que foi gravado: e o estado que o gateway vai ler.
+    Ok((fora, config))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,9 +554,9 @@ pub enum Promovido {
 /// estava ganha acesso pela uniao, e o [`Promovido::Novo`] diz isso ao
 /// chamador para a tela avisar.
 ///
-/// Devolve o [`Acesso`] **depois**, calculado da config que acabou de ir ao
-/// disco — sem reler o arquivo, pela mesma razao do [`remover`].
-pub fn promover(loader: &ConfigLoader, numero: &str) -> Result<(Promovido, Acesso)> {
+/// Devolve a config **depois** — a que acabou de ir ao disco —, sem reler o
+/// arquivo, pela mesma razao do [`remover`].
+pub fn promover(loader: &ConfigLoader, numero: &str) -> Result<(Promovido, AppConfig)> {
     loader.ensure_dirs()?;
     let mut config = loader.load_sem_env()?;
     let alvo = chave_do_portao(numero);
@@ -561,7 +576,7 @@ pub fn promover(loader: &ConfigLoader, numero: &str) -> Result<(Promovido, Acess
     if matches!(promovido, Promovido::Novo { .. }) {
         loader.save(&config)?;
     }
-    Ok((promovido, acesso_da_config(&config)))
+    Ok((promovido, config))
 }
 
 /// O desfecho de [`rebaixar`].
@@ -593,8 +608,9 @@ pub enum Rebaixado {
 /// digito) continua sendo o que o `config.yml` mostra.
 ///
 /// Nao cria secao e nao escreve quando nao havia o que rebaixar. `enabled` nao
-/// e tocado, como em [`autorizar`] e [`remover`].
-pub fn rebaixar(loader: &ConfigLoader, numero: &str) -> Result<(Rebaixado, Acesso)> {
+/// e tocado, como em [`autorizar`] e [`remover`]. Devolve a config **depois**,
+/// como os tres.
+pub fn rebaixar(loader: &ConfigLoader, numero: &str) -> Result<(Rebaixado, AppConfig)> {
     loader.ensure_dirs()?;
     let mut config = loader.load_sem_env()?;
     let alvo = chave_do_portao(numero);
@@ -624,7 +640,7 @@ pub fn rebaixar(loader: &ConfigLoader, numero: &str) -> Result<(Rebaixado, Acess
     if matches!(rebaixado, Rebaixado::Feito { .. }) {
         loader.save(&config)?;
     }
-    Ok((rebaixado, acesso_da_config(&config)))
+    Ok((rebaixado, config))
 }
 
 // ---------------------------------------------------------------------------
@@ -804,13 +820,14 @@ pub fn allow(ctx: &Context, prompter: &dyn Prompter, pedido: &Pedido) -> i32 {
     };
 
     let antes = acesso_da_config(&config);
-    match autorizar(loader, &numero, papel) {
-        Ok(gravado) => imprimir_gravado(ctx.lang, &numero, papel, gravado),
+    let (gravado, depois) = match autorizar(loader, &numero, papel) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
             return EX_SOFTWARE;
         }
-    }
+    };
+    imprimir_gravado(ctx.lang, &numero, papel, gravado);
     if antes.enabled {
         println!("{}", dica_do_gateway(ctx.lang, true, ctx.gateway_pid));
     } else {
@@ -822,6 +839,14 @@ pub fn allow(ctx: &Context, prompter: &dyn Prompter, pedido: &Pedido) -> i32 {
                 "The channel is not on yet: link WhatsApp with `{bin} whatsapp link`.",
             )
         );
+    }
+    // #1414: so o que mudou vai para o audit — `allow` repetido nao e evento.
+    // `allow --owner` continua sendo o subcomando `allow`; o resumo `depois`
+    // do evento e que diz que o alvo entrou como dono.
+    if gravado == Gravado::Novo
+        && let Err(code) = super::politica::auditar(ctx, "allow", &numero, &config, &depois)
+    {
+        return code;
     }
     0
 }
@@ -1095,7 +1120,7 @@ pub fn remove(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoRemocao) ->
         }
     }
 
-    let (fora, depois) = match remover(loader, &numero) {
+    let (fora, gravada) = match remover(loader, &numero) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
@@ -1114,11 +1139,16 @@ pub fn remove(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoRemocao) ->
     //
     // So o canal ligado precisa de dica: num canal desligado nao ha turno em
     // andamento para a remocao alcancar.
+    let depois = acesso_da_config(&gravada);
     if depois.enabled {
         if depois.autorizados == 0 {
             println!("{}", aviso_ninguem_autorizado(ctx.lang));
         }
         println!("{}", dica_do_gateway(ctx.lang, true, ctx.gateway_pid));
+    }
+    // #1414: a revogacao vai para o mesmo audit das mutacoes novas.
+    if let Err(code) = super::politica::auditar(ctx, "remove", &numero, &config, &gravada) {
+        return code;
     }
     0
 }
@@ -1258,7 +1288,7 @@ pub fn owner(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoDePapel) -> 
         }
     }
 
-    let (promovido, depois) = match promover(loader, &numero) {
+    let (promovido, gravada) = match promover(loader, &numero) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
@@ -1269,7 +1299,7 @@ pub fn owner(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoDePapel) -> 
     if matches!(promovido, Promovido::Novo { .. }) {
         println!("{}", nota_do_poder_de_dono(ctx.lang));
     }
-    if depois.enabled {
+    if acesso_da_config(&gravada).enabled {
         println!("{}", dica_do_gateway(ctx.lang, true, ctx.gateway_pid));
     } else {
         println!(
@@ -1280,6 +1310,12 @@ pub fn owner(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoDePapel) -> 
                 "The channel is not on yet: link WhatsApp with `{bin} whatsapp link`.",
             )
         );
+    }
+    // #1414: promover e evento; quem ja era dono nao mudou nada.
+    if matches!(promovido, Promovido::Novo { .. })
+        && let Err(code) = super::politica::auditar(ctx, "owner", &numero, &config, &gravada)
+    {
+        return code;
     }
     0
 }
@@ -1336,7 +1372,7 @@ pub fn unowner(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoDePapel) -
         }
     }
 
-    let (rebaixado, depois) = match rebaixar(loader, &numero) {
+    let (rebaixado, gravada) = match rebaixar(loader, &numero) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
@@ -1347,9 +1383,11 @@ pub fn unowner(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoDePapel) -
     if !matches!(rebaixado, Rebaixado::Feito { .. }) {
         // Nada mudou no disco: mandar reiniciar (ou explicar o hot reload)
         // logo depois de "nada mudou" so sugeriria que havia o que aplicar.
-        // Mesma saida do `remove` quando o numero nao estava na lista.
+        // Mesma saida do `remove` quando o numero nao estava na lista — e,
+        // como la, nada a auditar.
         return 0;
     }
+    let depois = acesso_da_config(&gravada);
     if depois.donos == 0 {
         println!(
             "{}",
@@ -1358,6 +1396,11 @@ pub fn unowner(ctx: &Context, prompter: &dyn Prompter, pedido: &PedidoDePapel) -
     }
     if depois.enabled {
         println!("{}", dica_do_gateway(ctx.lang, true, ctx.gateway_pid));
+    }
+    // #1414: o rebaixamento vai para o audit — e o `depois` do evento mostra
+    // que o acesso ficou (`owner: false`, sem sair da lista).
+    if let Err(code) = super::politica::auditar(ctx, "unowner", &numero, &config, &gravada) {
+        return code;
     }
     0
 }
@@ -1545,12 +1588,20 @@ pub fn pos_link(
         } else {
             Papel::Autorizado
         };
-        match autorizar(loader, &numero, papel) {
-            Ok(gravado) => imprimir_gravado(ctx.lang, &numero, papel, gravado),
+        let (gravado, depois) = match autorizar(loader, &numero, papel) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("{e}");
                 return Err(EX_SOFTWARE);
             }
+        };
+        imprimir_gravado(ctx.lang, &numero, papel, gravado);
+        // #1414: e a MESMA escrita do `allow`, entao e o mesmo evento. Aqui o
+        // audit indisponivel nao muda o exit: o vinculo em si valeu, e o
+        // `init` (#1430) le qualquer saida diferente de 0 como "nao vinculou".
+        if gravado == Gravado::Novo {
+            // O aviso da falha ja saiu em stderr.
+            let _ = super::politica::auditar(ctx, "allow", &numero, &config, &depois);
         }
     }
 
