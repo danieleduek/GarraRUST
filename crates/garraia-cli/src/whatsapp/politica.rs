@@ -30,7 +30,8 @@ use garraia_gateway::bootstrap::{
 };
 
 use super::acesso::{
-    EX_DATAERR, EX_USAGE, carregar, dica_do_gateway, final4, normalizar_numero, secao_criando,
+    EX_DATAERR, EX_USAGE, MensagemDeNumero, carregar, dica_do_gateway, final4, normalizar_numero,
+    secao_criando,
 };
 use super::{Context, EX_CANCELLED, EX_SOFTWARE, Lang, t, tb};
 use crate::wizard::prompts::Prompter;

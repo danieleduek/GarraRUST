@@ -701,7 +701,14 @@ channels:
   `default`, `level`, `write`, `block`, `unblock`, `groups`, `group-default`,
   `group`, `reset`) aplica pelo mesmo motor e devolve `changed`, `changes`,
   `impact` (o que cada principal ganha e perde), `audit` e a politica
-  resultante; `GET /admin/api/whatsapp/access/audit?limit=N` le a trilha.
+  resultante. `identity` passa pela **mesma validacao da CLI** (#1403):
+  `+` e codigo do pais obrigatorios, 6 a 15 digitos, formatos BR/US com
+  espacos, hifens e parenteses aceitos, ou `<digitos>@lid`; invalida da
+  `400` com `error` e um `error_code` estavel
+  (`identity_missing_country_code`, `identity_invalid_character`,
+  `identity_wildcard`, `identity_leading_zero`, `identity_length`,
+  `identity_is_jid`, `identity_empty`) — sem o `+` nao ha como saber se o
+  codigo do pais veio, e um numero gravado sem ele nunca casa com o remetente; `GET /admin/api/whatsapp/access/audit?limit=N` le a trilha.
   Cookie do `/admin` + CSRF; leitura para `viewer`, mutacao para quem tem
   `Channels/Update`. A API nunca revela identidade. O `/api/diagnostics`
   (`whatsapp.access`) avisa quando a admissao esta `open` e quando a secao

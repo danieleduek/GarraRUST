@@ -69,6 +69,8 @@ pub use whatsapp::build_whatsapp_channels;
 /// tabela, entao console e terminal nunca discordam sobre o mesmo fato.
 pub use whatsapp_linked::doctor as whatsapp_linked_doctor;
 pub use whatsapp_linked::motivo_da_recusa as whatsapp_linked_motivo_da_recusa;
+/// #1403: a validacao de numero, uma so, para a CLI e a API admin.
+pub use whatsapp_linked::numero as whatsapp_linked_numero;
 /// ADR 0025 (#1388): a Access Policy v2 do canal — `PoliticaDeAcesso`,
 /// `Principal`, `Alcance`, `principal_do_turno`, `teto_do_principal`. E o
 /// MESMO motor que o turno usa; a CLI, a API admin e o Web Console leem e

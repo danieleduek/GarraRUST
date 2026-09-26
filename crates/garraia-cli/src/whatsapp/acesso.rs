@@ -39,6 +39,7 @@
 
 use anyhow::{Result, bail};
 use garraia_config::{AppConfig, ChannelConfig, ConfigLoader, ExecutionProfile};
+use garraia_gateway::bootstrap::whatsapp_linked_politica::{Admission, Alcance};
 
 use super::{CONFIG_KEY, Context, EX_CANCELLED, EX_SOFTWARE, Lang, t, tb};
 use crate::wizard::prompts::Prompter;
@@ -56,29 +57,19 @@ const TENTATIVAS: usize = 3;
 // Numero
 // ---------------------------------------------------------------------------
 
-/// Por que um texto nao e um numero autorizavel.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NumeroInvalido {
-    Vazio,
-    /// Veio na forma `…@s.whatsapp.net` (ou qualquer JID que nao `<id>@lid`).
-    Jid,
-    /// Numero sem o `+` do codigo do pais.
-    SemMais,
-    /// Letra ou outro caractere fora de `+ -().` e espaco.
-    Caractere,
-    /// `*` (ou `+*`, `**`…): a tentativa de abrir o canal para todo mundo
-    /// (#1389). Nao existe hoje semantica de curinga — e o erro generico de
-    /// caractere fazia parecer erro de digitacao, e nao recurso inexistente.
-    Curinga,
-    /// Comeca com `0`: prefixo de discagem local, nao codigo de pais.
-    ZeroInicial,
-    /// Fora de 6 a 15 digitos.
-    Tamanho(usize),
+// #1403: a regra do numero vive no gateway (`whatsapp_linked_numero`) e vale
+// igual para a API admin e o console; a CLI re-exporta e so acrescenta a
+// frase no idioma do terminal.
+pub use garraia_gateway::bootstrap::whatsapp_linked_numero::{NumeroInvalido, normalizar_numero};
+
+/// A frase que o usuario le, no idioma do terminal. Nunca repete o que ele
+/// digitou. Trait de extensao porque o tipo mora no gateway (#1403).
+pub trait MensagemDeNumero {
+    fn mensagem(&self, lang: Lang) -> String;
 }
 
-impl NumeroInvalido {
-    /// A frase que o usuario le. Nunca repete o que ele digitou.
-    pub fn mensagem(&self, lang: Lang) -> String {
+impl MensagemDeNumero for NumeroInvalido {
+    fn mensagem(&self, lang: Lang) -> String {
         match self {
             Self::Vazio => t(lang, "O número está vazio.", "The number is empty.").to_string(),
             Self::Jid => t(
@@ -123,77 +114,6 @@ impl NumeroInvalido {
     }
 }
 
-/// Separadores que o numero pode trazer e que sao descartados.
-fn separador(c: char) -> bool {
-    matches!(c, ' ' | '-' | '.' | '(' | ')')
-}
-
-/// `*`, `**`, `+*`: a tentativa de dizer "todo mundo" (#1389).
-///
-/// So existe para o erro poder ser especifico. **Nao** e um passo em direcao
-/// ao curinga: a semantica de acesso aberto nao existe (depende da #1388), e
-/// enquanto nao existir a resposta certa e recusar dizendo o porque — e nao
-/// o `Caractere` generico, que faz um recurso inexistente parecer erro de
-/// digitacao.
-fn e_curinga(s: &str) -> bool {
-    let corpo = s.strip_prefix('+').unwrap_or(s);
-    !corpo.is_empty() && corpo.chars().all(|c| c == '*')
-}
-
-/// `<digitos>@lid`, exatamente: o LID que a ponte entrega quando o servidor
-/// nao manda o numero junto.
-fn e_lid_valido(s: &str) -> bool {
-    s.strip_suffix("@lid")
-        .is_some_and(|id| (6..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Normaliza um numero digitado para a forma que o portao do canal compara.
-///
-/// Pura. `Ok` e so digitos, com codigo do pais, 6 a 15 de comprimento — ou
-/// um `<digitos>@lid` como veio — e e byte a byte o que
-/// `whatsapp_linked_normalizar_identidade` do gateway devolve para a mesma
-/// entrada (um teste prende isso).
-pub fn normalizar_numero(raw: &str) -> Result<String, NumeroInvalido> {
-    let s = raw.trim();
-    if s.is_empty() {
-        return Err(NumeroInvalido::Vazio);
-    }
-    if e_curinga(s) {
-        return Err(NumeroInvalido::Curinga);
-    }
-    if e_lid_valido(s) {
-        return Ok(garraia_gateway::bootstrap::whatsapp_linked_normalizar_identidade(s));
-    }
-    if s.contains('@') {
-        return Err(NumeroInvalido::Jid);
-    }
-    let Some(corpo) = s.strip_prefix('+') else {
-        return Err(if s.chars().all(|c| c.is_ascii_digit() || separador(c)) {
-            NumeroInvalido::SemMais
-        } else {
-            NumeroInvalido::Caractere
-        });
-    };
-    let mut digitos = String::with_capacity(corpo.len());
-    for c in corpo.chars() {
-        if c.is_ascii_digit() {
-            digitos.push(c);
-        } else if !separador(c) {
-            return Err(NumeroInvalido::Caractere);
-        }
-    }
-    if digitos.is_empty() {
-        return Err(NumeroInvalido::Vazio);
-    }
-    if digitos.starts_with('0') {
-        return Err(NumeroInvalido::ZeroInicial);
-    }
-    if !(6..=15).contains(&digitos.len()) {
-        return Err(NumeroInvalido::Tamanho(digitos.len()));
-    }
-    Ok(garraia_gateway::bootstrap::whatsapp_linked_normalizar_identidade(&digitos))
-}
-
 /// Os quatro ultimos digitos — a unica parte de um numero (ou de um LID,
 /// antes do `@lid`) que a CLI imprime.
 pub fn final4(numero: &str) -> &str {
@@ -222,6 +142,11 @@ pub struct Acesso {
     /// do gateway admite.
     pub autorizados: usize,
     pub donos: usize,
+    /// ADR 0025 (#1399): `restricted` | `open` — o que decide se um numero
+    /// que NAO esta na lista entra.
+    pub admissao: Admission,
+    /// O alcance de um desconhecido quando a admissao e `open`.
+    pub default: Alcance,
 }
 
 /// Le o acesso pelo MESMO leitor que o gateway usa no turno.
@@ -231,6 +156,8 @@ pub fn acesso_da_config(config: &AppConfig) -> Acesso {
         enabled: s.enabled,
         autorizados: s.autorizados(),
         donos: s.donos(),
+        admissao: s.access.admission,
+        default: s.access.default,
     }
 }
 
@@ -959,11 +886,32 @@ pub fn linhas_de_acesso(lang: Lang, acesso: Acesso) -> Vec<String> {
         }
         .to_string(),
         linha_de_contagens(lang, acesso),
+        linha_de_admissao(lang, acesso),
     ];
-    if acesso.enabled && acesso.autorizados == 0 {
+    // Com a admissao aberta ninguem "fica sem resposta": o aviso de portao
+    // vazio so vale para `restricted`.
+    if acesso.enabled && acesso.autorizados == 0 && acesso.admissao != Admission::Open {
         out.push(aviso_ninguem_autorizado(lang));
     }
     out
+}
+
+/// "Admissao: restrita" ou "Admissao: ABERTA — desconhecido recebe X" (#1399):
+/// o `status` tem de dizer se um numero fora da lista entra, e com o que.
+fn linha_de_admissao(lang: Lang, acesso: Acesso) -> String {
+    match (lang, acesso.admissao) {
+        (Lang::Pt, Admission::Open) => format!(
+            "Admissão: ABERTA — qualquer número entra com o default `{}` (`{{bin}} whatsapp access` mostra a política)",
+            acesso.default
+        ),
+        (Lang::Pt, _) => "Admissão: restrita (só quem você autorizar)".to_string(),
+        (Lang::En, Admission::Open) => format!(
+            "Admission: OPEN — any number gets in with the default `{}` (`{{bin}} whatsapp access` shows the policy)",
+            acesso.default
+        ),
+        (Lang::En, _) => "Admission: restricted (only who you authorize)".to_string(),
+    }
+    .replace("{bin}", &crate::binario::nome())
 }
 
 /// "Autorizados: N · Donos: M" — a UNICA copia do literal.
@@ -1029,6 +977,10 @@ pub fn json_de_usuarios(acesso: Acesso, usuarios: &[Autorizado]) -> serde_json::
         "enabled": acesso.enabled,
         "authorized": acesso.autorizados,
         "owners": acesso.donos,
+        // #1399: a admissao e o default do desconhecido, com as chaves da
+        // secao `access` (`admission`, `default.level`/`default.write`).
+        "admission": acesso.admissao.as_str(),
+        "default_access": { "level": acesso.default.nivel.as_str(), "write": acesso.default.write },
         "users": usuarios
             .iter()
             .map(|u| serde_json::json!({

@@ -208,9 +208,60 @@ async fn a_api_admin_le_muda_e_audita_pelo_mesmo_motor_da_cli() {
         "dry_run nao audita"
     );
 
+    // ── #1403: `identity` sem `+` e recusada com codigo estavel, sem gravar;
+    // formato US com parenteses e hifens e aceito e gravado so em digitos ──
+    let mut req = pedido("level");
+    req.identity = Some("21 98888-7777".to_string());
+    req.level = Some("read".to_string());
+    let (status, doc) = corpo(
+        admin_whatsapp_access_mutate(
+            State(admin_state.clone()),
+            HeaderMap::new(),
+            admin(Role::Admin),
+            Json(req),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{doc}");
+    assert_eq!(
+        doc["error_code"],
+        serde_json::json!("identity_missing_country_code"),
+        "{doc}"
+    );
+    assert!(
+        !doc["error"].as_str().unwrap_or_default().contains("98888"),
+        "o erro nao repete a entrada: {doc}"
+    );
+    let mut req = pedido("level");
+    req.identity = Some("+1 (415) 555-0100".to_string());
+    req.level = Some("read".to_string());
+    // Preview: prova a normalizacao sem gravar nem auditar (o bloco seguinte
+    // conta exatamente um evento de audit).
+    req.dry_run = true;
+    let (status, doc) = corpo(
+        admin_whatsapp_access_mutate(
+            State(admin_state.clone()),
+            HeaderMap::new(),
+            admin(Role::Admin),
+            Json(req),
+        )
+        .await
+        .into_response(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    let texto = doc.to_string();
+    assert!(
+        texto.contains("…0100"),
+        "o numero US entra normalizado e mascarado: {texto}"
+    );
+    assert!(!texto.contains("14155550100"), "{texto}");
+
     // ── POST real: grava, audita com origem admin_api e ator = username ──
     let mut req = pedido("level");
-    req.identity = Some(NUMERO.to_string());
+    req.identity = Some(format!("+{NUMERO}"));
     req.level = Some("read".to_string());
     let (status, doc) = corpo(
         admin_whatsapp_access_mutate(
@@ -295,7 +346,7 @@ async fn a_api_admin_le_muda_e_audita_pelo_mesmo_motor_da_cli() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let mut req = pedido("block");
-    req.identity = Some(ESTRANHO.to_string());
+    req.identity = Some(format!("+{ESTRANHO}"));
     let (status, _) = corpo(
         admin_whatsapp_access_mutate(
             State(admin_state.clone()),
@@ -398,7 +449,7 @@ async fn a_api_admin_le_muda_e_audita_pelo_mesmo_motor_da_cli() {
     assert!(s.e_dono(NUMERO), "virou dono por role");
     // Duas identidades com o mesmo final: 409, e nada muda.
     let mut req = pedido("level");
-    req.identity = Some("5521999998888".to_string());
+    req.identity = Some("+55 21 99999-8888".to_string());
     req.level = Some("chat".to_string());
     let (status, _) = corpo(
         admin_whatsapp_access_mutate(
@@ -442,7 +493,7 @@ async fn a_api_admin_le_muda_e_audita_pelo_mesmo_motor_da_cli() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "final que ninguem tem");
     // unowner preserva o acesso; remove tira de tudo.
     let mut req = pedido("unowner");
-    req.identity = Some(NUMERO.to_string());
+    req.identity = Some(format!("+{NUMERO}"));
     let (status, _) = corpo(
         admin_whatsapp_access_mutate(
             State(admin_state.clone()),
@@ -456,7 +507,7 @@ async fn a_api_admin_le_muda_e_audita_pelo_mesmo_motor_da_cli() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let mut req = pedido("remove");
-    req.identity = Some(NUMERO.to_string());
+    req.identity = Some(format!("+{NUMERO}"));
     let (status, doc) = corpo(
         admin_whatsapp_access_mutate(
             State(admin_state.clone()),
