@@ -72,6 +72,9 @@ use super::config::channel_gates;
 use super::execution::politica_de_execucao;
 
 // ADR 0025 §4: Access Policy v2 — principal, nivel, teto.
+/// #1419/#1420: o motor do `doctor whatsapp` — a tabela pura que a CLI e o
+/// card "Test WhatsApp" do Web Console rodam.
+pub mod doctor;
 pub mod politica;
 pub mod rejeicoes;
 pub use politica::{
