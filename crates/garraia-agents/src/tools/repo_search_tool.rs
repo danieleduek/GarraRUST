@@ -118,6 +118,17 @@ const MARCAS_DE_REPO: &[&str] = &[".git", ".hg", ".svn", ".jj"];
 /// para olhar" (EACCES num diretorio sem permissao de leitura), e confundir
 /// os dois faria a recusa pegar um repositorio de verdade. Na duvida a tool
 /// nao recusa e busca, que e exatamente o comportamento de antes da #1380.
+/// O diretorio do PROCESSO e (ou esta dentro de) um repositorio? E a mesma
+/// pergunta que [`recusa_sem_repositorio`] faz antes de varrer — exposta para
+/// o registro de capacidades (#1416) dizer, ANTES de o modelo tentar, se o
+/// `repo_search` de uma sessao sem `working_dir` teria onde buscar. So
+/// `stat`s; nunca falha (CWD ilegivel = "nao").
+pub fn processo_em_repositorio() -> bool {
+    std::env::current_dir()
+        .ok()
+        .is_some_and(|cwd| dentro_de_repositorio(&cwd))
+}
+
 fn dentro_de_repositorio(dir: &Path) -> bool {
     dir.ancestors().any(|d| {
         MARCAS_DE_REPO

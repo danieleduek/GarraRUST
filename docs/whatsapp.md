@@ -281,7 +281,15 @@ Detalhes do que e feito:
 > `not_configured`), motivo e remediacao — e o prompt manda o modelo
 > responder a partir dela: `denied` e "existe e nao esta liberada aqui",
 > nunca "nao existe". O mesmo registro sai em `tools.capabilities` no
-> `/api/diagnostics` e em `GET /admin/api/capabilities` (#1381, #1387). E uma sessao
+> `/api/diagnostics` e em `GET /admin/api/capabilities` (#1381, #1387). **Falta de
+> contexto e um estado proprio (#1416):** `file_read`, `file_write` e `list_dir`
+> numa sessao **sem raiz nenhuma** (sem projeto selecionado, sem
+> `agent.file_roots` e sem workspace padrao) saem como `unavailable` com
+> `reason_code: no_roots`, e o `repo_search` sem repositorio (sem projeto, e o
+> diretorio do processo nao e um repositorio) como `no_repository` — nos dois
+> a remediacao e `/project <nome>`, do usuario da conversa, e nao do operador.
+> A politica vence: uma ferramenta que o piso ou o teto negam continua
+> `denied`, porque selecionar um projeto nao a liberaria. E uma sessao
 > **sem raiz nenhuma** para as file tools (sem diretorio de trabalho nem
 > `agent.file_roots`) recebe uma recusa propria e acionavel — "selecione um
 > projeto com `/project <nome>`" — em vez da recusa generica de caminho fora
