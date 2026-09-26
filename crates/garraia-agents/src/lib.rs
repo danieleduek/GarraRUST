@@ -19,6 +19,8 @@ pub mod memory_noise;
 pub mod memory_reindex;
 pub mod modes;
 pub mod multi_agent;
+/// #1438: observabilidade local de confiabilidade (ferramentas, MCP, canal).
+pub mod observabilidade;
 pub mod ollama;
 pub mod openai;
 pub mod orchestrator;

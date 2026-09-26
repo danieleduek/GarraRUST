@@ -54,6 +54,8 @@ mod fallback_local;
 mod mcp_no_runtime;
 mod metricas_de_memoria;
 mod nota_garra_status;
+/// #1438: o despacho alimenta o registro de confiabilidade.
+mod observabilidade;
 mod portao_e_fixtures;
 mod repo_search_git_e_recall;
 mod roteamento_e_fatos;

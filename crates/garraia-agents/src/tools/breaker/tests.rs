@@ -329,3 +329,40 @@ fn registro_por_sessao_isola_sessoes_e_expulsa_a_mais_antiga_no_teto() {
     r.registrar("c", "repo_search", &ToolOutput::success("achei"), t);
     assert!(r.abertas("c", t).is_empty());
 }
+
+/// #1438: `registrar` diz se ESTA saida abriu o breaker (fechado -> aberto) —
+/// e o que vira `breaker_opened` na observabilidade. Falha que so conta,
+/// falha com o breaker ja aberto, sucesso e confirmacao nao sao abertura.
+#[test]
+fn registrar_diz_so_a_transicao_de_fechado_para_aberto() {
+    let t = t0();
+    let mut b = Breaker::new();
+    b.abrir_turno(None);
+    let generica = ToolOutput::error("deu ruim do mesmo jeito");
+    assert!(!b.registrar("x", &generica, t), "a primeira so conta");
+    assert!(!b.registrar("x", &generica, t), "a segunda so conta");
+    assert!(b.registrar("x", &generica, t), "a terceira igual abre");
+    assert!(
+        !b.registrar("x", &generica, t),
+        "ja aberto: nao e outra abertura"
+    );
+    assert!(
+        !b.registrar("x", &ToolOutput::success("ok"), t),
+        "sucesso fecha"
+    );
+    assert!(
+        !b.registrar("x", &ToolOutput::confirmation_request("confirme"), t),
+        "confirmacao e neutra"
+    );
+    let timeout = ToolOutput::error(format!("{TIMEOUT_PREFIXO}lenta"));
+    assert!(b.registrar("lenta", &timeout, t), "timeout abre de uma vez");
+
+    let r = Breakers::new();
+    let sem_raiz = ToolOutput::error(NO_ROOTS_MESSAGE);
+    assert!(r.registrar("s", "file_read", &sem_raiz, t));
+    assert!(!r.registrar("s", "file_read", &sem_raiz, t));
+    assert!(
+        r.registrar("outra", "file_read", &sem_raiz, t),
+        "cada sessao tem o seu breaker"
+    );
+}
