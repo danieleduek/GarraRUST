@@ -94,6 +94,25 @@ pub async fn admin_capabilities(
         )),
         _ => None,
     };
+    // #1416: com `session_id`, o contexto e o DAQUELA sessao (tem
+    // `working_dir`?); sem sessao, so o que a instalacao garante (fonte das
+    // raizes) e nada sobre repositorio.
+    // Resolvido no boot, nunca por request.
+    let fonte = app.raizes_das_file_tools.fonte;
+    let contexto = match &resumo {
+        Some(r) => crate::capacidades_registro::contexto_de_arquivos(
+            fonte,
+            r.has_workspace.then_some(std::path::Path::new(".")),
+            garraia_agents::tools::repo_search_tool::processo_em_repositorio,
+        ),
+        None => crate::capacidades_registro::ContextoDaSessao {
+            tem_raiz: Some(!matches!(
+                fonte,
+                crate::bootstrap::FonteDasRaizesDasFileTools::SomenteSessao
+            )),
+            tem_repositorio: None,
+        },
+    };
     let linhas = registro(&Entradas {
         inventario: &inventario,
         permite: &permite,
@@ -101,6 +120,7 @@ pub async fn admin_capabilities(
         mcp: &mcp,
         bash_desligado,
         restrito: false,
+        contexto,
     });
     (
         StatusCode::OK,
@@ -109,6 +129,13 @@ pub async fn admin_capabilities(
             "session": sessao_json,
             "counts": contagens(&linhas),
             "capabilities": linhas,
+            // #1417: as ferramentas em pausa NESTA conversa (circuit breaker),
+            // com codigo e motivo — texto constante do modulo, sem caminho.
+            "breaker": query
+                .session_id
+                .as_deref()
+                .map(|sid| app.agents.estado_do_breaker(sid))
+                .unwrap_or_default(),
         })),
     )
 }

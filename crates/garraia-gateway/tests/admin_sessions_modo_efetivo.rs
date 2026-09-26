@@ -200,4 +200,7 @@ async fn sessoes_trazem_principal_modo_efetivo_e_projeto_sem_caminho() {
         doc["session"]["effective_mode"],
         serde_json::json!("search")
     );
+    // #1417: o painel da conversa traz o estado do breaker (vazio aqui).
+    assert!(doc["breaker"].is_array(), "{doc}");
+    assert_eq!(doc["breaker"].as_array().map(Vec::len), Some(0));
 }

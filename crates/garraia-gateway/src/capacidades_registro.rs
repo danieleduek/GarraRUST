@@ -96,6 +96,97 @@ pub struct Entradas<'a> {
     /// Turno restrito (#1347): nomes de servidor MCP caidos sao retidos —
     /// a linha sintetica do servidor sai como `mcp/*`.
     pub restrito: bool,
+    /// #1416: o que a SESSAO tem de contexto para as ferramentas que
+    /// dependem dele. `None` em cada campo = quem chama nao sabe (nao
+    /// inventa): a linha fica como o portao e a disponibilidade disserem.
+    pub contexto: ContextoDaSessao,
+}
+
+/// O contexto de sessao que decide se uma ferramenta REGISTRADA e
+/// PERMITIDA tem onde agir (#1416, #1381): raiz para as file tools,
+/// repositorio para o `repo_search`. E o "missing context" da #1387 — um
+/// estado distinto de negada (politica) e de nao configurada (instalacao):
+/// a remediacao e do usuario da conversa (`/project <nome>`), nao do
+/// operador.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextoDaSessao {
+    /// `Some(false)`: nenhuma raiz efetiva — sem `working_dir` na sessao e
+    /// sem raiz de config/workspace padrao. Ver [`contexto_de_arquivos`].
+    pub tem_raiz: Option<bool>,
+    /// `Some(false)`: sem `working_dir` e o diretorio do processo nao e um
+    /// repositorio — o `repo_search` recusaria de imediato.
+    pub tem_repositorio: Option<bool>,
+}
+
+impl ContextoDaSessao {
+    /// Nada se sabe: o registro nao muda nenhuma linha por contexto.
+    pub const DESCONHECIDO: ContextoDaSessao = ContextoDaSessao {
+        tem_raiz: None,
+        tem_repositorio: None,
+    };
+}
+
+/// Ferramentas nativas que nao fazem nada sem raiz (o mesmo `FileJail`).
+pub const PRECISAM_DE_RAIZ: &[&str] = &["file_read", "file_write", "list_dir"];
+/// Ferramentas nativas que nao fazem nada sem repositorio.
+pub const PRECISAM_DE_REPOSITORIO: &[&str] = &["repo_search"];
+
+/// Codigo de motivo de uma file tool sem raiz nenhuma.
+pub const NO_ROOTS: &str = "no_roots";
+/// Codigo de motivo do `repo_search` sem repositorio.
+pub const NO_REPOSITORY: &str = "no_repository";
+
+/// O contexto de arquivos de UMA sessao, a partir do que o boot resolveu
+/// para as raizes (`raizes_das_file_tools(config).fonte`) e do
+/// `working_dir` da sessao. Puro.
+///
+/// - `Declaradas` (`agent.file_roots`) e `WorkspacePadrao` (`<data_dir>/
+///   workspace/<sessao>`): toda sessao tem raiz, com ou sem projeto.
+/// - `SomenteSessao`: so a sessao com `working_dir` (projeto selecionado)
+///   tem raiz; as outras recebem `NO_ROOTS_MESSAGE` em toda chamada.
+///
+/// `cwd_em_repositorio` e consultado so quando nao ha `working_dir` — e o
+/// `stat` que o `repo_search` faria; o chamador passa a pergunta, nao o
+/// resultado, para o caminho comum (sessao com projeto) nao tocar o disco.
+pub fn contexto_de_arquivos(
+    fonte: crate::bootstrap::FonteDasRaizesDasFileTools,
+    working_dir: Option<&std::path::Path>,
+    cwd_em_repositorio: impl FnOnce() -> bool,
+) -> ContextoDaSessao {
+    use crate::bootstrap::FonteDasRaizesDasFileTools as Fonte;
+    let tem_working_dir = working_dir.is_some();
+    ContextoDaSessao {
+        tem_raiz: Some(tem_working_dir || !matches!(fonte, Fonte::SomenteSessao)),
+        tem_repositorio: Some(tem_working_dir || cwd_em_repositorio()),
+    }
+}
+
+/// A linha de "falta contexto" (#1416) para uma ferramenta permitida e
+/// disponivel, ou `None` quando o contexto basta (ou nao se sabe).
+fn falta_de_contexto(
+    nome: &str,
+    contexto: ContextoDaSessao,
+) -> Option<(&'static str, String, Option<String>)> {
+    if PRECISAM_DE_RAIZ.contains(&nome) && contexto.tem_raiz == Some(false) {
+        return Some((
+            NO_ROOTS,
+            "registrada e permitida, mas esta sessao nao tem raiz nenhuma para as file tools (sem projeto selecionado, sem `agent.file_roots` e sem workspace padrao): toda chamada seria recusada."
+                .to_string(),
+            Some(
+                "Selecione um projeto nesta conversa com `/project <nome>` (ou o operador declara `agent.file_roots`)."
+                    .to_string(),
+            ),
+        ));
+    }
+    if PRECISAM_DE_REPOSITORIO.contains(&nome) && contexto.tem_repositorio == Some(false) {
+        return Some((
+            NO_REPOSITORY,
+            "registrada e permitida, mas esta sessao nao tem repositorio para buscar (sem projeto selecionado, e o diretorio do processo nao e um repositorio): a busca seria recusada de imediato."
+                .to_string(),
+            Some("Selecione um projeto nesta conversa com `/project <nome>`.".to_string()),
+        ));
+    }
+    None
 }
 
 /// Nomes que o gateway considera acoes de canal (a origem vira `channel`).
@@ -159,12 +250,21 @@ pub fn registro(e: &Entradas<'_>) -> Vec<Capacidade> {
                 ),
                 Disponibilidade::Disponivel => {
                     if (e.permite)(&entrada.name) {
-                        (
-                            Estado::Visible,
-                            "ok",
-                            "disponivel neste turno.".to_string(),
-                            None,
-                        )
+                        // #1416: permitida e operacional, mas SEM o contexto
+                        // de que depende (raiz, repositorio) — e "falta
+                        // contexto", nao "negada": a remediacao e do usuario
+                        // da conversa, e o modelo tem de dizer isso.
+                        match falta_de_contexto(&entrada.name, e.contexto) {
+                            Some((codigo, motivo, remediacao)) => {
+                                (Estado::Unavailable, codigo, motivo, remediacao)
+                            }
+                            None => (
+                                Estado::Visible,
+                                "ok",
+                                "disponivel neste turno.".to_string(),
+                                None,
+                            ),
+                        }
                     } else {
                         (
                             Estado::Denied,
@@ -346,6 +446,7 @@ mod tests {
             mcp: &mcp,
             bash_desligado: Some(("sandbox desligado".into(), "ligue `agent.sandbox`".into())),
             restrito: false,
+            contexto: ContextoDaSessao::DESCONHECIDO,
         });
         assert_eq!(por_nome(&linhas, "file_read").state, Estado::Visible);
         let negada = por_nome(&linhas, "file_write");
@@ -408,6 +509,7 @@ mod tests {
             mcp: &[],
             bash_desligado: None,
             restrito: false,
+            contexto: ContextoDaSessao::DESCONHECIDO,
         });
         assert_eq!(linhas[0].state, Estado::NotConfigured);
         assert_eq!(linhas[0].reason_code, "not_configured");
@@ -435,11 +537,166 @@ mod tests {
             mcp: &mcp,
             bash_desligado: None,
             restrito: true,
+            contexto: ContextoDaSessao::DESCONHECIDO,
         });
         assert_eq!(linhas.len(), 1);
         assert_eq!(linhas[0].name, "mcp/*");
         assert!(linhas[0].server.is_none());
         assert_eq!(linhas[0].state, Estado::Unhealthy);
         assert!(!format!("{linhas:?}").contains("interno-da-empresa"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1416 / #1381: falta de contexto (raiz, repositorio) e um estado proprio
+    // -----------------------------------------------------------------------
+
+    fn entradas_com_contexto<'a>(
+        inventario: &'a [ToolInventoryEntry],
+        permite: &'a dyn Fn(&str) -> bool,
+        disponivel: &'a dyn Fn(&str) -> Disponibilidade,
+        contexto: ContextoDaSessao,
+    ) -> Entradas<'a> {
+        Entradas {
+            inventario,
+            permite,
+            disponibilidade: disponivel,
+            mcp: &[],
+            bash_desligado: None,
+            restrito: false,
+            contexto,
+        }
+    }
+
+    fn inventario_de_arquivos() -> Vec<ToolInventoryEntry> {
+        vec![
+            entrada("file_read", "native", None, &["filesystem.read"]),
+            entrada("file_write", "native", None, &["filesystem.write"]),
+            entrada("list_dir", "native", None, &["filesystem.read"]),
+            entrada("repo_search", "native", None, &["filesystem.read"]),
+            entrada("web_fetch", "native", None, &["network.read"]),
+        ]
+    }
+
+    fn linha<'a>(linhas: &'a [Capacidade], nome: &str) -> &'a Capacidade {
+        linhas
+            .iter()
+            .find(|c| c.name == nome)
+            .unwrap_or_else(|| panic!("{nome} ausente: {linhas:?}"))
+    }
+
+    #[test]
+    fn sem_raiz_e_sem_repositorio_as_ferramentas_de_arquivo_dizem_falta_de_contexto() {
+        let inv = inventario_de_arquivos();
+        let tudo = |_: &str| true;
+        let disponivel = |_: &str| Disponibilidade::Disponivel;
+        let linhas = registro(&entradas_com_contexto(
+            &inv,
+            &tudo,
+            &disponivel,
+            ContextoDaSessao {
+                tem_raiz: Some(false),
+                tem_repositorio: Some(false),
+            },
+        ));
+        for nome in PRECISAM_DE_RAIZ {
+            let l = linha(&linhas, nome);
+            assert_eq!(l.state, Estado::Unavailable, "{nome}: {l:?}");
+            assert_eq!(l.reason_code, NO_ROOTS, "{nome}");
+            assert!(
+                l.remediation
+                    .as_deref()
+                    .is_some_and(|r| r.contains("/project")),
+                "{nome}: a remediacao e do usuario da conversa: {l:?}"
+            );
+            assert!(!l.reason.contains('/'), "sem caminho: {}", l.reason);
+        }
+        let rs = linha(&linhas, "repo_search");
+        assert_eq!(rs.state, Estado::Unavailable);
+        assert_eq!(rs.reason_code, NO_REPOSITORY);
+        assert!(
+            rs.remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("/project"))
+        );
+        // Quem nao depende de raiz nao muda.
+        assert_eq!(linha(&linhas, "web_fetch").state, Estado::Visible);
+        let c = contagens(&linhas);
+        assert_eq!((c.unavailable, c.visible), (4, 1));
+    }
+
+    #[test]
+    fn a_politica_negada_vence_a_falta_de_contexto() {
+        let inv = inventario_de_arquivos();
+        let so_leitura = |n: &str| n != "file_write";
+        let disponivel = |_: &str| Disponibilidade::Disponivel;
+        let linhas = registro(&entradas_com_contexto(
+            &inv,
+            &so_leitura,
+            &disponivel,
+            ContextoDaSessao {
+                tem_raiz: Some(false),
+                tem_repositorio: Some(true),
+            },
+        ));
+        // Negada pela politica: e isso que o modelo tem de dizer, e nao
+        // "selecione um projeto" — selecionar nao liberaria a escrita.
+        let fw = linha(&linhas, "file_write");
+        assert_eq!(fw.state, Estado::Denied);
+        assert_eq!(fw.reason_code, "policy");
+        assert_eq!(linha(&linhas, "file_read").reason_code, NO_ROOTS);
+        assert_eq!(linha(&linhas, "repo_search").state, Estado::Visible);
+    }
+
+    #[test]
+    fn contexto_desconhecido_ou_presente_nao_muda_linha_nenhuma() {
+        let inv = inventario_de_arquivos();
+        let tudo = |_: &str| true;
+        let disponivel = |_: &str| Disponibilidade::Disponivel;
+        for contexto in [
+            ContextoDaSessao::DESCONHECIDO,
+            ContextoDaSessao {
+                tem_raiz: Some(true),
+                tem_repositorio: Some(true),
+            },
+        ] {
+            let linhas = registro(&entradas_com_contexto(&inv, &tudo, &disponivel, contexto));
+            assert!(
+                linhas.iter().all(|l| l.state == Estado::Visible),
+                "{contexto:?}: {linhas:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contexto_de_arquivos_segue_a_fonte_das_raizes_e_o_working_dir() {
+        use crate::bootstrap::FonteDasRaizesDasFileTools as Fonte;
+        use std::cell::Cell;
+        let wd = std::path::Path::new("/tmp/projeto");
+        for (fonte, working_dir, raiz) in [
+            (Fonte::Declaradas, None, true),
+            (Fonte::WorkspacePadrao, None, true),
+            (Fonte::SomenteSessao, None, false),
+            (Fonte::SomenteSessao, Some(wd), true),
+            (Fonte::Declaradas, Some(wd), true),
+        ] {
+            let c = contexto_de_arquivos(fonte, working_dir, || false);
+            assert_eq!(c.tem_raiz, Some(raiz), "{fonte:?} {working_dir:?}");
+        }
+        // Repositorio: com `working_dir` nem pergunta ao CWD; sem, pergunta.
+        let perguntou = Cell::new(false);
+        let c = contexto_de_arquivos(Fonte::WorkspacePadrao, Some(wd), || {
+            perguntou.set(true);
+            false
+        });
+        assert_eq!(c.tem_repositorio, Some(true));
+        assert!(!perguntou.get(), "com working_dir o CWD nao e consultado");
+        let c = contexto_de_arquivos(Fonte::WorkspacePadrao, None, || {
+            perguntou.set(true);
+            false
+        });
+        assert_eq!(c.tem_repositorio, Some(false));
+        assert!(perguntou.get());
+        let c = contexto_de_arquivos(Fonte::WorkspacePadrao, None, || true);
+        assert_eq!(c.tem_repositorio, Some(true));
     }
 }

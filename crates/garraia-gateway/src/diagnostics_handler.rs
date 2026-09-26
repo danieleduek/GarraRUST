@@ -1391,6 +1391,19 @@ pub(crate) async fn relatorio(state: &SharedState) -> DiagnosticsReport {
             )),
             _ => None,
         };
+        // #1416: sem sessao, o diagnostico so afirma o que a instalacao
+        // garante: com `SomenteSessao` NENHUMA sessao sem projeto tem raiz
+        // (e o operador precisa saber); repositorio e por sessao — nao se
+        // afirma aqui.
+        // Resolvido no boot, nunca por request (guarda `o_handler_nao_resolve_as_raizes_das_file_tools_por_request`).
+        let fonte = state.raizes_das_file_tools.fonte;
+        let contexto = crate::capacidades_registro::ContextoDaSessao {
+            tem_raiz: Some(!matches!(
+                fonte,
+                crate::bootstrap::FonteDasRaizesDasFileTools::SomenteSessao
+            )),
+            tem_repositorio: None,
+        };
         let registro =
             crate::capacidades_registro::registro(&crate::capacidades_registro::Entradas {
                 inventario: &inventario,
@@ -1399,6 +1412,7 @@ pub(crate) async fn relatorio(state: &SharedState) -> DiagnosticsReport {
                 mcp: &mcp,
                 bash_desligado,
                 restrito: false,
+                contexto,
             });
         checks.push(tools_capabilities_check(&registro));
     }

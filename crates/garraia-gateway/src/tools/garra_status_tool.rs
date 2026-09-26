@@ -387,6 +387,15 @@ impl Tool for GarraStatusTool {
                 )),
                 _ => None,
             };
+            // #1416: o contexto DESTA sessao — raiz (pela fonte que o boot
+            // resolveu + `working_dir`) e repositorio (idem, ou o CWD do
+            // processo) — para `file_*`/`list_dir`/`repo_search` sairem como
+            // "falta contexto" em vez de "disponivel" quando nao ha onde agir.
+            let contexto = crate::capacidades_registro::contexto_de_arquivos(
+                state.raizes_das_file_tools.fonte,
+                ctx.working_dir.as_deref().map(std::path::Path::new),
+                garraia_agents::tools::repo_search_tool::processo_em_repositorio,
+            );
             crate::capacidades_registro::registro(&crate::capacidades_registro::Entradas {
                 inventario: &inventario,
                 permite: &permite,
@@ -394,6 +403,7 @@ impl Tool for GarraStatusTool {
                 mcp: &mcp,
                 bash_desligado,
                 restrito,
+                contexto,
             })
         };
 
@@ -609,6 +619,72 @@ mod tests {
             data_dir: Some(dir.to_path_buf()),
             ..Default::default()
         }
+    }
+
+    /// #1416: a instalacao em que NENHUMA sessao sem projeto tem raiz
+    /// (`SomenteSessao`), montada por cima do estado normal — o que decide e
+    /// a `fonte` que o boot resolveu, e o teste a fixa em vez de depender de
+    /// um `data_dir` impossivel de criar.
+    fn state_somente_sessao() -> Arc<AppState> {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let mut st = AppState::with_config_dir(
+            config_no(&dir),
+            Arc::new(AgentRuntime::new()),
+            ChannelRegistry::new(),
+            &dir,
+        );
+        st.raizes_das_file_tools = crate::bootstrap::RaizesDasFileTools {
+            jail: garraia_agents::tools::FileJail::sessions_only(),
+            fonte: crate::bootstrap::FonteDasRaizesDasFileTools::SomenteSessao,
+            workspace_por_sessao: None,
+        };
+        Arc::new(st)
+    }
+
+    /// #1416: `file_read` permitida pelo piso mas SEM raiz nenhuma na sessao
+    /// sai como `unavailable`/`no_roots` com o passo `/project` — e nao como
+    /// `visible`, que era o que o modelo lia antes de tentar e falhar. Com
+    /// `working_dir` a mesma sessao a ve `visible`; `file_write`, negada pelo
+    /// piso, continua `denied` (a politica vence a falta de contexto).
+    #[tokio::test]
+    async fn capabilities_diz_falta_de_contexto_quando_a_sessao_nao_tem_raiz() {
+        let st = state_somente_sessao();
+        st.agents
+            .register_tool(Box::new(garraia_agents::tools::FileReadTool::new(
+                garraia_agents::tools::FileJail::sessions_only(),
+            )));
+        st.agents
+            .register_tool(Box::new(garraia_agents::tools::FileWriteTool::new(
+                garraia_agents::tools::FileJail::sessions_only(),
+            )));
+        let tool = tool(&st);
+        let (json, _) = relatorio_no_turno(&tool, &ctx(None), false).await;
+        let caps = json["capabilities"].as_array().expect("lista");
+        let de = |nome: &str| {
+            caps.iter()
+                .find(|c| c["name"] == nome)
+                .unwrap_or_else(|| panic!("{nome} ausente: {caps:?}"))
+                .clone()
+        };
+        let fr = de("file_read");
+        assert_eq!(fr["state"], serde_json::json!("unavailable"), "{fr}");
+        assert_eq!(fr["reason_code"], serde_json::json!("no_roots"));
+        assert!(
+            fr["remediation"]
+                .as_str()
+                .is_some_and(|r| r.contains("/project")),
+            "{fr}"
+        );
+        assert_eq!(de("file_write")["state"], serde_json::json!("denied"));
+        assert!(!json.to_string().contains("/tmp/"), "sem caminho: {json}");
+
+        let (json, _) = relatorio_no_turno(&tool, &ctx(Some("/tmp/garra-projeto")), false).await;
+        let caps = json["capabilities"].as_array().expect("lista");
+        let fr = caps
+            .iter()
+            .find(|c| c["name"] == "file_read")
+            .expect("file_read");
+        assert_eq!(fr["state"], serde_json::json!("visible"), "{fr}");
     }
 
     /// O relatorio traz o que o console ve — e o que o agente nao via.
