@@ -496,3 +496,46 @@ fn principal_tem_etiqueta_sem_identidade() {
         "full, write on"
     );
 }
+
+/// #1501: `access.groups.enabled: false` declarado VENCE o `reply_in_groups:
+/// true` legado — e avisa, porque e uma escolha por cima do legado. Sem o
+/// declarado, o legado continua ligando (o teste acima); declarado `true`
+/// com legado `false` liga.
+#[test]
+fn groups_enabled_declarado_vence_o_reply_in_groups_legado_nos_dois_sentidos() {
+    let desligado = settings_from_config(&config_com(json!({
+        "reply_in_groups": true,
+        "access": { "groups": { "enabled": false } }
+    })));
+    assert!(desligado.access.groups.declarado);
+    assert!(!desligado.access.groups.enabled);
+    assert!(
+        !desligado.responde_em_grupo(),
+        "o false declarado vence o legado"
+    );
+    assert!(
+        desligado
+            .access
+            .avisos
+            .iter()
+            .any(|a| a.contains("vence o `reply_in_groups: true`")),
+        "a precedencia e avisada, nunca silenciosa: {:?}",
+        desligado.access.avisos
+    );
+
+    let ligado = settings_from_config(&config_com(json!({
+        "reply_in_groups": false,
+        "access": { "groups": { "enabled": true } }
+    })));
+    assert!(ligado.responde_em_grupo());
+    assert!(
+        ligado.access.avisos.is_empty(),
+        "{:?}",
+        ligado.access.avisos
+    );
+
+    // Sem `access.groups.enabled`, o legado manda — e sem aviso.
+    let legado = settings_from_config(&config_com(json!({ "reply_in_groups": true })));
+    assert!(!legado.access.groups.declarado);
+    assert!(legado.responde_em_grupo());
+}

@@ -474,7 +474,13 @@ impl LinkedSettings {
     /// Responde em grupo? O `reply_in_groups` legado **ou**
     /// `access.groups.enabled`.
     pub fn responde_em_grupo(&self) -> bool {
-        self.reply_in_groups || self.access.groups.enabled
+        // #1501: `access.groups.enabled` declarado vence o legado nos dois
+        // sentidos; sem ele, o `reply_in_groups` continua ligando.
+        if self.access.groups.declarado {
+            self.access.groups.enabled
+        } else {
+            self.reply_in_groups || self.access.groups.enabled
+        }
     }
 
     /// As chaves de portao de toda identidade declarada, de qualquer fonte.

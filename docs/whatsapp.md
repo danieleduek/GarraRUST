@@ -665,7 +665,8 @@ channels:
   identidade).
 - **Compatibilidade.** Sem `access:` nada muda: `allow` e usuario **sem
   teto** (o piso `default_mode` decide, como sempre), `owners` e dono,
-  `reply_in_groups` liga grupos. Nivel e `write` so existem onde foram
+  `reply_in_groups` liga grupos — e `access.groups.enabled`, quando declarado,
+  **vence** o legado nos dois sentidos, com aviso no boot (#1501). Nivel e `write` so existem onde foram
   declarados; `access.users` vence o legado para a mesma identidade. As
   chaves de `users` aceitam qualquer grafia do numero (a comparacao e a
   mesma do `allow`, nono digito incluso) ou o JID `@lid`.
