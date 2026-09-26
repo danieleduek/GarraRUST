@@ -38,7 +38,7 @@
 //! gravado como veio.
 
 use anyhow::{Result, bail};
-use garraia_config::{AppConfig, ChannelConfig, ConfigLoader};
+use garraia_config::{AppConfig, ChannelConfig, ConfigLoader, ExecutionProfile};
 
 use super::{CONFIG_KEY, Context, EX_CANCELLED, EX_SOFTWARE, Lang, t, tb};
 use crate::wizard::prompts::Prompter;
@@ -1505,25 +1505,25 @@ pub fn validar_pre_link(ctx: &Context, pre: &Pedido) -> Result<(), i32> {
     validar(ctx, pre, &config).map(|_| ())
 }
 
-/// O resumo de acesso que o `link` imprime antes de sair (#1429).
+/// O resumo que o `link` imprime antes de sair (#1429): a politica efetiva.
 ///
-/// O corpo e o do `garra whatsapp users` — [`linhas_de_usuarios`], sem uma
-/// segunda formatacao do mesmo estado —, com um cabecalho que diz o que
-/// aquelas linhas sao e onde reve-las depois. Ate aqui o fim do wizard so
-/// dizia "pronto": quem tinha acabado de parear saia sem ver quem, afinal,
-/// podia falar com o GarraIA por aquele WhatsApp.
-///
-/// **So mostra o que ja existe** — canal ligado, contagens e as identidades
-/// mascaradas. Modo de admissao (restrito/aberto) e nivel de acesso
-/// (Chat/Read/Full/Write) nao existem no canal, e inventa-los na tela
-/// prometeria um controle que o portao do gateway nao aplica.
-pub fn resumo_de_acesso(lang: Lang, acesso: Acesso, usuarios: &[Autorizado]) -> Vec<String> {
+/// O corpo e o do `garra whatsapp access` — [`super::politica::linhas_da_politica`],
+/// sem uma segunda formatacao do mesmo estado —, com um cabecalho que diz o
+/// que aquelas linhas sao e onde reve-las depois: canal, perfil de execucao,
+/// admissao, default do desconhecido, grupos, contagens e cada principal com
+/// piso, nivel e o que pode de fato, identidades so por `…1234`. Ate a
+/// #1429 o fim do wizard so dizia "pronto": quem tinha acabado de parear
+/// saia sem ver quem, afinal, podia falar com o GarraIA por aquele WhatsApp
+/// — e, depois da Access Policy v2 (ADR 0025), sem ver ate onde cada um ia.
+pub fn resumo_de_acesso(lang: Lang, config: &AppConfig, perfil: ExecutionProfile) -> Vec<String> {
     let mut out = vec![tb(
         lang,
-        "Acesso em vigor neste WhatsApp (o mesmo que `{bin} whatsapp users` mostra):",
-        "Access in effect on this WhatsApp (the same `{bin} whatsapp users` shows):",
+        "Política de acesso em vigor neste WhatsApp (o mesmo que `{bin} whatsapp access` mostra):",
+        "Access policy in effect on this WhatsApp (the same `{bin} whatsapp access` shows):",
     )];
-    out.extend(linhas_de_usuarios(lang, acesso, usuarios));
+    out.extend(super::politica::linhas_da_politica(
+        lang, config, perfil, false,
+    ));
     out
 }
 
@@ -1532,13 +1532,14 @@ pub fn resumo_de_acesso(lang: Lang, acesso: Acesso, usuarios: &[Autorizado]) -> 
 pub struct PosLink {
     /// Quantos autorizados ha depois do passo.
     pub autorizados: usize,
-    /// O resumo de acesso a imprimir antes da linha final, ja pronto —
+    /// O resumo da politica a imprimir antes da linha final, ja pronto —
     /// ver [`resumo_de_acesso`].
     pub resumo: Vec<String>,
 }
 
 /// Depois de a sessao estar salva e o canal ligado: garante que alguem
-/// pode falar com o GarraIA, ou diz claramente que ninguem pode.
+/// pode falar com o GarraIA, ou diz claramente que ninguem pode — e oferece
+/// a politica de acesso (#1429).
 ///
 /// So roda dentro do `link`, que ja e interativo. Nunca remove nada.
 ///
@@ -1549,6 +1550,14 @@ pub struct PosLink {
 /// - Dono so e oferecido em `isolated-pod`, com confirmacao default nao.
 /// - Numero cujo final bate com o do celular vinculado: avisa do `from_me` e
 ///   pede confirmacao, default nao.
+/// - **Sem numero pre-respondido** (`link` puro), depois disso vem a politica
+///   ([`super::politica::perguntar_politica`]): nivel e escrita de quem
+///   acabou de entrar em `allow` (defaults `read`, sem escrita) e a admissao
+///   (default `restricted`; `open` so com o aviso do `access open`). Cada
+///   resposta e gravada por [`super::politica::aplicar`] — o mesmo motor,
+///   validacao e audit do `access`. Com `--allow <numero>` nada disso e
+///   perguntado: o caminho pre-respondido continua o de sempre, para
+///   continuar scriptavel.
 pub fn pos_link(
     ctx: &Context,
     prompter: &dyn Prompter,
@@ -1575,6 +1584,9 @@ pub fn pos_link(
             .unwrap_or(false)
     };
 
+    // Quem acabou de entrar em `allow` (nao em `owners`) — o unico para quem
+    // nivel e escrita sao perguntados.
+    let mut recem_autorizado = None;
     if quer_adicionar
         && let Some(numero) = obter_numero(ctx, prompter, phone_last4, pre, antes.autorizados == 0)
     {
@@ -1596,28 +1608,53 @@ pub fn pos_link(
             }
         };
         imprimir_gravado(ctx.lang, &numero, papel, gravado);
-        // #1414: e a MESMA escrita do `allow`, entao e o mesmo evento. Aqui o
-        // audit indisponivel nao muda o exit: o vinculo em si valeu, e o
-        // `init` (#1430) le qualquer saida diferente de 0 como "nao vinculou".
         if gravado == Gravado::Novo {
-            // O aviso da falha ja saiu em stderr.
+            // #1414: e a MESMA escrita do `allow`, entao e o mesmo evento.
+            // Aqui o audit indisponivel nao muda o exit: o vinculo em si
+            // valeu, e o `init` (#1430) le qualquer saida diferente de 0 como
+            // "nao vinculou". O aviso da falha ja saiu em stderr.
             let _ = super::politica::auditar(ctx, "allow", &numero, &config, &depois);
+            if papel == Papel::Autorizado {
+                recem_autorizado = Some(numero);
+            }
+        }
+    }
+
+    // #1429: a politica, so no caminho sem pre-resposta. `link --allow` e o
+    // caminho de script — nao ganha pergunta nova.
+    if pre.numero.is_none() {
+        let default = garraia_gateway::bootstrap::whatsapp_linked_settings(&config)
+            .access
+            .default;
+        for mutacao in
+            super::politica::perguntar_politica(ctx, prompter, recem_autorizado.as_deref(), default)
+        {
+            // O mesmo `aplicar` do `access`: valida, grava atomico, audita.
+            // `Err` ja saiu impresso.
+            let aplicacao = super::politica::aplicar(ctx, &mutacao, false)?;
+            for mudanca in &aplicacao.aplicada.mudancas {
+                println!("✓ {mudanca}");
+            }
+            if let Some(erro) = &aplicacao.audit_falhou {
+                eprintln!("{}", super::politica::aviso_de_audit_falhou(ctx.lang, erro));
+            }
         }
     }
 
     // Relido do arquivo, e nao deduzido do que acabou de ser gravado: o
     // resumo tem de dizer o que o portao do gateway vai ler, inclusive o que
-    // ja estava la antes deste `link`.
-    let (depois, usuarios) = match loader.load_sem_env() {
-        Ok(c) => (acesso_da_config(&c), listar(&c)),
+    // ja estava la antes deste `link`. Com a env do perfil por cima, como o
+    // `access` le — o piso do dono depende dela.
+    let depois = match carregar_com_env(ctx, loader) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
             return Err(EX_SOFTWARE);
         }
     };
     Ok(PosLink {
-        autorizados: depois.autorizados,
-        resumo: resumo_de_acesso(ctx.lang, depois, &usuarios),
+        autorizados: acesso_da_config(&depois).autorizados,
+        resumo: resumo_de_acesso(ctx.lang, &depois, depois.execution.perfil()),
     })
 }
 
