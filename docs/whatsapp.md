@@ -738,8 +738,20 @@ channels:
   projeto nao muda poder: o portao do turno (modo e teto) continua valendo.
 - **A quente.** A secao inteira e relida a cada mensagem (como `allow` e
   `owners` ja eram): um `blocked: true` vale na mensagem seguinte, sem
-  restart. `access.groups.enabled` tambem; o `reply_in_groups` legado segue
-  sendo lido no boot.
+  restart. `access.groups.enabled` tambem, nos dois sentidos — o filtro de
+  grupo e decidido no turno com a config viva (antes ele usava a do boot, e
+  ligar os grupos a quente so valia depois de um restart, #1412/#1423).
+  Promover a dono, rebaixar e remover valem na mensagem seguinte; e
+  mensagens que chegam DURANTE uma troca sao decididas, cada uma, por um
+  retrato inteiro da politica: viram turno ou recusa uma vez so, e nenhuma
+  recebe mais do que a politica mais larga que esteve configurada. O
+  `reply_in_groups` legado segue sendo lido no boot.
+- **Grupo e fronteira propria (#1423).** Numa conversa de grupo manda a
+  politica do GRUPO (`access.groups.<jid>`, senao `access.groups.default`),
+  nunca o nivel de quem fala: um usuario `full` em conversa direta recebe
+  so o teto do grupo, o dono dentro do grupo e o grupo, e um remetente nao
+  declarado nao entra por estar num grupo ligado (a admissao continua
+  `restricted`).
 
 ### Confirmacao de ferramenta perigosa ("sim")
 

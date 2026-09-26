@@ -2421,6 +2421,10 @@ mod ponta_a_ponta {
     // com a config viva. Em arquivo proprio pelo mesmo motivo.
     mod permissoes_multiusuario;
 
+    // #1412 e #1423: politica a quente (grupos, concorrencia, papel) e o grupo
+    // como fronteira propria. Em arquivo proprio pelo mesmo motivo.
+    mod politica_a_quente;
+
     // -----------------------------------------------------------------------
     // O circuito da mensagem (sink + gates)
     // -----------------------------------------------------------------------
