@@ -1325,9 +1325,9 @@ async function pageSessions() {
     grid.appendChild(sc);
     frag.appendChild(grid);
     var card = el('div', { className: 'card' });
-    if (sessions.length === 0) { card.appendChild(el('div', { className: 'empty-state', textContent: 'No active sessions.' })); }
+    if (sessions.length === 0) { card.appendChild(el('div', { className: 'empty-state', 'data-testid': 'sessions-empty', textContent: 'No active sessions.' })); }
     else {
-      var tbl = el('table');
+      var tbl = el('table', { 'data-testid': 'sessions-table' });
       tbl.appendChild(el('thead', null, [el('tr', null, [el('th', { textContent: 'Session ID' }), el('th', { textContent: 'Tenant' }), el('th', { textContent: 'User' }), el('th', { textContent: 'Channel' }), el('th', { textContent: 'Status' }), el('th', { textContent: 'History' }), el('th', { textContent: 'Principal' }), el('th', { textContent: 'Effective mode' }), el('th', { textContent: 'Project' }), el('th', { textContent: 'Actions' })])]));
       var tbody = el('tbody');
       sessions.forEach(s => {
