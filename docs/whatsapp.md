@@ -44,29 +44,66 @@ garraia whatsapp
 Quem pode falar com o GarraIA por este WhatsApp? Ninguém, até você autorizar.
 Número autorizado, com código do país (ex.: +55 11 99999-8888; vazio = ninguém por enquanto): +55 11 98888-0000
 ✓ Número terminado em 0000 autorizado.
+Nível de acesso de …0000 (o teto do que ele pode pedir ao GarraIA): read — só leitura (arquivos, busca); nunca shell nem escrita (padrão)
+Liberar escrita de arquivo para …0000? (só escrita de arquivo, nativa e MCP — nunca shell) [y/N]: n
+✓ …0000: usuario (sem teto) → usuario (read, write off)
+Admissão: quem pode falar com o GarraIA por este WhatsApp?: restricted — só quem você autorizar (padrão)
 
-Acesso em vigor neste WhatsApp (o mesmo que `garraia whatsapp users` mostra):
-Canal:    ligado
-Autorizados: 1 · Donos: 0
-  autorizado · número terminado em 0000
+Política de acesso em vigor neste WhatsApp (o mesmo que `garraia whatsapp access` mostra):
+Canal:               ligado
+Perfil de execucao:  standard (piso do dono em 1:1: `search`; dos demais: `search`)
+Admissao:            restricted (so quem esta declarado ou pareou por codigo)
+Default (desconhecido): chat, write off
+Grupos:              desligados
+Autorizados: 1 · Donos: 0 · Bloqueados: 0
+
+  principal    identidade         piso     nivel              pode
+  usuario      …0000              search   read, write off    leitura de arquivo, MCP leitura
+  pareado      —                  search   read, write off    leitura de arquivo, MCP leitura
 
 ✓ GarraIA está pronto para receber mensagens (inicie o gateway: `garraia start`)
 ```
 
-O resumo antes da ultima linha (#1429) e o **mesmo** do `garraia whatsapp users`
-— canal, contagens e as identidades por papel e pelos quatro ultimos digitos,
-nunca o numero inteiro. Ele sai tambem num re-vinculo que nao mudou nada, para
-o operador nao sair do wizard sem ver o portao que herdou.
+Depois do numero, o wizard oferece a **politica de acesso** (#1429, ADR
+0025), com defaults seguros em tudo — Enter em cada pergunta deixa quem
+acabou de entrar com `read` sem escrita e a admissao `restricted`:
+
+- o **nivel** de quem acabou de entrar (`chat` · `read` · `full`, default
+  `read`) e, fora de `chat`, a **escrita de arquivo** (default nao);
+- a **admissao**: so quem voce autorizar (`restricted`, default) ou qualquer
+  numero (`open`). Escolher `open` mostra o default que um desconhecido
+  recebe nesta config e pede a MESMA confirmacao do `garraia whatsapp access
+  open`, com default nao.
+
+Cada resposta e gravada pelo mesmo motor do `access` (validacao, escrita
+atomica, audit) — o wizard nao tem uma segunda forma de escrever politica.
+Quem vira dono (so em `isolated-pod`) nao recebe pergunta de nivel: dono nao
+tem teto. Com `link --allow <numero>` nada disso e perguntado, para o
+caminho pre-respondido continuar scriptavel.
+
+O resumo antes da ultima linha e o **mesmo** do `garraia whatsapp access` —
+canal, perfil de execucao, admissao, default do desconhecido, grupos,
+contagens e cada principal com piso, nivel e o que pode de fato, identidades
+so pelos quatro ultimos digitos, nunca o numero inteiro. Ele sai tambem num
+re-vinculo que nao mudou nada, para o operador nao sair do wizard sem ver a
+politica que herdou.
 
 O "pronto" so aparece quando ha pelo menos um numero autorizado. Resposta
-vazia deixa o portao fechado (ninguem recebe resposta), e o resumo termina no
-aviso com o comando que resolve depois — uma vez so, sem repeti-lo como ultima
-linha, e sem terminal inclusive:
+vazia deixa o portao fechado (ninguem recebe resposta), e a ultima linha vira
+o aviso com o comando que resolve depois — uma vez so:
 
 ```text
-Acesso em vigor neste WhatsApp (o mesmo que `garraia whatsapp users` mostra):
-Canal:    ligado
-Autorizados: 0 · Donos: 0
+Política de acesso em vigor neste WhatsApp (o mesmo que `garraia whatsapp access` mostra):
+Canal:               ligado
+Perfil de execucao:  standard (piso do dono em 1:1: `search`; dos demais: `search`)
+Admissao:            restricted (so quem esta declarado ou pareou por codigo)
+Default (desconhecido): chat, write off
+Grupos:              desligados
+Autorizados: 0 · Donos: 0 · Bloqueados: 0
+
+  principal    identidade         piso     nivel              pode
+  pareado      —                  search   read, write off    leitura de arquivo, MCP leitura
+
 ⚠ Ninguém está autorizado a falar com o GarraIA por este WhatsApp — toda mensagem será ignorada em silêncio. Autorize um número: `garraia whatsapp allow <número>` (com o código do país).
 ```
 
@@ -96,11 +133,11 @@ apaga nada: ele valida e responde `✓ Sessão encontrada e válida`.
 | `garraia doctor whatsapp [--json] [--strict]` | o caminho inteiro numa passada: vinculo, chave da sessao, gateway e ponte, acesso, perfil de execucao, workspace, MCP visivel no piso, provider — cada linha com o proximo passo, no vocabulario do `/api/diagnostics` (#1419) | 0 tudo verde · 2 aviso com `--strict` · 69 algo vermelho |
 | `garraia whatsapp logout` | apaga a sessao e desliga o canal | 0 · 1 cancelado |
 | `garraia whatsapp restore` | devolve o `session.enc.prev` ao lugar | 0 · 69 nao ha arquivada, ou ha sessao em uso · 70 erro interno |
-| `garraia whatsapp allow <numero> [--owner] [--yes]` | autoriza um numero a falar com o GarraIA; funciona sem terminal | 0 · 1 cancelado · 64 `--owner` fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido (inclusive `*`, ver abaixo) · 70 config ilegivel |
+| `garraia whatsapp allow <numero> [--owner] [--yes]` | autoriza um numero a falar com o GarraIA; funciona sem terminal | 0 · 1 cancelado · 64 `--owner` fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido (inclusive `*`, ver abaixo) · 70 config ilegivel · 73 gravou mas o audit falhou |
 | `garraia whatsapp users [--json]` | lista quem esta autorizado: papel (`allow`/`owners`) e os quatro ultimos digitos de cada identidade | 0 · 70 config ilegivel |
-| `garraia whatsapp remove <numero> [--yes]` | revoga o acesso: tira a identidade de `allow` **e** de `owners`; dono exige confirmacao | 0 (inclusive quem nao estava na lista) · 1 cancelado · 64 dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel |
-| `garraia whatsapp owner <numero> [--yes]` | promove a DONO: grava em `owners`, a mesma escrita do `allow --owner` | 0 (inclusive quem ja era dono) · 1 cancelado · 64 fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel |
-| `garraia whatsapp unowner <numero> [--yes]` | tira o papel de DONO **sem** tirar o acesso; o ultimo dono exige confirmacao | 0 (inclusive quem nao era dono) · 1 cancelado · 64 ultimo dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel |
+| `garraia whatsapp remove <numero> [--yes]` | revoga o acesso: tira a identidade de `allow` **e** de `owners`; dono exige confirmacao | 0 (inclusive quem nao estava na lista) · 1 cancelado · 64 dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel · 73 gravou mas o audit falhou |
+| `garraia whatsapp owner <numero> [--yes]` | promove a DONO: grava em `owners`, a mesma escrita do `allow --owner` | 0 (inclusive quem ja era dono) · 1 cancelado · 64 fora de `isolated-pod`, ou sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel · 73 gravou mas o audit falhou |
+| `garraia whatsapp unowner <numero> [--yes]` | tira o papel de DONO **sem** tirar o acesso; o ultimo dono exige confirmacao | 0 (inclusive quem nao era dono) · 1 cancelado · 64 ultimo dono sem terminal e sem `--yes` · 65 numero invalido · 70 config ilegivel · 73 gravou mas o audit falhou |
 | `garraia whatsapp access [--json] [--reveal]` | a politica efetiva inteira (ADR 0025): admissao, default do desconhecido, grupos e cada principal com piso, nivel e o que pode de fato — pelo MESMO `ToolGate` do turno; identidades so por `…1234`, `--reveal` mostra os valores da config (local) | 0 · 70 config ilegivel |
 | `garraia whatsapp access open [--yes] [--dry-run]` / `access restricted` | troca a admissao; `open` avisa (QUALQUER numero passa a entrar, com o default) e pede confirmacao | 0 · 1 cancelado · 64 `open` sem terminal e sem `--yes` · 70 |
 | `garraia whatsapp access default chat\|read [--write] [--dry-run]` | o que um desconhecido recebe em `open` (`full` e recusado; guardado mesmo em `restricted`) | 0 · 65 combinacao invalida · 70 |
@@ -148,8 +185,10 @@ dono nenhum. O `remove` de um dono continua pedindo confirmacao sempre, porque
 la o acesso cai junto.
 
 `garraia whatsapp link --allow <numero> [--owner]` pre-responde a pergunta do
-numero (e a do dono), mas continua exigindo terminal: o QR se le dali. Num
-pipe ele sai 69, como o `link` puro.
+numero (e a do dono) e **pula as perguntas de politica** (nivel, escrita,
+admissao — ver o tutorial): o numero entra como o `allow` o gravaria, sem
+teto, e a politica se ajusta depois com `level`/`write`/`access`. Continua
+exigindo terminal: o QR se le dali. Num pipe ele sai 69, como o `link` puro.
 
 Os codigos seguem `sysexits` (64 = `EX_USAGE`, 65 = `EX_DATAERR`,
 69 = `EX_UNAVAILABLE`, 70 = `EX_SOFTWARE`), como
@@ -639,7 +678,12 @@ channels:
   aceita `--dry-run`: imprime o que mudaria e o **impacto por principal**
   (o que ganha e perde: escrita de arquivo, shell, dispositivo, mensagem,
   MCP), calculado pelo motor real, sem gravar nem auditar. `access audit`
-  le a trilha.
+  le a trilha. Os comandos legados `allow`, `remove`, `owner` e `unowner`
+  tambem vao para o mesmo audit (#1414), com o nome do subcomando como acao
+  — so quando a escrita mudou algo, e com o mesmo exit 73 quando a mudanca
+  ficou gravada mas o audit falhou. O passo pos-QR do `link` e a mesma
+  escrita do `allow` e audita do mesmo jeito, mas la o audit indisponivel so
+  avisa: o vinculo valeu, e o exit continua 0.
 - **Pela API admin (e o Web Console).** `GET /admin/api/whatsapp/access`
   devolve o mesmo documento de `access --json` (mais `hot_reload`);
   `POST /admin/api/whatsapp/access` com `{ "action": "level", "identity":

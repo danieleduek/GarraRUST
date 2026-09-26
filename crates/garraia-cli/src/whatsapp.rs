@@ -1862,18 +1862,17 @@ fn after_pairing(
     0
 }
 
-/// O fecho do `link`: o resumo de acesso (#1429) e a linha final. Pura, para
-/// o teste.
+/// O fecho do `link`: o resumo da politica (#1429) e a linha final. Pura,
+/// para o teste.
 ///
-/// O wizard nao sai mais so com "pronto": antes da ultima linha ele mostra o
-/// acesso que fica valendo, nas MESMAS linhas do `whatsapp users` (ver
+/// O wizard nao sai mais so com "pronto": antes da ultima linha ele mostra a
+/// politica que fica valendo, nas MESMAS linhas do `whatsapp access` (ver
 /// [`acesso::resumo_de_acesso`]).
 ///
-/// Com o portao vazio o resumo ja **termina** no aviso de "ninguem
-/// autorizado" (ver [`acesso::linhas_de_acesso`]), que e palavra por palavra
-/// o que [`final_line`] diria ali — e o mesmo paragrafo duas vezes seguidas
-/// faz o operador duvidar de qual dos dois e o estado. Entao a linha final so
-/// sai quando acrescenta alguma coisa.
+/// A linha final so sai quando acrescenta alguma coisa: se o resumo ja
+/// terminasse com o mesmo paragrafo (o aviso de "ninguem autorizado", que e
+/// palavra por palavra o que [`final_line`] diz com o portao vazio), repeti-lo
+/// faria o operador duvidar de qual dos dois e o estado.
 fn closing_lines(
     lang: Lang,
     resumo: &[String],
