@@ -75,6 +75,7 @@ use super::execution::politica_de_execucao;
 /// #1419/#1420: o motor do `doctor whatsapp` — a tabela pura que a CLI e o
 /// card "Test WhatsApp" do Web Console rodam.
 pub mod doctor;
+pub mod numero;
 pub mod politica;
 pub mod rejeicoes;
 pub use politica::{

@@ -5,8 +5,10 @@
 //! processo filho e testado em `garraia-channels` contra a fixture Python; o
 //! smoke da linha de comando esta em `tests/whatsapp_smoke.rs`.
 
+use super::acesso::MensagemDeNumero;
 use super::*;
 use crate::wizard::prompts::Prompter;
+use garraia_gateway::bootstrap::whatsapp_linked_politica::{Admission, Alcance};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -2044,6 +2046,8 @@ fn users_com_o_canal_desligado_nao_manda_autorizar_ninguem() {
         enabled: false,
         autorizados: 0,
         donos: 0,
+        admissao: Admission::Restricted,
+        default: Alcance::CHAT,
     };
     for lang in [Lang::Pt, Lang::En] {
         let linhas = linhas_de_usuarios(lang, desligado, &[]).join("\n");
@@ -2077,6 +2081,8 @@ fn o_status_e_o_users_dizem_o_acesso_com_as_mesmas_linhas() {
         enabled: true,
         autorizados: 2,
         donos: 1,
+        admissao: Admission::Restricted,
+        default: Alcance::CHAT,
     };
     let compartilhadas = acesso::linhas_de_acesso(Lang::Pt, a);
     let do_status = access_lines(Lang::Pt, true, Some(7), Some(a));
@@ -2087,8 +2093,8 @@ fn o_status_e_o_users_dizem_o_acesso_com_as_mesmas_linhas() {
     }
     assert_eq!(
         compartilhadas.len(),
-        2,
-        "com gente autorizada nao ha aviso: {compartilhadas:?}"
+        3,
+        "canal, contagens e admissao (#1399); com gente autorizada nao ha aviso: {compartilhadas:?}"
     );
 }
 
@@ -3560,6 +3566,8 @@ fn o_status_mostra_contagens_e_avisa_o_portao_vazio_sem_numeros() {
         enabled: true,
         autorizados: 0,
         donos: 0,
+        admissao: Admission::Restricted,
+        default: Alcance::CHAT,
     };
     let linhas = access_lines(Lang::Pt, true, Some(7), Some(vazio)).join("\n");
     assert!(linhas.contains("Autorizados: 0"), "{linhas}");
@@ -3754,3 +3762,42 @@ fn o_link_de_verdade_num_upgrade_preserva_o_allow() {
 
 // ADR 0025: `garraia whatsapp access ...`.
 mod politica;
+
+/// #1399: o `status` diz se um numero fora da lista entra, e com o que — nas
+/// duas linguas e no `--json`, com as chaves da secao `access`.
+#[test]
+fn o_status_diz_a_admissao_e_o_default_do_desconhecido() {
+    let restrito = Acesso {
+        enabled: true,
+        autorizados: 2,
+        donos: 1,
+        admissao: Admission::Restricted,
+        default: Alcance::CHAT,
+    };
+    let pt = acesso::linhas_de_acesso(Lang::Pt, restrito).join("\n");
+    assert!(pt.contains("Admissão: restrita"), "{pt}");
+    let en = acesso::linhas_de_acesso(Lang::En, restrito).join("\n");
+    assert!(en.contains("Admission: restricted"), "{en}");
+
+    let aberto = Acesso {
+        admissao: Admission::Open,
+        autorizados: 0,
+        ..restrito
+    };
+    let pt = acesso::linhas_de_acesso(Lang::Pt, aberto).join("\n");
+    assert!(pt.contains("Admissão: ABERTA"), "{pt}");
+    assert!(
+        pt.contains("chat"),
+        "o default do desconhecido aparece: {pt}"
+    );
+    assert!(
+        !pt.contains("Ninguém autorizado") && !pt.contains("ninguem autorizado"),
+        "com a admissao aberta o aviso de portao vazio nao cabe: {pt}"
+    );
+    let doc = acesso::json_de_usuarios(aberto, &[]);
+    assert_eq!(doc["admission"], "open");
+    assert_eq!(doc["default_access"]["level"], "chat");
+    assert_eq!(doc["default_access"]["write"], false);
+    let doc = acesso::json_de_usuarios(restrito, &[]);
+    assert_eq!(doc["admission"], "restricted");
+}
