@@ -134,8 +134,13 @@ pub struct EntradaDeUsuario {
 /// `access.groups`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoliticaDeGrupos {
-    /// `access.groups.enabled` **ou** o `reply_in_groups` legado.
+    /// `access.groups.enabled` quando declarado; senao o `reply_in_groups`
+    /// legado (#1501: o declarado VENCE o legado, nos dois sentidos — como
+    /// `access.users` vence `allow`/`owners`).
     pub enabled: bool,
+    /// `access.groups.enabled` estava na secao? Sem isto nao da para saber se
+    /// um `false` foi escolha do operador ou so o default.
+    pub declarado: bool,
     /// O grupo sem entrada propria. Sem `access.groups.default`, sem teto
     /// (o piso de modo decide, como sempre).
     pub default: Alcance,
@@ -147,6 +152,7 @@ impl Default for PoliticaDeGrupos {
     fn default() -> Self {
         Self {
             enabled: false,
+            declarado: false,
             default: Alcance::COMPLETO,
             por_grupo: BTreeMap::new(),
         }
@@ -414,7 +420,20 @@ impl PoliticaDeAcesso {
                 for (k, v) in m {
                     match k.as_str() {
                         "enabled" => match v.as_bool() {
-                            Some(b) => politica.groups.enabled = politica.groups.enabled || b,
+                            Some(b) => {
+                                // #1501: declarado vence o legado. Um `false`
+                                // por cima de `reply_in_groups: true` e uma
+                                // escolha, e fica registrada — nunca em
+                                // silencio.
+                                if reply_in_groups && !b {
+                                    avisos.push(
+                                        "`access.groups.enabled: false` vence o `reply_in_groups: true` legado: o canal NAO responde em grupo"
+                                            .to_string(),
+                                    );
+                                }
+                                politica.groups.enabled = b;
+                                politica.groups.declarado = true;
+                            }
                             None => avisos.push(
                                 "`access.groups.enabled` nao e booleano; ignorado".to_string(),
                             ),

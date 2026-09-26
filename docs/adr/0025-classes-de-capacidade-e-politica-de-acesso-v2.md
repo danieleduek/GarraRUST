@@ -98,6 +98,7 @@ channels:
   **sem teto** — o piso de modo decide sozinho, como sempre decidiu. A unica excecao e o pareado por
   codigo, que passa a ter teto `read` (credencial fraca). Nivel declarado em grupo e honrado (inclusive
   `full`), mas o grupo continua no piso de grupo: nunca o perfil `Completo` do dono.
+- **Compatibilidade (grupos, #1501):** `access.groups.enabled` **declarado vence** o `reply_in_groups` legado nos dois sentidos — como `access.users` vence `allow`/`owners`; `false` por cima de `reply_in_groups: true` desliga os grupos e gera `aviso`. Sem `access.groups.enabled`, o legado continua ligando.
 - **Compatibilidade:** `allow`/`owners`/`reply_in_groups` sem `access:` produzem o comportamento da
   v0.4.5 (a menos do pareado, acima). `access.users` vence o legado para a mesma identidade.
 - **Hot reload (#1412):** a secao inteira e relida por turno da config viva (como `allow`/`owners`
