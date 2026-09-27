@@ -1820,8 +1820,14 @@ impl AgentRuntime {
             // Auto-reset turn limit when reached (but task limit not reached)
             // This allows multi-turn agent loops without failing
             if budget.atingiu_limite_turno() {
-                budget.resetar_turno();
-                info!("auto-reset turn budget, continuing agent loop");
+                // A linha de log e a mesma de sempre (quem monitora faz grep
+                // nela); o que muda e que agora ela diz os numeros, e que o
+                // reset nao apaga mais a janela do detector de loop.
+                info!(
+                    orcamento = %budget.status(),
+                    "auto-reset turn budget, continuing agent loop"
+                );
+                budget.renovar_teto_do_turno();
             }
 
             // Check if task limit is reached (hard limit)
@@ -2552,8 +2558,14 @@ impl AgentRuntime {
             // Auto-reset turn limit when reached (but task limit not reached)
             // This allows multi-turn agent loops without failing
             if budget.atingiu_limite_turno() {
-                budget.resetar_turno();
-                info!("auto-reset turn budget, continuing agent loop");
+                // A linha de log e a mesma de sempre (quem monitora faz grep
+                // nela); o que muda e que agora ela diz os numeros, e que o
+                // reset nao apaga mais a janela do detector de loop.
+                info!(
+                    orcamento = %budget.status(),
+                    "auto-reset turn budget, continuing agent loop"
+                );
+                budget.renovar_teto_do_turno();
             }
 
             // Check if task limit is reached (hard limit)

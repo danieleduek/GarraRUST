@@ -419,6 +419,20 @@ impl ExecutionBudget {
         self.historico_assinaturas.clear();
     }
 
+    /// Renova o teto por turno no meio da tarefa — o "auto-reset" do loop do
+    /// runtime — **sem** esvaziar a janela de deteccao de loop.
+    ///
+    /// [`Self::resetar_turno`] tambem limpa a janela, e isso e o certo para
+    /// uma mensagem nova do usuario. Usado no auto-reset, porem, ele fazia o
+    /// detector esquecer o que viu a cada `max_per_turn` chamadas: `X, X` no
+    /// fim de um teto e `X` logo depois do reset nunca fechavam a janela de
+    /// [`JANELA_LOOP`]. O teto por turno e macio por desenho (a tarefa segue
+    /// ate `max_per_task`, que e o limite duro); a memoria do detector nao
+    /// pode ser.
+    pub fn renovar_teto_do_turno(&mut self) {
+        self.current_turn_calls = 0;
+    }
+
     /// Reseta completamente o orçamento para uma nova tarefa (nova mensagem do usuário).
     pub fn resetar_tarefa(&mut self) {
         self.current_turn_calls = 0;
@@ -439,6 +453,54 @@ impl ExecutionBudget {
 
 #[cfg(test)]
 mod tests {
+
+    /// O auto-reset do teto por turno nao pode apagar a memoria do detector
+    /// de loop: tres chamadas identicas atravessando o teto continuam loop.
+    #[test]
+    fn auto_reset_nao_esquece_a_janela_de_loop() {
+        let mut b = super::ExecutionBudget::padrao();
+        let repetida = serde_json::json!({"command": "cargo check"});
+        for i in 0..8 {
+            b.registrar_chamada("bash", &serde_json::json!({"command": format!("ls {i}")}));
+        }
+        b.registrar_chamada("bash", &repetida);
+        b.registrar_chamada("bash", &repetida);
+        assert!(
+            b.atingiu_limite_turno(),
+            "10 chamadas fecham o teto por turno"
+        );
+        assert!(
+            !b.detectar_loop_ferramenta(),
+            "duas iguais ainda nao e loop"
+        );
+
+        b.renovar_teto_do_turno();
+        assert!(
+            b.pode_chamar_ferramenta(),
+            "o teto renovado libera a tarefa"
+        );
+        b.registrar_chamada("bash", &repetida);
+        assert!(
+            b.detectar_loop_ferramenta(),
+            "a terceira igual, logo depois do auto-reset, fecha a janela"
+        );
+    }
+
+    /// O contraste: `resetar_turno` e o de mensagem nova e continua limpando
+    /// a janela — o que viu na mensagem anterior nao conta contra a proxima.
+    #[test]
+    fn resetar_turno_continua_limpando_a_janela() {
+        let mut b = super::ExecutionBudget::padrao();
+        let repetida = serde_json::json!({"command": "cargo check"});
+        b.registrar_chamada("bash", &repetida);
+        b.registrar_chamada("bash", &repetida);
+        b.resetar_turno();
+        b.registrar_chamada("bash", &repetida);
+        assert!(
+            !b.detectar_loop_ferramenta(),
+            "mensagem nova comeca com a janela vazia"
+        );
+    }
 
     /// Os limites do modo alimentam o orcamento (#979).
     ///
