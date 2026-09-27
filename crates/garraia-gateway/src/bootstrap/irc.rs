@@ -13,16 +13,15 @@
 //! não é conveniência aqui: é o único controle de acesso que existe neste
 //! canal, e vale a pena dizer isso em voz alta.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use garraia_agents::ChatMessage;
 use garraia_config::AppConfig;
-use garraia_security::{Allowlist, PairingManager};
 use tracing::{info, warn};
 
 use crate::state::SharedState;
 
-use super::config::default_allowlist_path;
+use super::config::channel_gates;
 
 /// Constrói os canais IRC a partir da config. Chamado depois de o estado
 /// virar `Arc`, para o callback poder capturar um `SharedState`.
@@ -94,12 +93,9 @@ pub fn build_irc_channels(
             .map(str::to_string)
             .unwrap_or_else(|| "garrabot".to_string());
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        // #1189: gates compartilhados com o AppState -- instancias
+        // proprias fazem o `/pair` nunca casar com o `claim()`.
+        let (allowlist, pairing) = channel_gates(state);
 
         let state_for_cb = Arc::clone(state);
         let allowlist_for_cb = Arc::clone(&allowlist);
@@ -162,7 +158,14 @@ pub fn build_irc_channels(
                     let history: Vec<ChatMessage> = state.session_history(&session_id);
                     let continuity_key = state.continuity_key();
                     // `exec_context_for`, nunca o wrapper `_with_context` (#988).
-                    let exec = state.exec_context_for(&session_id, Some(&nick)).await;
+                    let exec = crate::approval_scope::com_escopo(
+                        state
+                            .exec_context_for_msg(&session_id, Some(&nick), Some(&text))
+                            .await,
+                        "irc",
+                        &session_id,
+                        &nick,
+                    );
 
                     let response = if let Some(delta_sender) = delta_tx {
                         state

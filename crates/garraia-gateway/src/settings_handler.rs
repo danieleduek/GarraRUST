@@ -58,7 +58,7 @@ pub enum SettingCategory {
     Experimental,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SettingSource {
     /// Compiled-in default.
@@ -119,11 +119,16 @@ fn settings() -> Vec<SettingSchema> {
         SettingSchema {
             id: "gateway.host",
             label: "Listener host",
-            description: "Bind address for the HTTP/WS listener.",
+            // #1261 (decisao B): `gateway.host` do arquivo esta deprecado —
+            // `garraia start` nunca o le. Editavel aqui, ele gravaria uma
+            // chave que nao muda o bind.
+            description: "Bind address of the running HTTP/WS listener. Set it with \
+                          `--host` or the HOST env var; the gateway.host file key is deprecated \
+                          and not read.",
             category: SettingCategory::Gateway,
             type_: SettingType::String,
             default: serde_json::Value::Null,
-            editable: true,
+            editable: false,
             secret: false,
             requires_restart: true,
             choices: None,
@@ -135,11 +140,13 @@ fn settings() -> Vec<SettingSchema> {
         SettingSchema {
             id: "gateway.port",
             label: "Listener port",
-            description: "TCP port for the HTTP/WS listener.",
+            description: "TCP port of the running HTTP/WS listener. Set it with `--port` or \
+                          the PORT env var; the gateway.port file key is deprecated and not \
+                          read.",
             category: SettingCategory::Gateway,
             type_: SettingType::Integer,
             default: serde_json::json!(3888),
-            editable: true,
+            editable: false,
             secret: false,
             requires_restart: true,
             choices: None,
@@ -279,6 +286,83 @@ fn settings() -> Vec<SettingSchema> {
             validation: Some("1..=10000"),
             warning: None,
         },
+        // — Security: sandbox por tool (#1222 / #1225) —
+        //
+        // Read-only aqui de proposito. O PATCH desta rota e dry-run (plan
+        // 0121a persiste): uma chave editavel faria a UI dizer "aplicado" para
+        // um controle de contencao que continuaria desligado no proximo boot.
+        // Ate la o registro serve para o operador VER o estado, que era o que
+        // faltava — a #1225 existe porque ninguem conseguia nem ligar nem ver.
+        SettingSchema {
+            id: "security.sandbox_mode",
+            label: "Tool sandbox mode",
+            description: "agent.sandbox.mode — off | all | allowlist. Read-only here; edit garraia.toml.",
+            category: SettingCategory::Security,
+            type_: SettingType::Enum,
+            default: serde_json::json!("off"),
+            editable: false,
+            secret: false,
+            requires_restart: true,
+            choices: Some(vec!["off", "all", "allowlist"]),
+            validation: None,
+            warning: Some(
+                "Only the `bash` tool is wrapped today; run_tests/git_diff/repo_search still spawn on the host. `ssh` is remote execution, not a sandbox. Unix only.",
+            ),
+        },
+        SettingSchema {
+            id: "security.sandbox_backend",
+            label: "Tool sandbox backend",
+            description: "agent.sandbox.backend — docker | podman | ssh. The SSH host is never reported here.",
+            category: SettingCategory::Security,
+            type_: SettingType::String,
+            default: serde_json::Value::Null,
+            editable: false,
+            secret: false,
+            requires_restart: true,
+            choices: None,
+            validation: None,
+            warning: Some(
+                "Empty while the mode is not `off` means every sandboxed command fails closed. `ssh` also fails closed until agent.sandbox.network_disabled and agent.sandbox.mount_workdir are an explicit false.",
+            ),
+        },
+        // — Security: perfil de execucao (ADR 0024 / #1329) —
+        //
+        // Read-only pelo mesmo motivo do sandbox: o PATCH e dry-run, e um
+        // perfil "aplicado" que voltasse a `standard` no proximo boot — ou
+        // pior, um `isolated-pod` que a UI dissesse aplicado fora de um pod —
+        // e exatamente a mentira que a linha existe para evitar. A origem
+        // (`default` | `file` | `env`) e a informacao: o operador ve DE ONDE
+        // veio o perfil que esta valendo.
+        SettingSchema {
+            id: "security.execution_profile",
+            label: "Execution profile",
+            description: "execution.profile — standard | isolated-pod (env GARRAIA_EXECUTION_PROFILE wins). Read-only here; edit config.yml or the env.",
+            category: SettingCategory::Security,
+            type_: SettingType::Enum,
+            default: serde_json::json!("standard"),
+            editable: false,
+            secret: false,
+            requires_restart: true,
+            choices: Some(vec!["standard", "isolated-pod"]),
+            validation: None,
+            warning: Some(
+                "`isolated-pod` gives the WhatsApp owner full power inside this process: the pod is the security boundary, not Garra. The profile does not isolate anything by itself.",
+            ),
+        },
+        SettingSchema {
+            id: "security.execution_pod_root",
+            label: "Execution pod root",
+            description: "execution.pod_root — MCP filesystem root in isolated-pod. Null = <data_dir>/workspace. Ignored in standard.",
+            category: SettingCategory::Security,
+            type_: SettingType::String,
+            default: serde_json::Value::Null,
+            editable: false,
+            secret: false,
+            requires_restart: true,
+            choices: None,
+            validation: Some("absolute pod-local path"),
+            warning: None,
+        },
         // — Appearance —
         SettingSchema {
             id: "appearance.default_theme",
@@ -350,6 +434,84 @@ struct EffectiveValue {
     source: SettingSource,
 }
 
+/// Valor e origem das duas linhas de sandbox (#1225) em
+/// `/api/settings/effective`.
+///
+/// Funcao **pura**, separada do handler de proposito. Duas razoes:
+///
+/// 1. Ela decide o que o operador LE sobre um controle de contencao. Dizer
+///    `Default` para uma secao que ele escreveu — ou `File` para uma que ele
+///    nunca tocou — e a interface mentindo sobre onde o sandbox esta ligado,
+///    que e a classe de bug que a #1225 existe para fechar.
+/// 2. `effective_value_for` so e alcancavel montando um `AppState` inteiro, e
+///    e por isso que este arquivo esta em 0% de cobertura. Extrair a decisao
+///    e o que a torna exercitavel sem subir o mundo.
+///
+/// O `ssh_host` **nunca** sai daqui: nao e segredo, mas nomeia
+/// infraestrutura, e a rota e auth-free. O backend sai so como discriminante.
+fn sandbox_effective(
+    id: &str,
+    sb: &garraia_config::SandboxConfig,
+) -> (serde_json::Value, SettingSource) {
+    use serde_json::{Value, json};
+
+    // Secao ausente => os dois campos estao no default compilado. Reportar
+    // `File` faria a UI afirmar que alguem escolheu `off`.
+    let source = if sb.mode == garraia_config::SandboxMode::Off && sb.backend.is_none() {
+        SettingSource::Default
+    } else {
+        SettingSource::File
+    };
+    let value = if id == "security.sandbox_mode" {
+        json!(match sb.mode {
+            garraia_config::SandboxMode::Off => "off",
+            garraia_config::SandboxMode::All => "all",
+            garraia_config::SandboxMode::Allowlist => "allowlist",
+        })
+    } else {
+        match sb.backend {
+            None => Value::Null,
+            Some(garraia_config::SandboxBackendKind::Docker) => json!("docker"),
+            Some(garraia_config::SandboxBackendKind::Podman) => json!("podman"),
+            Some(garraia_config::SandboxBackendKind::Ssh) => json!("ssh"),
+        }
+    };
+    (value, source)
+}
+
+/// Valor e origem das duas linhas do perfil de execucao (ADR 0024 / #1329)
+/// em `/api/settings/effective`. Pura, pelas mesmas razoes de
+/// [`sandbox_effective`].
+///
+/// O perfil e `ExecutionConfig::perfil()` (env ja aplicada pelo loader) e a
+/// origem e `origem()` mapeada 1:1 — `Env` quando `GARRAIA_EXECUTION_PROFILE`
+/// venceu, `File` quando veio do arquivo, `Default` quando ninguem escolheu.
+/// `pod_root` so existe no arquivo, entao `File` quando declarado e
+/// `Default` (com `null`) quando nao.
+fn execution_effective(
+    id: &str,
+    ex: &garraia_config::ExecutionConfig,
+) -> (serde_json::Value, SettingSource) {
+    use serde_json::{Value, json};
+
+    if id == "security.execution_profile" {
+        let source = match ex.origem() {
+            garraia_config::ProfileSource::Default => SettingSource::Default,
+            garraia_config::ProfileSource::File => SettingSource::File,
+            garraia_config::ProfileSource::Env => SettingSource::Env,
+        };
+        (json!(ex.perfil().as_str()), source)
+    } else {
+        match ex.pod_root() {
+            Some(root) => (
+                Value::String(root.display().to_string()),
+                SettingSource::File,
+            ),
+            None => (Value::Null, SettingSource::Default),
+        }
+    }
+}
+
 fn effective_value_for(s: &SettingSchema, state: &SharedState) -> EffectiveValue {
     use serde_json::{Value, json};
     let (value, configured, source) = match s.id {
@@ -358,12 +520,18 @@ fn effective_value_for(s: &SettingSchema, state: &SharedState) -> EffectiveValue
             None,
             SettingSource::Default,
         ),
+        // #1261: o valor e o do bind resolvido em runtime (flag > env >
+        // default), que a CLI escreve em `config.gateway` antes do boot.
         "gateway.host" => (
             Value::String(state.config.gateway.host.clone()),
             None,
-            SettingSource::File,
+            SettingSource::Runtime,
         ),
-        "gateway.port" => (json!(state.config.gateway.port), None, SettingSource::File),
+        "gateway.port" => (
+            json!(state.config.gateway.port),
+            None,
+            SettingSource::Runtime,
+        ),
         "gateway.tls_enabled" => (
             json!(state.config.gateway.tls_cert_path.is_some()),
             None,
@@ -382,10 +550,18 @@ fn effective_value_for(s: &SettingSchema, state: &SharedState) -> EffectiveValue
             // Async access deferred — read the list outside this fn.
             (Value::Null, None, SettingSource::Runtime)
         }
+        // #1241: `is_some()` reportava `configured: true` para um
+        // `api_key: "  "` que deixa o gate de `/api/*` e `/ws` DESLIGADO.
+        // `api_key_configurada` e a mesma regra que o `ApiKeyGate` aplica.
+        // #1261: GARRAIA_GATEWAY_API_KEY vence o arquivo; a origem diz qual.
         "secrets.gateway_api_key" => (
             Value::Null,
-            Some(state.config.gateway.api_key.is_some()),
-            SettingSource::File,
+            Some(state.config.gateway.api_key_configurada()),
+            if state.config.gateway.api_key_env.is_some() {
+                SettingSource::Env
+            } else {
+                SettingSource::File
+            },
         ),
         "secrets.jwt_secret" => (
             Value::Null,
@@ -409,6 +585,18 @@ fn effective_value_for(s: &SettingSchema, state: &SharedState) -> EffectiveValue
             SettingSource::File,
         ),
         "security.rate_limit_rpm" => (json!(120), None, SettingSource::Default),
+        // #1225: so o discriminante. `ssh_host` nao e segredo, mas nomeia
+        // infraestrutura e nao acrescenta nada ao diagnostico — a rota e
+        // auth-free, entao o que nao precisa sair nao sai.
+        "security.sandbox_mode" | "security.sandbox_backend" => {
+            let (value, source) = sandbox_effective(s.id, &state.config.agent.sandbox);
+            (value, None, source)
+        }
+        // ADR 0024 (#1329): perfil efetivo com a origem real.
+        "security.execution_profile" | "security.execution_pod_root" => {
+            let (value, source) = execution_effective(s.id, &state.config.execution);
+            (value, None, source)
+        }
         "appearance.default_theme" => (json!("dark"), None, SettingSource::Default),
         "appearance.default_skin" => (json!("garra-blue"), None, SettingSource::Default),
         "experimental.streaming" => (json!(false), None, SettingSource::Default),
@@ -546,4 +734,254 @@ pub async fn patch_handler(
             dry_run: true,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use garraia_config::{SandboxBackendKind, SandboxConfig, SandboxMode};
+
+    const MODO: &str = "security.sandbox_mode";
+    const BACKEND: &str = "security.sandbox_backend";
+
+    /// #1225 S3: secao ausente e config compilada, nao escolha do operador.
+    #[test]
+    fn sandbox_desligado_reporta_default() {
+        let sb = SandboxConfig::default();
+        assert_eq!(sb.mode, SandboxMode::Off);
+        assert!(sb.backend.is_none());
+
+        let (valor, origem) = sandbox_effective(MODO, &sb);
+        assert_eq!(valor, serde_json::json!("off"));
+        assert_eq!(origem, SettingSource::Default);
+
+        let (valor, origem) = sandbox_effective(BACKEND, &sb);
+        assert_eq!(valor, serde_json::Value::Null);
+        assert_eq!(origem, SettingSource::Default);
+    }
+
+    /// Qualquer configuracao explicita vira `File` — inclusive `mode: off`
+    /// com um backend escrito, que e o caso que a condicao composta existe
+    /// para pegar: o operador desligou temporariamente, mas escreveu a secao.
+    #[test]
+    fn sandbox_configurado_reporta_file() {
+        let casos = [
+            SandboxConfig {
+                mode: SandboxMode::All,
+                backend: Some(SandboxBackendKind::Docker),
+                ..SandboxConfig::default()
+            },
+            SandboxConfig {
+                mode: SandboxMode::Allowlist,
+                backend: Some(SandboxBackendKind::Podman),
+                ..SandboxConfig::default()
+            },
+            // `off` COM backend: a secao existe no arquivo.
+            SandboxConfig {
+                mode: SandboxMode::Off,
+                backend: Some(SandboxBackendKind::Ssh),
+                ..SandboxConfig::default()
+            },
+            // `all` SEM backend: config invalida (o check recusa), mas a
+            // origem continua sendo o arquivo — foi alguem que escreveu.
+            SandboxConfig {
+                mode: SandboxMode::All,
+                backend: None,
+                ..SandboxConfig::default()
+            },
+        ];
+        for sb in casos {
+            assert_eq!(
+                sandbox_effective(MODO, &sb).1,
+                SettingSource::File,
+                "sb = {sb:?}"
+            );
+            assert_eq!(
+                sandbox_effective(BACKEND, &sb).1,
+                SettingSource::File,
+                "sb = {sb:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_mode_e_backend_saem_com_o_nome_certo() {
+        for (modo, esperado) in [
+            (SandboxMode::Off, "off"),
+            (SandboxMode::All, "all"),
+            (SandboxMode::Allowlist, "allowlist"),
+        ] {
+            let sb = SandboxConfig {
+                mode: modo,
+                ..SandboxConfig::default()
+            };
+            assert_eq!(sandbox_effective(MODO, &sb).0, serde_json::json!(esperado));
+        }
+        for (backend, esperado) in [
+            (SandboxBackendKind::Docker, "docker"),
+            (SandboxBackendKind::Podman, "podman"),
+            (SandboxBackendKind::Ssh, "ssh"),
+        ] {
+            let sb = SandboxConfig {
+                mode: SandboxMode::All,
+                backend: Some(backend),
+                ..SandboxConfig::default()
+            };
+            assert_eq!(
+                sandbox_effective(BACKEND, &sb).0,
+                serde_json::json!(esperado)
+            );
+        }
+    }
+
+    /// O `ssh_host` nao pode vazar por esta rota, que e auth-free. Nomear
+    /// infraestrutura nao acrescenta nada ao diagnostico.
+    #[test]
+    fn sandbox_effective_nunca_devolve_o_ssh_host() {
+        let sb = SandboxConfig {
+            mode: SandboxMode::All,
+            backend: Some(SandboxBackendKind::Ssh),
+            ssh_host: Some("bastiao-interno.exemplo".into()),
+            image: Some("registry.interno/imagem:1".into()),
+            ..SandboxConfig::default()
+        };
+        for id in [MODO, BACKEND] {
+            let (valor, _) = sandbox_effective(id, &sb);
+            let texto = valor.to_string();
+            assert!(!texto.contains("bastiao-interno"), "vazou host: {texto}");
+            assert!(!texto.contains("registry.interno"), "vazou imagem: {texto}");
+        }
+    }
+
+    // ─── ADR 0024 (#1329): perfil de execucao ─────────────────────────────
+
+    use garraia_config::{ExecutionConfig, ExecutionProfile};
+
+    const PERFIL: &str = "security.execution_profile";
+    const POD_ROOT: &str = "security.execution_pod_root";
+
+    /// Secao ausente: `standard` vindo do default compilado, `pod_root` nulo.
+    #[test]
+    fn execution_ausente_reporta_standard_default() {
+        let ex = ExecutionConfig::default();
+        assert_eq!(
+            execution_effective(PERFIL, &ex),
+            (serde_json::json!("standard"), SettingSource::Default)
+        );
+        assert_eq!(
+            execution_effective(POD_ROOT, &ex),
+            (serde_json::Value::Null, SettingSource::Default)
+        );
+    }
+
+    /// Perfil escrito no arquivo e `File` — inclusive `standard` explicito,
+    /// que e escolha do operador e nao o default.
+    #[test]
+    fn execution_no_arquivo_reporta_file() {
+        for (perfil, esperado) in [
+            (ExecutionProfile::Standard, "standard"),
+            (ExecutionProfile::IsolatedPod, "isolated-pod"),
+        ] {
+            let ex = ExecutionConfig::new(Some(perfil), Some("/workspace".into()));
+            assert_eq!(
+                execution_effective(PERFIL, &ex),
+                (serde_json::json!(esperado), SettingSource::File)
+            );
+            assert_eq!(
+                execution_effective(POD_ROOT, &ex),
+                (serde_json::json!("/workspace"), SettingSource::File)
+            );
+        }
+    }
+
+    /// A env vence o arquivo e a origem diz isso — e o que distingue "alguem
+    /// exportou GARRAIA_EXECUTION_PROFILE neste shell" de "esta no config".
+    #[test]
+    fn execution_da_env_reporta_env_e_vence_o_arquivo() {
+        let ex = ExecutionConfig::new(Some(ExecutionProfile::Standard), None)
+            .com_env_aplicada(ExecutionProfile::IsolatedPod);
+        assert_eq!(
+            execution_effective(PERFIL, &ex),
+            (serde_json::json!("isolated-pod"), SettingSource::Env)
+        );
+        // `pod_root` nao vem da env: continua nulo/default.
+        assert_eq!(
+            execution_effective(POD_ROOT, &ex),
+            (serde_json::Value::Null, SettingSource::Default)
+        );
+    }
+
+    /// As duas linhas existem no schema, sao read-only, ficam em Security e
+    /// as escolhas do perfil sao exatamente as que a config aceita.
+    #[test]
+    fn execution_aparece_no_schema_como_somente_leitura() {
+        let todas = settings();
+        for id in [PERFIL, POD_ROOT] {
+            let row = todas
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("{id} deveria estar no schema"));
+            assert!(!row.editable, "{id} nao pode ser editavel");
+            assert!(!row.secret);
+            assert!(row.requires_restart, "{id} so muda no boot");
+            assert!(matches!(row.category, SettingCategory::Security));
+        }
+        let perfil = todas.iter().find(|s| s.id == PERFIL).expect("perfil");
+        assert_eq!(
+            perfil.choices.as_deref(),
+            Some(ExecutionProfile::VALORES_ACEITOS),
+            "as escolhas espelham a config"
+        );
+        assert_eq!(perfil.default, serde_json::json!("standard"));
+    }
+
+    /// As duas linhas existem no schema, sao read-only e ficam em Security.
+    /// Read-only importa: o PATCH da rota e dry-run, entao uma chave editavel
+    /// faria a UI dizer "aplicado" para um controle que voltaria desligado.
+    #[test]
+    fn sandbox_aparece_no_schema_como_somente_leitura() {
+        let todas = settings();
+        for id in [MODO, BACKEND] {
+            let row = todas
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("{id} deveria estar no schema"));
+            assert!(!row.editable, "{id} nao pode ser editavel");
+            assert!(!row.secret);
+            assert!(matches!(row.category, SettingCategory::Security));
+        }
+    }
+
+    /// #1261 (decisao B): `gateway.host`/`gateway.port` do arquivo nao sao
+    /// lidos por `garraia start`; o console nao pode oferece-los como
+    /// editaveis, e um PATCH neles e recusado.
+    #[test]
+    fn bind_do_gateway_e_somente_leitura_no_schema() {
+        let todas = settings();
+        for id in ["gateway.host", "gateway.port"] {
+            let row = todas
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("{id} deveria estar no schema"));
+            assert!(!row.editable, "{id} nao pode ser editavel");
+            assert!(
+                row.description.contains("deprecated"),
+                "{id}: a descricao diz como mudar o bind: {}",
+                row.description
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_no_bind_do_gateway_e_recusado() {
+        let mut patch = serde_json::Map::new();
+        patch.insert("gateway.host".to_string(), serde_json::json!("0.0.0.0"));
+        patch.insert("gateway.port".to_string(), serde_json::json!(4000));
+        let (_status, Json(resp)) = patch_handler(Json(PatchSettingsRequest { patch })).await;
+        let resp = serde_json::to_value(&resp).expect("json");
+        let applied = resp["applied"].as_array().cloned().unwrap_or_default();
+        assert!(applied.is_empty(), "nada pode ser aplicado: {resp}");
+        let rejected = resp["rejected"].as_array().cloned().unwrap_or_default();
+        assert_eq!(rejected.len(), 2, "{resp}");
+    }
 }

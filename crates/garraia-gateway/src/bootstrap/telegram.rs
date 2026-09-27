@@ -1,16 +1,15 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use garraia_agents::ChatMessage;
 use garraia_channels::{OnVoiceFn, TelegramChannel};
 use garraia_config::AppConfig;
-use garraia_security::{Allowlist, PairingManager};
 use teloxide::net::Download;
 use teloxide::prelude::Requester;
 use tracing::{error, info, warn};
 
 use crate::state::SharedState;
 
-use super::config::{default_allowlist_path, resolve_api_key};
+use super::config::{channel_gates, resolve_api_key};
 
 pub fn build_telegram_voice_handler(state: &SharedState) -> Option<OnVoiceFn> {
     // Check if voice clients are available
@@ -116,7 +115,14 @@ pub fn build_telegram_voice_handler(state: &SharedState) -> Option<OnVoiceFn> {
                         None,
                         None,
                         None,
-                        &state.exec_context_for(&session_id, Some(&user_id)).await,
+                        &crate::approval_scope::com_escopo(
+                            state
+                                .exec_context_for_msg(&session_id, Some(&user_id), Some(&text))
+                                .await,
+                            "telegram",
+                            &session_id,
+                            &user_id,
+                        ),
                     )
                     .await
                     .map_err(|e| {
@@ -219,13 +225,9 @@ pub fn build_telegram_channels(
             continue;
         };
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        // #1189: gates compartilhados com o AppState -- instancias
+        // proprias fazem o `/pair` nunca casar com o `claim()`.
+        let (allowlist, pairing) = channel_gates(state);
 
         let state_for_cb = Arc::clone(state);
         let allowlist_for_cb = Arc::clone(&allowlist);
@@ -322,7 +324,18 @@ pub fn build_telegram_channels(
                                 model_override.as_deref(),
                                 None,
                                 None,
-                                &state.exec_context_for(&session_id, Some(&user_id)).await,
+                                &crate::approval_scope::com_escopo(
+                                    state
+                                        .exec_context_for_msg(
+                                            &session_id,
+                                            Some(&user_id),
+                                            Some(&text),
+                                        )
+                                        .await,
+                                    "telegram",
+                                    &session_id,
+                                    &user_id,
+                                ),
                             )
                             .await
                     } else {
@@ -338,7 +351,18 @@ pub fn build_telegram_channels(
                                 model_override.as_deref(),
                                 None,
                                 None,
-                                &state.exec_context_for(&session_id, Some(&user_id)).await,
+                                &crate::approval_scope::com_escopo(
+                                    state
+                                        .exec_context_for_msg(
+                                            &session_id,
+                                            Some(&user_id),
+                                            Some(&text),
+                                        )
+                                        .await,
+                                    "telegram",
+                                    &session_id,
+                                    &user_id,
+                                ),
                             )
                             .await
                     }

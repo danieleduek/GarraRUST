@@ -69,6 +69,41 @@ pub async fn notify_message(
     Ok(())
 }
 
+// ── Credencial do gateway ───────────────────────────────────────────────────
+
+/// A `gateway.api_key` configurada, para o handshake do `/ws/parrot`.
+///
+/// #1240 (achado da revisao do PR #1251): o gate de credencial do
+/// `/ws/parrot` (`crates/garraia-gateway/src/parrot_ws.rs`) fechou a rota
+/// para cliente sem `Origin`, mas o `ui/ws.js` conectava numa URL constante,
+/// sem token nenhum. Com a chave configurada — o caso comum desde que o
+/// #1252 passou a gera-la sozinha em bind exposto — o handshake levava 401 e
+/// o `ws.js` entrava em reconexao infinita: overlay e Chat Bar morriam em
+/// silencio.
+///
+/// A chave vem do **mesmo** `config.yml` e da mesma env
+/// (`GARRAIA_GATEWAY_API_KEY`, que vence o arquivo) que o gateway le: o
+/// `ConfigLoader::new()` e o resolvedor de path canonico (honra
+/// `GARRAIA_CONFIG_DIR`, prefere o XDG e cai no legado `~/.garraia`), o mesmo
+/// que o sidecar `garraia start` usa. Reimplementar o path aqui e como as
+/// duas pontas passam a discordar de qual arquivo vale. Um gateway subido
+/// por outro processo com outra env (systemd, docker) continua fora do
+/// alcance do desktop.
+///
+/// Devolve `None` quando nao ha chave — e o `ws.js` conecta na URL nua, que
+/// e o comportamento historico de uma instalacao sem `api_key`. Nenhum erro
+/// de leitura vira excecao: config ilegivel ou YAML quebrado degrada para
+/// `None`, nunca derruba a webview.
+#[tauri::command]
+pub async fn gateway_api_key() -> Option<String> {
+    let config = garraia_config::ConfigLoader::new().ok()?.load().ok()?;
+    // #1261: `load()` injeta `GARRAIA_GATEWAY_API_KEY` em `api_key_env`, e o
+    // gate do `/ws/parrot` exige a chave de `api_key_normalizada` (env vence
+    // o arquivo). Ler so `gateway.api_key` mandava token nenhum (chave so na
+    // env) ou a chave velha do arquivo, e o handshake voltava ao 401 do #1240.
+    config.gateway.api_key_normalizada().map(str::to_string)
+}
+
 // ── Chat-bar window management ──────────────────────────────────────────────
 
 /// Hides the chat bar (called from the chat-bar JS on Escape / ✕) and

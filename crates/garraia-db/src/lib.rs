@@ -1,9 +1,12 @@
+pub mod agent_runs;
 pub mod chat_sync;
 pub mod db_trait;
 pub mod memory_store;
 pub mod migrations;
 pub mod project_store;
 pub mod recurrence;
+/// #1436: tamanho, previa e ultima limpeza da memoria e do ledger de runs.
+pub mod retention;
 pub mod session_store;
 pub mod sqlite_db;
 pub mod vector_store;
@@ -11,6 +14,7 @@ pub mod vector_store;
 #[cfg(feature = "postgres")]
 pub mod postgres_db;
 
+pub use agent_runs::{AgentRunRow, RunStatus};
 pub use chat_sync::{
     ChatSessionManager, ChatSource, SessionHints, SessionKeyStrategy, SessionResolverConfig,
 };
@@ -20,7 +24,10 @@ pub use memory_store::{
     MemoryRole, MemoryStore, NewMemoryEntry, RecallQuery, SessionContext,
 };
 pub use project_store::{DataRetentionRecord, Project, ProjectFile, ProjectTemplate};
-pub use session_store::{MobileUser, ScheduledTask, SessionStore, StoredMessage};
+pub use retention::{CompactionPreview, LastCleanup, MemoryRetentionSnapshot, RunLedgerSnapshot};
+pub use session_store::{
+    MobileUser, ScheduledTask, SessionStore, SessionSurfaces, StoredMessage, log_recovered_leases,
+};
 pub use sqlite_db::SqliteDb;
 pub use vector_store::{VecIndexInventory, VectorStore};
 

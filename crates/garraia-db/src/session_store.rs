@@ -22,9 +22,49 @@ pub struct StoredMessage {
     pub tokens_out: Option<i32>,
 }
 
+/// O que o `sessions.db` registra sobre **quem** ja tocou uma sessao.
+///
+/// E dado, nao politica: quem decide o que fazer com isto e o chamador — hoje,
+/// a readocao de sessao REST do gateway depois de um restart, que so traz de
+/// volta do disco o que so a propria superficie REST gravou. Sao quatro
+/// fontes porque nenhuma sozinha conta a historia inteira:
+///
+/// - `sessions.channel_id` e o **ultimo** a gravar a linha: cada upsert
+///   sobrescreve, entao ele sozinho esquece quem veio antes;
+/// - `chat_session_keys` e a marca persistente de canal do Chat Sync — a
+///   sessao do Telegram resolvida por UUID so e reconhecivel por ela;
+/// - `session_tokens` guarda a superficie que emitiu cada token (`api`, `web`);
+/// - o `metadata.channel_id` e a coluna `source` de cada mensagem so crescem:
+///   sao o registro de toda superficie que ja gravou um turno.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSurfaces {
+    /// `sessions.tenant_id`, para quem recria a sessao nao a mudar de tenant.
+    pub tenant_id: String,
+    /// `sessions.channel_id` — o ultimo a gravar, nao o unico.
+    pub channel_id: String,
+    /// Toda `source` de `chat_session_keys` desta sessao, sem repeticao.
+    pub key_sources: std::collections::BTreeSet<String>,
+    /// Toda `source` de `session_tokens` desta sessao, sem repeticao.
+    pub token_sources: std::collections::BTreeSet<String>,
+    /// Todo canal que uma mensagem gravada declarou — `metadata.channel_id`
+    /// ou a coluna `source` —, sem repeticao.
+    pub message_channels: std::collections::BTreeSet<String>,
+    /// Ha mensagem cujo metadado nao e JSON legivel (ou e `NULL`): dela nao
+    /// da para dizer quem a gravou.
+    pub unreadable_message_metadata: bool,
+    /// `sessions.metadata` carrega a marca de logout que o
+    /// `DELETE /api/sessions/{id}` grava ([`SessionStore::mark_api_logout`]).
+    /// Nao e superficie: e o registro de que a sessao foi encerrada, e so
+    /// cresce — nenhum gravador de metadado a remove.
+    pub api_logout: bool,
+    /// `sessions.metadata` nao e JSON legivel (ou e `NULL`): dela nao da para
+    /// dizer se ha a marca de logout.
+    pub unreadable_session_metadata: bool,
+}
+
 /// Persistent storage for conversation sessions and message history.
 pub struct SessionStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 /// Mobile user row (GAR-334: Garra Cloud Alpha auth).
@@ -80,6 +120,13 @@ impl SessionStore {
     }
 
     fn run_migrations(&self) -> Result<()> {
+        // Ledger de runs de agentes (P1 gap analysis 2026-09-15): idempotente,
+        // parte das migrations para existir em qualquer store novo/antigo.
+        let _ = self.create_agent_runs_table();
+        // #1436: a ultima limpeza do ledger mora no proprio `sessions.db`.
+        self.conn
+            .execute_batch(crate::retention::RETENTION_STATE_SQL)
+            .map_err(|e| Error::Database(format!("retention state migration failed: {e}")))?;
         // Migration: add tenant_id column to pre-existing sessions tables.
         // Ignore error if the table doesn't exist yet or the column already exists.
         let _ = self.conn.execute_batch(
@@ -154,7 +201,12 @@ impl SessionStore {
                     last_run_at TEXT,
                     run_count INTEGER NOT NULL DEFAULT 0,
                     max_runs INTEGER,
-                    attempts INTEGER NOT NULL DEFAULT 0
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    -- #1227 (slice 2): lease do scheduler. `running` so vale
+                    -- enquanto `lease_until` nao passou; depois disso a linha
+                    -- e devolvida a `pending` na subida ou no tick seguinte.
+                    lease_until TEXT,
+                    leased_by TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_tasks_execute_at
@@ -312,6 +364,36 @@ impl SessionStore {
             let _ = self.conn.execute_batch(stmt);
         }
 
+        // #1227 (slice 2): lease do scheduler, forward-only. Guardado por
+        // `PRAGMA table_info` em vez de engolir o erro do ALTER: assim uma
+        // falha real (disco cheio, tabela travada) sobe como erro em vez de
+        // virar coluna ausente descoberta so no primeiro `claim_due_tasks`.
+        // O indice vem DEPOIS do ALTER de proposito — num store antigo as
+        // colunas ainda nao existem quando o `CREATE TABLE IF NOT EXISTS`
+        // acima roda, e um `CREATE INDEX` la dentro abortaria o batch todo.
+        for (column, ddl) in [
+            (
+                "lease_until",
+                "ALTER TABLE scheduled_tasks ADD COLUMN lease_until TEXT;",
+            ),
+            (
+                "leased_by",
+                "ALTER TABLE scheduled_tasks ADD COLUMN leased_by TEXT;",
+            ),
+        ] {
+            if !self.column_exists("scheduled_tasks", column)? {
+                self.conn.execute_batch(ddl).map_err(|e| {
+                    Error::Database(format!("migration failed: scheduled_tasks.{column}: {e}"))
+                })?;
+            }
+        }
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_lease
+                    ON scheduled_tasks(lease_until) WHERE status = 'running';",
+            )
+            .map_err(|e| Error::Database(format!("migration failed: idx_tasks_lease: {e}")))?;
+
         // Phase 2.1: add project_id column to sessions (nullable FK)
         let _ = self.conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN project_id TEXT REFERENCES projects(id);",
@@ -366,6 +448,22 @@ impl SessionStore {
         }
 
         Ok(())
+    }
+
+    /// Se `table` ja tem a coluna `column` — guarda dos `ALTER TABLE ADD
+    /// COLUMN` forward-only. Usa a funcao-tabela `pragma_table_info(?)`
+    /// (SQLite >= 3.16) para o nome da tabela entrar como bind e nao como
+    /// texto interpolado no SQL (regra 5 do CLAUDE.md).
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Database(format!("pragma_table_info({table}): {e}")))?;
+        Ok(count > 0)
     }
 
     pub fn connection(&self) -> &Connection {
@@ -716,6 +814,38 @@ impl SessionStore {
         Ok(result)
     }
 
+    /// Todas as fontes (`source`) com chave para esta sessao, sem repeticao e
+    /// em ordem lexica (#1347).
+    ///
+    /// O `garra_status` precisa saber se uma sessao ja foi tocada por um canal
+    /// remoto: a sessao do Telegram resolvida por `resolve_session` tem id
+    /// UUID, sem prefixo de canal, e a unica marca persistente de que ela e
+    /// do Telegram e a linha daqui. Uma sessao compartilhada (Chat Sync: o
+    /// VS Code e o Telegram na mesma conversa) tem uma linha por fonte, e a
+    /// consulta devolve todas — [`Self::get_external_key_for_session`] so
+    /// devolveria a primeira.
+    pub fn get_sources_for_session(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT source FROM chat_session_keys \
+                 WHERE session_id = ?1 ORDER BY source",
+            )
+            .map_err(|e| Error::Database(format!("failed to prepare source query: {e}")))?;
+
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Database(format!("failed to query session sources: {e}")))?;
+
+        let mut fontes = Vec::new();
+        for row in rows {
+            fontes.push(
+                row.map_err(|e| Error::Database(format!("failed to read session source: {e}")))?,
+            );
+        }
+        Ok(fontes)
+    }
+
     /// Delete a session key mapping.
     pub fn delete_session_key(&self, source: &str, external_id: &str) -> Result<()> {
         self.conn
@@ -783,6 +913,235 @@ impl SessionStore {
         Ok(count)
     }
 
+    /// Quem ja tocou esta sessao, segundo o banco — ver [`SessionSurfaces`].
+    ///
+    /// `None` quando nao ha linha em `sessions`: a sessao nao existe no disco.
+    /// So le; nao cria nem atualiza nada, para que perguntar por um id
+    /// desconhecido nao deixe rastro.
+    ///
+    /// O canal da mensagem sai de `metadata.channel_id` por
+    /// `json_extract`, guardado por `CASE WHEN json_valid(...)`: o `CASE`
+    /// avalia na ordem, entao um metadado quebrado nunca chega ao
+    /// `json_extract` (que falharia a consulta inteira) — ele so liga
+    /// `unreadable_message_metadata`. O `CAST` cobre um `channel_id` gravado
+    /// como numero. A marca de logout da linha segue a mesma guarda: com o
+    /// metadado da sessao ilegivel, liga `unreadable_session_metadata` e nunca
+    /// chega ao `json_type`.
+    pub fn get_session_surfaces(&self, session_id: &str) -> Result<Option<SessionSurfaces>> {
+        let linha: Option<(String, String, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT tenant_id,
+                        channel_id,
+                        CASE WHEN json_valid(metadata) THEN 0 ELSE 1 END,
+                        CASE WHEN json_valid(metadata)
+                             THEN json_type(metadata, ?2) IS NOT NULL
+                             ELSE 0
+                        END
+                 FROM sessions WHERE id = ?1",
+                params![session_id, Self::API_LOGOUT_PATH],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| Error::Database(format!("failed to read session row: {e}")))?;
+        let Some((tenant_id, channel_id, metadado_ilegivel, logout)) = linha else {
+            return Ok(None);
+        };
+
+        let key_sources = self.distinct_sources(
+            "SELECT DISTINCT source FROM chat_session_keys WHERE session_id = ?1",
+            session_id,
+        )?;
+        let token_sources = self.distinct_sources(
+            "SELECT DISTINCT source FROM session_tokens WHERE session_id = ?1",
+            session_id,
+        )?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT
+                     CASE WHEN json_valid(metadata)
+                          THEN CAST(json_extract(metadata, '$.channel_id') AS TEXT)
+                     END,
+                     source,
+                     CASE WHEN json_valid(metadata) THEN 0 ELSE 1 END
+                 FROM messages
+                 WHERE session_id = ?1",
+            )
+            .map_err(|e| Error::Database(format!("failed to prepare surfaces query: {e}")))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| Error::Database(format!("failed to query message surfaces: {e}")))?;
+
+        let mut message_channels = std::collections::BTreeSet::new();
+        let mut unreadable_message_metadata = false;
+        for row in rows {
+            let (canal, fonte, ilegivel) =
+                row.map_err(|e| Error::Database(format!("failed to read message surface: {e}")))?;
+            message_channels.extend(canal);
+            message_channels.extend(fonte);
+            unreadable_message_metadata |= ilegivel != 0;
+        }
+
+        Ok(Some(SessionSurfaces {
+            tenant_id,
+            channel_id,
+            key_sources,
+            token_sources,
+            message_channels,
+            unreadable_message_metadata,
+            api_logout: logout != 0,
+            unreadable_session_metadata: metadado_ilegivel != 0,
+        }))
+    }
+
+    /// A chave de `sessions.metadata` que marca a sessao encerrada pelo
+    /// `DELETE /api/sessions/{id}`.
+    pub const API_LOGOUT: &'static str = "api_logout";
+
+    /// O caminho JSON de [`Self::API_LOGOUT`], para o `json_type` de
+    /// [`Self::get_session_surfaces`] (vai por bind, nao por concatenacao).
+    const API_LOGOUT_PATH: &'static str = "$.api_logout";
+
+    /// Grava em `sessions.metadata` que a sessao foi encerrada pelo `DELETE`
+    /// da superficie REST — e e so isso que ela muda.
+    ///
+    /// # Por que existe
+    ///
+    /// O `DELETE /api/sessions/{id}` revoga os tokens e desconecta a sessao
+    /// em memoria, e a varredura de TTL a esquece depois. Revogar so esvazia
+    /// `session_tokens`: sem marca no banco, a linha de uma sessao encerrada
+    /// ficava identica a de uma sessao REST nunca usada com token, e a
+    /// readocao do disco a trazia de volta, servindo o historico inteiro de
+    /// uma sessao que o dono tinha fechado.
+    ///
+    /// # O que muda — e o que nao muda
+    ///
+    /// Com a linha existente, so o metadado recebe a chave (merge do RFC 7396
+    /// por `json_patch`, como no upsert) e `updated_at` anda. `tenant_id`,
+    /// `channel_id` e `user_id` **nao** sao reescritos: o `DELETE` alcanca
+    /// sessao em memoria de qualquer superficie, e reetiqueta-la seria
+    /// mudar a conta de quem a sessao e. Metadado ilegivel vira `{}` antes do
+    /// patch, e a marca entra do mesmo jeito.
+    ///
+    /// Sem linha (a sessao so existia em memoria), a linha nasce com os
+    /// valores recebidos e a marca: a hidratacao seguinte da mesma sessao
+    /// mescla metadado e nunca a apaga, entao uma leitura depois do logout
+    /// nao cria uma linha sem ela.
+    pub fn mark_api_logout(
+        &self,
+        session_id: &str,
+        tenant_id: &str,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let marca = serde_json::json!({ Self::API_LOGOUT: true }).to_string();
+        self.conn
+            .execute(
+                "INSERT INTO sessions (id, tenant_id, channel_id, user_id, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                   metadata = json_patch(
+                       CASE WHEN json_valid(sessions.metadata)
+                            THEN sessions.metadata
+                            ELSE '{}' END,
+                       excluded.metadata),
+                   updated_at = datetime('now')",
+                params![session_id, tenant_id, channel_id, user_id, marca],
+            )
+            .map_err(|e| Error::Database(format!("failed to mark session logout: {e}")))?;
+        Ok(())
+    }
+
+    /// Cria a linha da sessao se ela nao existe; se existe, nao toca em nada.
+    ///
+    /// Devolve `true` quando criou. E o que precisa quem so quer garantir a
+    /// linha antes de gravar um campo do metadado (o `set_agent_mode` falha
+    /// sem ela) sem **reetiquetar** a sessao: o
+    /// [`Self::upsert_session_with_tenant`] sobrescreve `tenant_id`,
+    /// `channel_id` e `user_id` no conflito, e chamado com os valores de uma
+    /// superficie sobre a linha de outra, muda a conta de quem ela e.
+    pub fn insert_session_if_absent(
+        &self,
+        session_id: &str,
+        tenant_id: &str,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<bool> {
+        let criadas = self
+            .conn
+            .execute(
+                "INSERT INTO sessions (id, tenant_id, channel_id, user_id, metadata)
+                 VALUES (?1, ?2, ?3, ?4, '{}')
+                 ON CONFLICT(id) DO NOTHING",
+                params![session_id, tenant_id, channel_id, user_id],
+            )
+            .map_err(|e| Error::Database(format!("failed to insert session: {e}")))?;
+        Ok(criadas > 0)
+    }
+
+    /// Uma coluna `source` de uma consulta com `?1 = session_id`, sem
+    /// repeticao. So para as consultas fixas de [`Self::get_session_surfaces`].
+    fn distinct_sources(
+        &self,
+        sql: &'static str,
+        session_id: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| Error::Database(format!("failed to prepare source query: {e}")))?;
+        let rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .map_err(|e| Error::Database(format!("failed to query sources: {e}")))?;
+        let mut fontes = std::collections::BTreeSet::new();
+        for row in rows {
+            fontes.insert(row.map_err(|e| Error::Database(format!("failed to read source: {e}")))?);
+        }
+        Ok(fontes)
+    }
+
+    /// #1300: o alvo do `--resume` sem id — a sessao do canal cuja ultima
+    /// mensagem e a mais recente.
+    ///
+    /// E a mensagem que ordena, nao `sessions.updated_at`: o upsert so roda
+    /// no momento da gravacao do turno e `datetime('now')` tem resolucao de
+    /// segundo — duas sessoes escritas no mesmo segundo empatariam, e a
+    /// pergunta sola do turno interrompido (que grava cedo, ver o CLI)
+    /// precisaria vencer justamente nesse empate. O `timestamp` da mensagem
+    /// e RFC3339 com microssegundos e ordena lexicograficamente.
+    ///
+    /// `None` = nenhuma mensagem no canal; quem chama decide o fallback.
+    pub fn latest_session_id(&self, channel_id: &str) -> Result<Option<String>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT m.session_id
+                 FROM messages m
+                 JOIN sessions s ON s.id = m.session_id
+                 WHERE s.channel_id = ?1
+                 ORDER BY m.timestamp DESC
+                 LIMIT 1",
+                params![channel_id],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::Database(format!(
+                    "failed to find latest session: {other}"
+                ))),
+            })?;
+        Ok(id)
+    }
+
     /// Schedule a task for future execution.
     pub fn schedule_task(
         &self,
@@ -808,15 +1167,21 @@ impl SessionStore {
         Ok(task_id)
     }
 
-    /// Poll for pending tasks that are due for execution.
+    /// Poll for pending tasks that are due for execution — **read-only**.
     ///
     /// Uses [`DEFAULT_POLL_LIMIT`]; see [`Self::poll_due_tasks_limit`] when a
     /// caller needs to drain a bigger backlog (e.g. after downtime).
+    ///
+    /// The gateway scheduler does **not** use this: it goes through
+    /// [`Self::claim_due_tasks`], which flips the row to `running` under a
+    /// lease so a crash mid-turn cannot make the next tick re-execute the
+    /// same task in silence (#1227 slice 2). This stays for tests, tooling
+    /// and any caller that only wants to *look* at what is due.
     pub fn poll_due_tasks(&self) -> Result<Vec<ScheduledTask>> {
         self.poll_due_tasks_limit(DEFAULT_POLL_LIMIT)
     }
 
-    /// Poll at most `limit` due tasks.
+    /// Poll at most `limit` due tasks (read-only; see [`Self::poll_due_tasks`]).
     pub fn poll_due_tasks_limit(&self, limit: i64) -> Result<Vec<ScheduledTask>> {
         let mut stmt = self
             .conn
@@ -832,25 +1197,7 @@ impl SessionStore {
             .map_err(|e| Error::Database(format!("failed to prepare poll query: {e}")))?;
 
         let rows = stmt
-            .query_map(params![limit], |row| {
-                let execute_at_raw: String = row.get(4)?;
-                let metadata_raw: String = row.get(6)?;
-                Ok(ScheduledTask {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    channel_id: row.get(2)?,
-                    user_id: row.get(3)?,
-                    execute_at: parse_timestamp(&execute_at_raw),
-                    payload: row.get(5)?,
-                    session_metadata: serde_json::from_str(&metadata_raw)
-                        .unwrap_or(serde_json::Value::Null),
-                    cron_expr: row.get(7)?,
-                    timezone: row.get(8)?,
-                    run_count: row.get(9)?,
-                    max_runs: row.get(10)?,
-                    attempts: row.get(11)?,
-                })
-            })
+            .query_map(params![limit], Self::task_from_row)
             .map_err(|e| Error::Database(format!("failed to poll tasks: {e}")))?;
 
         let mut tasks = Vec::new();
@@ -860,22 +1207,177 @@ impl SessionStore {
         Ok(tasks)
     }
 
-    /// Mark a scheduled task as completed.
+    /// Row shape shared by `poll_due_tasks_limit`, `claim_due_tasks` and
+    /// `recover_expired_leases`: the 12-column projection of
+    /// `scheduled_tasks t JOIN sessions s`, in this exact order.
+    fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask> {
+        let execute_at_raw: String = row.get(4)?;
+        let metadata_raw: String = row.get(6)?;
+        Ok(ScheduledTask {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            channel_id: row.get(2)?,
+            user_id: row.get(3)?,
+            execute_at: parse_timestamp(&execute_at_raw),
+            payload: row.get(5)?,
+            session_metadata: serde_json::from_str(&metadata_raw)
+                .unwrap_or(serde_json::Value::Null),
+            cron_expr: row.get(7)?,
+            timezone: row.get(8)?,
+            run_count: row.get(9)?,
+            max_runs: row.get(10)?,
+            attempts: row.get(11)?,
+        })
+    }
+
+    /// Claim up to `limit` due tasks for `owner` (#1227 slice 2).
+    ///
+    /// One transaction (`BEGIN IMMEDIATE`) selects the due `pending` rows and
+    /// flips each one to `status = 'running'` with `lease_until = now +
+    /// lease_secs` and `leased_by = owner`. Only the rows **this** call
+    /// actually flipped are returned: the `UPDATE` is guarded by `AND status
+    /// = 'pending'` and the row is kept only when `changes() == 1`, so two
+    /// schedulers racing over the same file cannot both walk away with the
+    /// same task. A crash after the claim leaves the row `running`; it comes
+    /// back to `pending` through [`Self::recover_expired_leases`] once the
+    /// lease has passed — explicitly, with a log line, never in silence.
+    ///
+    /// `lease_secs` is clamped to at least 1 so a zero/negative value cannot
+    /// mint an already-expired lease.
+    pub fn claim_due_tasks(
+        &self,
+        limit: i64,
+        lease_secs: i64,
+        owner: &str,
+    ) -> Result<Vec<ScheduledTask>> {
+        // SQLite clock on both sides (set here, compared in the recovery
+        // query) so the lease does not depend on the host clock agreeing
+        // with itself across two code paths.
+        let lease_modifier = format!("+{} seconds", lease_secs.max(1));
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| Error::Database(format!("failed to begin claim transaction: {e}")))?;
+
+        let due: Vec<ScheduledTask> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT t.id, t.session_id, s.channel_id, t.user_id, t.execute_at, t.payload,
+                            s.metadata, t.cron_expr, t.timezone, t.run_count, t.max_runs,
+                            t.attempts
+                     FROM scheduled_tasks t
+                     JOIN sessions s ON t.session_id = s.id
+                     WHERE t.status = 'pending' AND datetime(t.execute_at) <= datetime('now')
+                     ORDER BY t.execute_at ASC
+                     LIMIT ?1",
+                )
+                .map_err(|e| Error::Database(format!("failed to prepare claim query: {e}")))?;
+            let rows = stmt
+                .query_map(params![limit], Self::task_from_row)
+                .map_err(|e| Error::Database(format!("failed to select due tasks: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Database(format!("failed to read due task row: {e}")))?
+        };
+
+        let mut claimed = Vec::with_capacity(due.len());
+        for task in due {
+            let changed = tx
+                .execute(
+                    "UPDATE scheduled_tasks
+                     SET status = 'running',
+                         lease_until = datetime('now', ?2),
+                         leased_by = ?3
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![task.id, lease_modifier, owner],
+                )
+                .map_err(|e| Error::Database(format!("failed to claim task: {e}")))?;
+            if changed == 1 {
+                claimed.push(task);
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| Error::Database(format!("failed to commit claim: {e}")))?;
+        Ok(claimed)
+    }
+
+    /// Put `running` tasks whose lease has expired back to `pending` and
+    /// return them so the caller can **log** the re-poll (#1227 slice 2).
+    ///
+    /// A `running` row with `lease_until IS NULL` is treated as expired too:
+    /// nothing legitimate produces it (every claim sets a lease), so leaving
+    /// it alone would park the task forever. `attempts` is left untouched —
+    /// a crash is not a failed attempt of the task itself; the retry budget
+    /// belongs to [`Self::retry_or_fail_task`].
+    pub fn recover_expired_leases(&self) -> Result<Vec<ScheduledTask>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| Error::Database(format!("failed to begin recovery transaction: {e}")))?;
+
+        let expired: Vec<ScheduledTask> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT t.id, t.session_id, s.channel_id, t.user_id, t.execute_at, t.payload,
+                            s.metadata, t.cron_expr, t.timezone, t.run_count, t.max_runs,
+                            t.attempts
+                     FROM scheduled_tasks t
+                     JOIN sessions s ON t.session_id = s.id
+                     WHERE t.status = 'running'
+                       AND (t.lease_until IS NULL
+                            OR datetime(t.lease_until) < datetime('now'))
+                     ORDER BY t.execute_at ASC",
+                )
+                .map_err(|e| Error::Database(format!("failed to prepare recovery query: {e}")))?;
+            let rows = stmt
+                .query_map([], Self::task_from_row)
+                .map_err(|e| Error::Database(format!("failed to select expired leases: {e}")))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::Database(format!("failed to read expired lease row: {e}")))?
+        };
+
+        let mut recovered = Vec::with_capacity(expired.len());
+        for task in expired {
+            let changed = tx
+                .execute(
+                    "UPDATE scheduled_tasks
+                     SET status = 'pending', lease_until = NULL, leased_by = NULL
+                     WHERE id = ?1 AND status = 'running'",
+                    params![task.id],
+                )
+                .map_err(|e| Error::Database(format!("failed to release expired lease: {e}")))?;
+            if changed == 1 {
+                recovered.push(task);
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| Error::Database(format!("failed to commit lease recovery: {e}")))?;
+        Ok(recovered)
+    }
+
+    /// Mark a scheduled task as completed (and drop its lease).
     pub fn complete_task(&self, task_id: &str) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE scheduled_tasks SET status = 'completed' WHERE id = ?1",
+                "UPDATE scheduled_tasks
+                 SET status = 'completed', lease_until = NULL, leased_by = NULL
+                 WHERE id = ?1",
                 params![task_id],
             )
             .map_err(|e| Error::Database(format!("failed to complete task: {e}")))?;
         Ok(())
     }
 
-    /// Mark a scheduled task as failed so it won't be retried.
+    /// Mark a scheduled task as failed so it won't be retried (and drop its lease).
     pub fn fail_task(&self, task_id: &str) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE scheduled_tasks SET status = 'failed' WHERE id = ?1",
+                "UPDATE scheduled_tasks
+                 SET status = 'failed', lease_until = NULL, leased_by = NULL
+                 WHERE id = ?1",
                 params![task_id],
             )
             .map_err(|e| Error::Database(format!("failed to mark task as failed: {e}")))?;
@@ -939,7 +1441,8 @@ impl SessionStore {
             self.conn
                 .execute(
                     "UPDATE scheduled_tasks
-                     SET status = 'completed', run_count = ?2, last_run_at = ?3, attempts = 0
+                     SET status = 'completed', run_count = ?2, last_run_at = ?3, attempts = 0,
+                         lease_until = NULL, leased_by = NULL
                      WHERE id = ?1",
                     params![task.id, runs, now.to_rfc3339()],
                 )
@@ -953,7 +1456,7 @@ impl SessionStore {
             .execute(
                 "UPDATE scheduled_tasks
                  SET execute_at = ?2, last_run_at = ?3, run_count = ?4, attempts = 0,
-                     status = 'pending'
+                     status = 'pending', lease_until = NULL, leased_by = NULL
                  WHERE id = ?1",
                 params![task.id, next.to_rfc3339(), now.to_rfc3339(), runs],
             )
@@ -976,9 +1479,15 @@ impl SessionStore {
         if attempts < max_attempts {
             let delay = crate::recurrence::retry_delay_secs(attempts as u32);
             let retry_at = now + chrono::Duration::seconds(delay);
+            // The row is `running` under a lease while the turn executes
+            // (#1227 slice 2); a retry has to hand it back to `pending` or
+            // the next tick would never see it.
             self.conn
                 .execute(
-                    "UPDATE scheduled_tasks SET execute_at = ?2, attempts = ?3 WHERE id = ?1",
+                    "UPDATE scheduled_tasks
+                     SET execute_at = ?2, attempts = ?3,
+                         status = 'pending', lease_until = NULL, leased_by = NULL
+                     WHERE id = ?1",
                     params![task.id, retry_at.to_rfc3339(), attempts],
                 )
                 .map_err(|e| Error::Database(format!("failed to schedule retry: {e}")))?;
@@ -993,7 +1502,9 @@ impl SessionStore {
             self.conn
                 .execute(
                     "UPDATE scheduled_tasks
-                     SET execute_at = ?2, attempts = 0, last_run_at = ?3 WHERE id = ?1",
+                     SET execute_at = ?2, attempts = 0, last_run_at = ?3,
+                         status = 'pending', lease_until = NULL, leased_by = NULL
+                     WHERE id = ?1",
                     params![task.id, next.to_rfc3339(), now.to_rfc3339()],
                 )
                 .map_err(|e| Error::Database(format!("failed to skip occurrence: {e}")))?;
@@ -1582,6 +2093,34 @@ impl ScheduledTask {
     }
 }
 
+/// Re-poll explicito apos queda (#1227 slice 2): devolve a `pending` toda
+/// tarefa `running` cuja lease expirou e loga `warn!` com id, `attempts` e
+/// `execute_at` — nunca `payload` (PII). Um lugar so para a regra de log,
+/// chamado na subida do gateway (ao lado de `log_interrupted_runs`) e no
+/// inicio de cada tick do scheduler. Fail-soft: uma falha aqui nao pode
+/// impedir a subida nem o tick — devolve 0 e avisa. Devolve quantas tarefas
+/// voltaram a `pending`.
+pub fn log_recovered_leases(store: &SessionStore) -> usize {
+    match store.recover_expired_leases() {
+        Ok(tasks) => {
+            for task in &tasks {
+                tracing::warn!(
+                    task = %task.id,
+                    attempts = task.attempts,
+                    execute_at = %task.execute_at.to_rfc3339(),
+                    recurring = task.is_recurring(),
+                    "tarefa agendada ficou `running` alem da lease — voltou a `pending` e sera reexecutada"
+                );
+            }
+            tasks.len()
+        }
+        Err(e) => {
+            tracing::warn!(erro = %e, "falhou ao recuperar leases expiradas do scheduler");
+            0
+        }
+    }
+}
+
 // ── GAR-202: Session token CRUD ───────────────────────────────────────────────
 
 /// Generate a cryptographically random URL-safe base64 token (256 bits).
@@ -1657,24 +2196,27 @@ impl SessionStore {
         token: &str,
         idle_timeout_secs: i64,
     ) -> Result<Option<String>> {
-        let idle_clause = if idle_timeout_secs > 0 {
-            format!("AND datetime(last_active, '+{idle_timeout_secs} seconds') > datetime('now')")
-        } else {
-            String::new()
-        };
-        let sql = format!(
-            "SELECT session_id FROM session_tokens
-             WHERE token = ?1
-               AND expires_at > datetime('now')
-               {idle_clause}
-             LIMIT 1"
-        );
+        // SQL estatico (regra 5, nota lateral da #1247): o timeout entra por
+        // bind ?2 e a comparacao desliga a clausula idle quando ?2 <= 0.
+        // `'+' || ?2 || ' seconds'` monta o modificador do datetime com o
+        // inteiro coercido a texto pelo proprio SQLite.
         let mut stmt = self
             .conn
-            .prepare(&sql)
+            .prepare(
+                "SELECT session_id FROM session_tokens
+                 WHERE token = ?1
+                   AND expires_at > datetime('now')
+                   AND (?2 <= 0
+                        OR datetime(last_active, '+' || ?2 || ' seconds')
+                           > datetime('now'))
+                 LIMIT 1",
+            )
             .map_err(|e| Error::Database(format!("validate_session_token prepare: {e}")))?;
         let session_id: Option<String> = stmt
-            .query_row(params![hash_session_token(token)], |row| row.get(0))
+            .query_row(
+                params![hash_session_token(token), idle_timeout_secs],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(|e| Error::Database(format!("validate_session_token: {e}")))?;
         Ok(session_id)
@@ -1869,6 +2411,23 @@ mod tests {
     use chrono::Duration;
     use rusqlite::params;
 
+    /// Regra 5 do CLAUDE.md: SQL e estatico, valor de dado vai por bind.
+    /// `validate_session_token` interpolava `idle_timeout_secs` via `format!`
+    /// (nota lateral da auditoria da #1247); a clausula idle agora vive no
+    /// SQL estatico com bind ?2. Esta varredura impede o padrao de voltar
+    /// neste arquivo.
+    #[test]
+    fn sql_e_estatico_em_session_store() {
+        let src = include_str!("session_store.rs");
+        // concat! evita que o proprio literal da assercao case com a
+        // varredura (include_str! inclui o modulo de testes).
+        let proibido = concat!("let sql = format", "!(");
+        assert!(
+            !src.contains(proibido),
+            "regra 5: montar SQL via format! e vedado — SQL estatico + params! (#1247)"
+        );
+    }
+
     #[test]
     fn upsert_and_load_recent_messages_round_trip() {
         let store = SessionStore::in_memory().expect("in-memory store should open");
@@ -1911,6 +2470,281 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].direction, "assistant");
         assert_eq!(messages[1].content, "hi there");
+    }
+
+    /// As quatro marcas de superficie de [`super::SessionSurfaces`] voltam
+    /// todas, e perguntar por um id desconhecido nao deixa rastro no banco — e
+    /// o que a readocao de sessao REST depois de um restart consulta antes de
+    /// decidir.
+    #[test]
+    fn superficies_da_sessao_voltam_das_quatro_fontes() {
+        use std::collections::BTreeSet;
+        let conjunto = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        let contar_sessoes = |store: &SessionStore| -> i64 {
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+                .expect("contar sessoes")
+        };
+
+        let store = SessionStore::in_memory().expect("store");
+        assert_eq!(
+            store.get_session_surfaces("inexistente").expect("ler"),
+            None
+        );
+        assert_eq!(contar_sessoes(&store), 0, "perguntar nao cria a sessao");
+
+        store
+            .upsert_session_with_tenant("s", "t1", "api", "anonymous", &serde_json::json!({}))
+            .expect("sessao");
+        let s = store
+            .get_session_surfaces("s")
+            .expect("ler")
+            .expect("a sessao existe");
+        assert_eq!(s.tenant_id, "t1");
+        assert_eq!(s.channel_id, "api");
+        assert!(s.key_sources.is_empty(), "{s:?}");
+        assert!(s.token_sources.is_empty(), "{s:?}");
+        assert!(s.message_channels.is_empty(), "{s:?}");
+        assert!(!s.unreadable_message_metadata);
+        assert!(!s.api_logout, "sessao nunca encerrada");
+        assert!(!s.unreadable_session_metadata);
+
+        let agora = chrono::Utc::now();
+        for (texto, meta) in [
+            (
+                "a",
+                serde_json::json!({ "channel_id": "api", "user_id": "anonymous" }),
+            ),
+            ("b", serde_json::json!({ "channel_id": "telegram" })),
+            // Sem canal no metadado (o turno agendado grava o da sessao).
+            (
+                "c",
+                serde_json::json!({ "continuity_key": "bus:shared-global" }),
+            ),
+            // Canal gravado como numero: o CAST o traz como texto.
+            ("d", serde_json::json!({ "channel_id": 42 })),
+        ] {
+            store
+                .append_message("s", "user", texto, agora, &meta)
+                .expect("mensagem");
+        }
+        store
+            .append_message_with_details(
+                "s",
+                "user",
+                "e",
+                agora,
+                &serde_json::json!({}),
+                Some("vscode"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("mensagem com source");
+        store
+            .upsert_session_key("s", "telegram", "123456")
+            .expect("chave");
+        store
+            .create_session_token("s", "web", 60, None, None)
+            .expect("token");
+
+        let s = store
+            .get_session_surfaces("s")
+            .expect("ler")
+            .expect("existe");
+        assert_eq!(
+            s.message_channels,
+            conjunto(&["42", "api", "telegram", "vscode"])
+        );
+        assert_eq!(s.key_sources, conjunto(&["telegram"]));
+        assert_eq!(s.token_sources, conjunto(&["web"]));
+        assert!(!s.unreadable_message_metadata, "todo metadado e JSON");
+
+        // Metadado quebrado e metadado NULL: nao da para dizer quem gravou, e
+        // a consulta nao pode falhar por causa deles.
+        for (id, meta) in [("m-quebrada", Some("{quebrado")), ("m-nula", None)] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO messages (id, session_id, direction, content, timestamp, metadata)
+                     VALUES (?1, 's', 'user', 'x', '2026-01-01T00:00:00Z', ?2)",
+                    params![id, meta],
+                )
+                .expect("mensagem com metadado ilegivel");
+            let s = store
+                .get_session_surfaces("s")
+                .expect("ler")
+                .expect("existe");
+            assert!(s.unreadable_message_metadata, "{id}");
+            store
+                .conn
+                .execute("DELETE FROM messages WHERE id = ?1", params![id])
+                .expect("limpar");
+        }
+        assert_eq!(contar_sessoes(&store), 1, "ler nao cria linha nenhuma");
+    }
+
+    /// `(tenant_id, channel_id, user_id, metadata)` da linha, direto do banco.
+    fn linha_crua(store: &SessionStore, id: &str) -> (String, String, String, Option<String>) {
+        store
+            .conn
+            .query_row(
+                "SELECT tenant_id, channel_id, user_id, metadata FROM sessions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("a linha existe")
+    }
+
+    /// A marca de logout do `DELETE` REST: `get_session_surfaces` a le, ela
+    /// so mexe no metadado (nem tenant, nem canal, nem usuario), preserva o
+    /// que ja estava la, sobrevive ao upsert da hidratacao seguinte e entra
+    /// ate por cima de metadado ilegivel ou `null`.
+    #[test]
+    fn marca_de_logout_da_api_so_mexe_no_metadado_e_fica() {
+        let store = SessionStore::in_memory().expect("store");
+        store
+            .upsert_session_with_tenant("s", "tenant-a", "whatsapp", "5511", &serde_json::json!({}))
+            .expect("sessao");
+        store.set_agent_mode("s", "search").expect("modo");
+
+        store
+            .mark_api_logout("s", "default", "api", "anonymous")
+            .expect("marcar");
+        let s = store
+            .get_session_surfaces("s")
+            .expect("ler")
+            .expect("existe");
+        assert!(s.api_logout, "{s:?}");
+        assert!(!s.unreadable_session_metadata);
+        let (tenant, canal, usuario, _) = linha_crua(&store, "s");
+        assert_eq!(
+            (tenant.as_str(), canal.as_str(), usuario.as_str()),
+            ("tenant-a", "whatsapp", "5511"),
+            "a marca nao reetiqueta a linha"
+        );
+        assert_eq!(
+            store.get_chosen_agent_mode("s").expect("ler"),
+            Some("search".to_string()),
+            "o resto do metadado fica"
+        );
+
+        // A hidratacao seguinte (upsert com `{}` e com a chave de
+        // continuidade) e o modo gravado depois nao apagam a marca.
+        for meta in [
+            serde_json::json!({}),
+            serde_json::json!({ "continuity_key": "bus:shared-global" }),
+        ] {
+            store
+                .upsert_session("s", "api", "anonymous", &meta)
+                .expect("upsert");
+        }
+        store.set_agent_mode("s", "code").expect("modo");
+        store.set_session_goal("s", "u", "meta").expect("goal");
+        store.clear_agent_mode("s").expect("limpar modo");
+        assert!(
+            store
+                .get_session_surfaces("s")
+                .expect("ler")
+                .expect("existe")
+                .api_logout,
+            "um gravador de metadado apagou a marca"
+        );
+
+        // Sessao que so existia em memoria: a linha nasce com a marca.
+        store
+            .mark_api_logout("so-memoria", "default", "api", "anonymous")
+            .expect("marcar");
+        let (tenant, canal, usuario, _) = linha_crua(&store, "so-memoria");
+        assert_eq!(
+            (tenant.as_str(), canal.as_str(), usuario.as_str()),
+            ("default", "api", "anonymous")
+        );
+        assert!(
+            store
+                .get_session_surfaces("so-memoria")
+                .expect("ler")
+                .expect("existe")
+                .api_logout
+        );
+
+        // Metadado ilegivel, `NULL` e `null`: a leitura nao falha, diz que
+        // nao da para ler, e a marca entra por cima de qualquer um deles.
+        for (id, meta) in [
+            ("quebrado", Some("{quebrado")),
+            ("nulo-sql", None),
+            ("nulo-json", Some("null")),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sessions (id, tenant_id, channel_id, user_id, metadata)
+                     VALUES (?1, 'default', 'api', 'anonymous', ?2)",
+                    params![id, meta],
+                )
+                .expect("linha com metadado estranho");
+            let s = store
+                .get_session_surfaces(id)
+                .expect("ler")
+                .expect("existe");
+            assert!(!s.api_logout, "{id}");
+            assert_eq!(
+                s.unreadable_session_metadata,
+                meta != Some("null"),
+                "{id}: `null` e JSON legivel, sem a marca"
+            );
+            store
+                .mark_api_logout(id, "default", "api", "anonymous")
+                .expect("marcar");
+            let s = store
+                .get_session_surfaces(id)
+                .expect("ler")
+                .expect("existe");
+            assert!(
+                s.api_logout && !s.unreadable_session_metadata,
+                "{id}: {s:?}"
+            );
+        }
+    }
+
+    /// `insert_session_if_absent` cria a linha que falta e nao toca na que
+    /// existe — nem tenant, nem canal, nem usuario, nem metadado.
+    #[test]
+    fn inserir_se_ausente_nao_reetiqueta_linha_existente() {
+        let store = SessionStore::in_memory().expect("store");
+        store
+            .upsert_session_with_tenant(
+                "whatsapp-5511",
+                "tenant-a",
+                "whatsapp",
+                "5511",
+                &serde_json::json!({ "k": "v" }),
+            )
+            .expect("sessao");
+        let antes = linha_crua(&store, "whatsapp-5511");
+        assert!(
+            !store
+                .insert_session_if_absent("whatsapp-5511", "default", "api", "anonymous")
+                .expect("inserir")
+        );
+        assert_eq!(linha_crua(&store, "whatsapp-5511"), antes);
+
+        assert!(
+            store
+                .insert_session_if_absent("nova", "default", "api", "anonymous")
+                .expect("inserir")
+        );
+        assert_eq!(
+            linha_crua(&store, "nova"),
+            (
+                "default".to_string(),
+                "api".to_string(),
+                "anonymous".to_string(),
+                Some("{}".to_string())
+            )
+        );
     }
 
     #[test]
@@ -1981,6 +2815,355 @@ mod tests {
 
         let due_after = store.poll_due_tasks().unwrap();
         assert_eq!(due_after.len(), 0);
+    }
+
+    // ── #1227 (slice 2): lease pending → running ─────────────────────
+
+    /// `(status, lease_until, leased_by)` de uma tarefa, direto da tabela.
+    fn lease_row(store: &SessionStore, task_id: &str) -> (String, Option<String>, Option<String>) {
+        store
+            .conn
+            .query_row(
+                "SELECT status, lease_until, leased_by FROM scheduled_tasks WHERE id = ?1",
+                params![task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("task row must exist")
+    }
+
+    /// Agenda uma tarefa ja vencida numa sessao `s1`/`u1`.
+    fn due_task(store: &SessionStore, payload: &str) -> String {
+        store
+            .upsert_session("s1", "web", "u1", &serde_json::json!({}))
+            .unwrap();
+        store
+            .schedule_task(
+                "s1",
+                "u1",
+                chrono::Utc::now() - Duration::minutes(1),
+                payload,
+            )
+            .unwrap()
+    }
+
+    /// Forca a lease de `task_id` para o passado, simulando o tempo passando
+    /// depois de uma queda no meio do turno.
+    fn expire_lease(store: &SessionStore, task_id: &str) {
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET lease_until = datetime('now', '-1 seconds')
+                 WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn claim_e_exclusivo_e_tira_a_tarefa_do_poll() {
+        let store = SessionStore::in_memory().unwrap();
+        let task_id = due_task(&store, "check logs");
+
+        let first = store.claim_due_tasks(10, 600, "owner-a").unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, task_id);
+        assert_eq!(first[0].channel_id, "web", "JOIN com sessions preservado");
+
+        // Segundo claim (outro dono, mesmo tick ou outro processo) nao leva nada.
+        let second = store.claim_due_tasks(10, 600, "owner-b").unwrap();
+        assert!(
+            second.is_empty(),
+            "a mesma tarefa nao pode ser reivindicada duas vezes"
+        );
+
+        // Enquanto `running`, nem o poll read-only a ve.
+        assert!(store.poll_due_tasks().unwrap().is_empty());
+
+        let (status, lease_until, leased_by) = lease_row(&store, &task_id);
+        assert_eq!(status, "running");
+        assert!(lease_until.is_some(), "claim tem de gravar lease_until");
+        assert_eq!(leased_by.as_deref(), Some("owner-a"));
+    }
+
+    #[test]
+    fn claim_respeita_o_limite() {
+        let store = SessionStore::in_memory().unwrap();
+        due_task(&store, "a");
+        due_task(&store, "b");
+        due_task(&store, "c");
+
+        assert_eq!(store.claim_due_tasks(2, 600, "o").unwrap().len(), 2);
+        assert_eq!(store.claim_due_tasks(2, 600, "o").unwrap().len(), 1);
+        assert!(store.claim_due_tasks(2, 600, "o").unwrap().is_empty());
+    }
+
+    #[test]
+    fn claim_nao_leva_tarefa_futura() {
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .upsert_session("s1", "web", "u1", &serde_json::json!({}))
+            .unwrap();
+        store
+            .schedule_task(
+                "s1",
+                "u1",
+                chrono::Utc::now() + Duration::minutes(10),
+                "future",
+            )
+            .unwrap();
+
+        assert!(store.claim_due_tasks(10, 600, "o").unwrap().is_empty());
+    }
+
+    #[test]
+    fn lease_expirada_volta_a_pending_e_e_listada() {
+        let store = SessionStore::in_memory().unwrap();
+        let task_id = due_task(&store, "check logs");
+        let claimed = store.claim_due_tasks(10, 600, "owner-a").unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        // Lease viva: nada a recuperar, e ninguem mais reivindica.
+        assert!(store.recover_expired_leases().unwrap().is_empty());
+        assert!(
+            store
+                .claim_due_tasks(10, 600, "owner-b")
+                .unwrap()
+                .is_empty()
+        );
+
+        // O processo caiu; o tempo passou.
+        expire_lease(&store, &task_id);
+
+        let recovered = store.recover_expired_leases().unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "a tarefa tem de ser DEVOLVIDA para o log"
+        );
+        assert_eq!(recovered[0].id, task_id);
+        assert_eq!(
+            recovered[0].attempts, 0,
+            "queda nao consome o orcamento de retry"
+        );
+
+        let (status, lease_until, leased_by) = lease_row(&store, &task_id);
+        assert_eq!(status, "pending");
+        assert!(lease_until.is_none());
+        assert!(leased_by.is_none());
+
+        // Re-poll explicito: o proximo claim a leva de novo, e a recuperacao
+        // nao a lista uma segunda vez.
+        assert!(store.recover_expired_leases().unwrap().is_empty());
+        let again = store.claim_due_tasks(10, 600, "owner-b").unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, task_id);
+        assert_eq!(
+            lease_row(&store, &task_id).2.as_deref(),
+            Some("owner-b"),
+            "o novo dono fica registrado"
+        );
+    }
+
+    #[test]
+    fn running_sem_lease_e_tratado_como_expirado() {
+        let store = SessionStore::in_memory().unwrap();
+        let task_id = due_task(&store, "orfa");
+        // Nada legitimo produz isso; se aparecer, nao pode ficar parado.
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET status = 'running', lease_until = NULL WHERE id = ?1",
+                params![task_id],
+            )
+            .unwrap();
+
+        let recovered = store.recover_expired_leases().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(lease_row(&store, &task_id).0, "pending");
+    }
+
+    #[test]
+    fn complete_e_fail_limpam_a_lease() {
+        let store = SessionStore::in_memory().unwrap();
+        let done_id = due_task(&store, "done");
+        let failed_id = due_task(&store, "failed");
+        assert_eq!(store.claim_due_tasks(10, 600, "o").unwrap().len(), 2);
+
+        store.complete_task(&done_id).unwrap();
+        assert_eq!(
+            lease_row(&store, &done_id),
+            ("completed".to_string(), None, None)
+        );
+
+        store.fail_task(&failed_id).unwrap();
+        assert_eq!(
+            lease_row(&store, &failed_id),
+            ("failed".to_string(), None, None)
+        );
+
+        // Terminal e terminal: mesmo com a lease "expirada" nada volta.
+        assert!(store.recover_expired_leases().unwrap().is_empty());
+        assert!(store.claim_due_tasks(10, 600, "o").unwrap().is_empty());
+    }
+
+    #[test]
+    fn retry_devolve_a_pending_sem_lease() {
+        let store = SessionStore::in_memory().unwrap();
+        let task_id = due_task(&store, "flaky");
+        let task = store.claim_due_tasks(10, 600, "o").unwrap().remove(0);
+
+        let retry_at = store
+            .retry_or_fail_task(&task, 3, chrono::Utc::now())
+            .unwrap()
+            .expect("first failure schedules a retry");
+        assert!(retry_at > chrono::Utc::now());
+
+        let (status, lease_until, leased_by) = lease_row(&store, &task_id);
+        assert_eq!(status, "pending", "sem isso o tick seguinte nunca a veria");
+        assert!(lease_until.is_none());
+        assert!(leased_by.is_none());
+        // Ainda nao vencida (backoff), entao nao e reivindicada agora.
+        assert!(store.claim_due_tasks(10, 600, "o").unwrap().is_empty());
+    }
+
+    #[test]
+    fn retry_esgotado_falha_e_limpa_a_lease() {
+        let store = SessionStore::in_memory().unwrap();
+        let task_id = due_task(&store, "hopeless");
+        let task = store.claim_due_tasks(10, 600, "o").unwrap().remove(0);
+
+        // max_attempts = 1: a primeira falha ja e a ultima.
+        let next = store
+            .retry_or_fail_task(&task, 1, chrono::Utc::now())
+            .unwrap();
+        assert!(next.is_none());
+        assert_eq!(
+            lease_row(&store, &task_id),
+            ("failed".to_string(), None, None)
+        );
+    }
+
+    #[test]
+    fn recorrente_reagendada_volta_a_pending_sem_lease() {
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .upsert_session("s1", "web", "u1", &serde_json::json!({}))
+            .unwrap();
+        let (task_id, _) = store
+            .schedule_recurring_task("s1", "u1", "*/5 * * * *", Some("UTC"), "ping", None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET execute_at = ?2 WHERE id = ?1",
+                params![
+                    task_id,
+                    (chrono::Utc::now() - Duration::minutes(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        let task = store.claim_due_tasks(10, 600, "o").unwrap().remove(0);
+        assert_eq!(lease_row(&store, &task_id).0, "running");
+
+        let next = store
+            .complete_recurring_run(&task, chrono::Utc::now())
+            .unwrap()
+            .expect("no max_runs: keeps going");
+        assert!(next > chrono::Utc::now());
+
+        let (status, lease_until, leased_by) = lease_row(&store, &task_id);
+        assert_eq!(status, "pending");
+        assert!(lease_until.is_none());
+        assert!(leased_by.is_none());
+        // Proxima ocorrencia esta no futuro: nem recuperada nem reivindicada.
+        assert!(store.recover_expired_leases().unwrap().is_empty());
+        assert!(store.claim_due_tasks(10, 600, "o").unwrap().is_empty());
+        assert_eq!(store.count_recurring_tasks_for_session("s1").unwrap(), 1);
+    }
+
+    #[test]
+    fn recorrente_que_pula_ocorrencia_volta_a_pending_sem_lease() {
+        let store = SessionStore::in_memory().unwrap();
+        store
+            .upsert_session("s1", "web", "u1", &serde_json::json!({}))
+            .unwrap();
+        let (task_id, _) = store
+            .schedule_recurring_task("s1", "u1", "*/5 * * * *", Some("UTC"), "ping", None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_tasks SET execute_at = ?2 WHERE id = ?1",
+                params![
+                    task_id,
+                    (chrono::Utc::now() - Duration::minutes(1)).to_rfc3339()
+                ],
+            )
+            .unwrap();
+        let task = store.claim_due_tasks(10, 600, "o").unwrap().remove(0);
+
+        // Orcamento esgotado numa recorrente: pula a ocorrencia, mantem o cron.
+        let next = store
+            .retry_or_fail_task(&task, 1, chrono::Utc::now())
+            .unwrap()
+            .expect("recurring task skips the occurrence instead of dying");
+        assert!(next > chrono::Utc::now());
+        assert_eq!(
+            lease_row(&store, &task_id),
+            ("pending".to_string(), None, None)
+        );
+    }
+
+    #[test]
+    fn claim_com_lease_nao_positiva_ainda_e_lease_viva() {
+        let store = SessionStore::in_memory().unwrap();
+        let task_id = due_task(&store, "zero");
+        // 0 e negativo sao clampados para 1 s: a lease nunca nasce expirada.
+        assert_eq!(store.claim_due_tasks(10, 0, "o").unwrap().len(), 1);
+        assert!(store.recover_expired_leases().unwrap().is_empty());
+        assert_eq!(lease_row(&store, &task_id).0, "running");
+    }
+
+    /// Migration forward-only: um store criado ANTES das colunas de lease
+    /// ganha `lease_until`/`leased_by` no `run_migrations`, e rodar de novo
+    /// e no-op (idempotente).
+    #[test]
+    fn migracao_adiciona_colunas_de_lease_em_store_antigo() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scheduled_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                execute_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        let store = SessionStore { conn };
+        assert!(
+            !store
+                .column_exists("scheduled_tasks", "lease_until")
+                .unwrap()
+        );
+
+        store.run_migrations().unwrap();
+        assert!(
+            store
+                .column_exists("scheduled_tasks", "lease_until")
+                .unwrap()
+        );
+        assert!(store.column_exists("scheduled_tasks", "leased_by").unwrap());
+
+        // Segunda passada nao pode falhar com "duplicate column".
+        store.run_migrations().unwrap();
+
+        // E o store antigo funciona de ponta a ponta com o claim.
+        let task_id = due_task(&store, "legacy");
+        assert_eq!(store.claim_due_tasks(10, 600, "o").unwrap()[0].id, task_id);
     }
 
     // ── Recurrence ───────────────────────────────────────────────────
@@ -3096,6 +4279,43 @@ mod tests {
     }
 
     #[test]
+    fn session_token_honors_positive_idle_timeout_via_bind() {
+        // #1247: a clausula idle agora e estatica com bind ?2 — este teste
+        // exerce os dois lados dela: token recem-tocado valida com timeout
+        // positivo; last_active atrasado alem do timeout nao valida mais.
+        let session_id = "tok-session-idle";
+        let store = store_with_session(session_id);
+        let token = store
+            .create_session_token(session_id, "web", 3600, None, None)
+            .expect("token creation should succeed");
+
+        assert_eq!(
+            store
+                .validate_session_token(&token, 300)
+                .expect("validation should succeed"),
+            Some(session_id.to_string()),
+            "fresh token must validate under a positive idle timeout",
+        );
+
+        store
+            .connection()
+            .execute(
+                "UPDATE session_tokens
+                 SET last_active = datetime('now', '-600 seconds')
+                 WHERE session_id = ?1",
+                params![session_id],
+            )
+            .expect("backdating last_active should succeed");
+        assert_eq!(
+            store
+                .validate_session_token(&token, 300)
+                .expect("validation should succeed"),
+            None,
+            "token idle beyond the timeout must stop validating",
+        );
+    }
+
+    #[test]
     fn legacy_cleartext_token_is_migrated_in_place_and_keeps_working() {
         let session_id = "tok-session-4";
         let store = store_with_session(session_id);
@@ -3139,5 +4359,124 @@ mod tests {
         // Idempotent: a second pass must not double-hash.
         store.run_migrations().expect("re-migration should succeed");
         assert_eq!(stored_token_value(&store, session_id), stored);
+    }
+
+    /// #1300: `latest_session_id` e o alvo do `--resume` sem id — a sessao
+    /// cuja ultima mensagem e a mais recente, e nao a sessao criada por
+    /// ultimo. O repro da issue e exatamente a diferenca: o turno
+    /// interrompido grava a pergunta numa sessao JA existente, e a sessao
+    /// nova de um CLI posterior (ou de outro canal) nunca pode vence-la.
+    #[test]
+    fn latest_session_id_e_a_da_mensagem_mais_recente_do_canal() {
+        let store = SessionStore::in_memory().expect("store em memoria");
+        let meta = serde_json::json!({ "channel_id": "cli", "user_id": "local" });
+        store
+            .upsert_session("cli-antiga", "cli", "local", &serde_json::json!({}))
+            .expect("upsert antiga");
+        store
+            .upsert_session("cli-nova", "cli", "local", &serde_json::json!({}))
+            .expect("upsert nova");
+        // Timestamps explicitos e crescentes: o teste nao pode depender da
+        // resolucao do relogio — so da ordem das mensagens.
+        let t1 = chrono::DateTime::parse_from_rfc3339("2026-09-20T12:00:00Z")
+            .expect("t1")
+            .with_timezone(&chrono::Utc);
+        let t2 = chrono::DateTime::parse_from_rfc3339("2026-09-20T12:01:00Z")
+            .expect("t2")
+            .with_timezone(&chrono::Utc);
+        let t3 = chrono::DateTime::parse_from_rfc3339("2026-09-20T12:02:00Z")
+            .expect("t3")
+            .with_timezone(&chrono::Utc);
+
+        store
+            .append_message("cli-antiga", "user", "velha", t1, &meta)
+            .expect("msg antiga");
+        store
+            .append_message("cli-nova", "user", "nova", t2, &meta)
+            .expect("msg nova");
+        assert_eq!(
+            store.latest_session_id("cli").expect("latest"),
+            Some("cli-nova".to_string()),
+            "a sessao com a mensagem mais recente vence, nao a criada por ultimo"
+        );
+
+        // O turno interrompido grava so a pergunta (persistencia adiantada) —
+        // e isso ja basta para a antiga voltar a ser o alvo do resume.
+        store
+            .append_message("cli-antiga", "user", "interrompida", t3, &meta)
+            .expect("msg interrompida");
+        assert_eq!(
+            store.latest_session_id("cli").expect("latest"),
+            Some("cli-antiga".to_string()),
+            "a pergunta solta do turno interrompido e atividade recente"
+        );
+
+        // Mensagem de OUTRO canal nao disputa o alvo do CLI.
+        store
+            .upsert_session("tg-1", "telegram", "u1", &serde_json::json!({}))
+            .expect("upsert telegram");
+        let t4 = chrono::DateTime::parse_from_rfc3339("2026-09-20T12:03:00Z")
+            .expect("t4")
+            .with_timezone(&chrono::Utc);
+        store
+            .append_message("tg-1", "user", "do telegram", t4, &meta)
+            .expect("msg telegram");
+        assert_eq!(
+            store.latest_session_id("cli").expect("latest"),
+            Some("cli-antiga".to_string()),
+            "canal e isolado: telegram nao rouba o resume do CLI"
+        );
+
+        // Canal sem nenhuma mensagem: nada a retomar.
+        assert_eq!(
+            store.latest_session_id("canal-fantasma").expect("latest"),
+            None,
+            "canal sem sessao nenhuma nao tem alvo"
+        );
+    }
+
+    /// #1347: a sessao do Telegram resolvida por UUID so e reconhecivel pela
+    /// linha em `chat_session_keys`. Uma sessao compartilhada tem uma fonte
+    /// por canal, e a consulta devolve todas — nao so a primeira.
+    #[test]
+    fn fontes_da_sessao_voltam_todas_sem_repeticao() {
+        let store = SessionStore::in_memory().expect("store");
+        let meta = serde_json::json!({});
+        for sid in ["sessao-uuid", "outra"] {
+            store
+                .upsert_session(sid, "canal", "user", &meta)
+                .expect("sessao");
+        }
+        assert_eq!(
+            store
+                .get_sources_for_session("sessao-uuid")
+                .expect("fontes"),
+            Vec::<String>::new(),
+            "sessao sem chave nenhuma"
+        );
+        store
+            .upsert_session_key("sessao-uuid", "vscode", "workspace-1")
+            .expect("chave");
+        store
+            .upsert_session_key("sessao-uuid", "telegram", "123456")
+            .expect("chave");
+        store
+            .upsert_session_key("sessao-uuid", "telegram", "654321")
+            .expect("chave");
+        store
+            .upsert_session_key("outra", "discord", "999")
+            .expect("chave");
+        assert_eq!(
+            store
+                .get_sources_for_session("sessao-uuid")
+                .expect("fontes"),
+            vec!["telegram".to_string(), "vscode".to_string()]
+        );
+        assert_eq!(
+            store
+                .get_sources_for_session("inexistente")
+                .expect("fontes"),
+            Vec::<String>::new()
+        );
     }
 }

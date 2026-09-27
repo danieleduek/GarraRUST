@@ -1,14 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use garraia_agents::ChatMessage;
 use garraia_channels::teams::{TeamsChannel, TeamsConfig, TeamsOnMessageFn};
 use garraia_config::AppConfig;
-use garraia_security::{Allowlist, PairingManager};
 use tracing::{info, warn};
 
 use crate::state::SharedState;
 
-use super::config::{default_allowlist_path, resolve_api_key};
+use super::config::{channel_gates, resolve_api_key};
 
 /// Constroi os canais Teams a partir da config (#1050).
 ///
@@ -83,13 +82,9 @@ pub fn build_teams_channels(config: &AppConfig, state: &SharedState) -> Vec<Arc<
             continue;
         };
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        // #1189: gates compartilhados com o AppState -- instancias
+        // proprias fazem o `/pair` nunca casar com o `claim()`.
+        let (allowlist, pairing) = channel_gates(state);
 
         let state_for_cb = Arc::clone(state);
         let allowlist_for_cb = Arc::clone(&allowlist);
@@ -189,7 +184,14 @@ pub fn build_teams_channels(config: &AppConfig, state: &SharedState) -> Vec<Arc<
                     // (#988): o wrapper passa `ExecContext::default()`, e
                     // entao `/mode search` responde "modo definido" sem a
                     // politica de ferramenta valer.
-                    let exec = state.exec_context_for(&session_id, Some(&user_id)).await;
+                    let exec = crate::approval_scope::com_escopo(
+                        state
+                            .exec_context_for_msg(&session_id, Some(&user_id), Some(&text))
+                            .await,
+                        "teams",
+                        &session_id,
+                        &user_id,
+                    );
 
                     let response = if let Some(delta_sender) = delta_tx {
                         state

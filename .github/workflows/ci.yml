@@ -88,6 +88,59 @@ jobs:
       - name: Validate .claude/agents/*.md frontmatter
         run: python3 scripts/ci/validate_agent_frontmatter.py
 
+  # Ponte WhatsApp (bridge/whatsapp) — Node/Baileys, fora do workspace Cargo.
+  #
+  # Nao da para parear no CI: nao existe telefone e os servidores do WhatsApp
+  # nao sao alcancaveis do runner. O que da para provar automaticamente e o
+  # contrato: o protocolo NDJSON v1. Por isso o job roda duas coisas.
+  #
+  # 1. `node --test`: framing, round-trip do estado de auth em memoria,
+  #    redacao, mapeamento de motivo de queda, backoff e o fluxo inteiro com o
+  #    `makeWASocket` injetado — nenhum teste abre socket de rede.
+  # 2. A fixture Python (a mesma que os testes Rust de garraia-channels usam
+  #    para rodar sem Node e sem telefone) passando pelo protocol-lint. E o que
+  #    impede a fixture e a ponte real de divergirem em silencio: se a fixture
+  #    mentir, os testes Rust ficam verdes contra um protocolo que nao existe.
+  #
+  # `npm ci` (nao `npm install`) de proposito: o package-lock.json e
+  # versionado e o pin exato do Baileys e parte do contrato reportado em
+  # `started.baileys_version`.
+  whatsapp-bridge:
+    name: WhatsApp bridge (Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: bridge/whatsapp
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: bridge/whatsapp/package-lock.json
+
+      - name: Install bridge dependencies
+        run: npm ci
+
+      - name: Run bridge tests
+        run: node --test
+
+      # O handshake tem de sair valido mesmo sem tocar a rede — e este o modo
+      # que o `garra whatsapp status` e o doctor do Rust invocam.
+      - name: Protocol check emits a valid started event
+        run: node bridge.mjs --protocol-check | node scripts/protocol-lint.mjs
+
+      - name: Fake bridge fixture speaks the same protocol
+        run: |
+          python3 ../../crates/garraia-channels/tests/fixtures/fake_whatsapp_bridge.py \
+              --scenario pair-ok --qr-expires 1 | node scripts/protocol-lint.mjs
+
   # Guarda de integridade do ledger de supressoes do CodeQL.
   #
   # O ledger em docs/security/codeql-suppressions.json e chaveado por
@@ -127,13 +180,68 @@ jobs:
         run: bash scripts/security/codeql-reapply-dismissals.sh --check-md
 
       # Cada entrada ainda aponta para o statement que a justificativa descreve,
-      # e a coluna File:line do .md casa com o .json (o --check-md acima so
-      # compara os numeros, nao as ancoras).
+      # e a coluna File:line do .md aponta para o mesmo arquivo do .json (o
+      # --check-md acima so compara os numeros, nao as ancoras).
+      #
+      # A ancora e o `sink_snippet` e a linha e DERIVADA dele (#1263), entao
+      # `--no-rewrite`: o job reporta a posicao derivada e nao escreve nada. A
+      # arvore do runner e descartada, e dizer "reescrito" aqui seria mentira.
+      # Quem consertar roda o checker sem a flag, localmente, e commita o
+      # `line` atualizado junto com a mudanca que o moveu. Vermelho aqui
+      # significa uma coisa so: o statement suprimido mudou, sumiu, ou ficou
+      # ambiguo — e ai a supressao precisa de reauditoria humana.
       - name: Ancoras do ledger ainda apontam para seus statements
-        run: python3 scripts/security/check-ledger-anchors.py
+        run: python3 scripts/security/check-ledger-anchors.py --no-rewrite
 
       - name: Testes do checker de ancoras
         run: python3 scripts/security/tests/test_ledger_anchors.py
+
+  # Slice D1 da #1228. O formato dos fragmentos de `changelog.d/` so era
+  # validado por quem lembrasse de rodar `assemble.py --check` a mao — e a
+  # auditoria achou 4 de 6 PRs abertas sem fragmento nenhum. Como as notas de
+  # release saem do CHANGELOG.md e nao da lista de commits (regra 15 do
+  # CLAUDE.md), o silencio so aparecia no dia da release.
+  #
+  # Este job valida FORMATO e roda os testes dos proprios scripts. A checagem
+  # de PRESENCA de fragmento e a slice D2, deliberadamente separada: ela
+  # precisa de label de escape e de um periodo em modo observacao antes de
+  # bloquear.
+  changelog:
+    name: Changelog fragments
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install pytest
+        run: python3 -m pip install --quiet pytest
+
+      - name: Formato dos fragmentos de changelog.d/
+        run: python3 scripts/changelog/assemble.py --check
+
+      # As duas suites rodam em invocacoes SEPARADAS de proposito: as duas
+      # trazem um `tests/__init__.py` chamado `tests`, entao um unico
+      # `pytest scripts/changelog/tests scripts/quality/tests` quebra na
+      # coleta com `ModuleNotFoundError: No module named 'tests.<...>'`.
+      # Medido neste repositorio; nao junte os dois numa linha so.
+      - name: Testes do assemble.py
+        run: python3 -m pytest scripts/changelog/tests -q
+
+      - name: Testes dos parsers do quality ratchet
+        run: python3 -m pytest scripts/quality/tests -q
+
+      # O `release.yml` so roda no tag; um asset copiado para `release/` e
+      # esquecido na lista `files:` do upload so aparecia na release publicada
+      # (v0.4.4: AppImage aarch64 com `.sha256` e sem o arquivo). Checado aqui,
+      # no PR, antes do tag. Invocacao separada pelo mesmo motivo acima.
+      - name: Todo asset da release esta na lista de upload
+        run: python3 scripts/release/check_files.py
+
+      - name: Testes do check_files.py
+        run: python3 -m pytest scripts/release/tests -q
 
   # Plan 0127 (PR-B) — shellcheck `install.sh` and the bash test harness.
   # `install.sh` is the public `curl | sh` entry point and has been
@@ -157,7 +265,7 @@ jobs:
         run: shellcheck tests/install_sh/fixtures/garraia-stub.sh
 
       - name: Run shellcheck on installer unit tests
-        run: shellcheck tests/install_sh/checksum_format.sh tests/install_sh/resolve_version.sh tests/install_sh/documented_urls.sh tests/install_sh/detect_platform.sh
+        run: shellcheck tests/install_sh/checksum_format.sh tests/install_sh/resolve_version.sh tests/install_sh/documented_urls.sh tests/install_sh/detect_platform.sh tests/install_sh/garra_alias.sh
 
       - name: Syntax-check the bash test runners
         run: |
@@ -166,6 +274,7 @@ jobs:
           bash -n tests/install_sh/parse_args.sh
           bash -n tests/install_sh/documented_urls.sh
           bash -n tests/install_sh/detect_platform.sh
+          bash -n tests/install_sh/garra_alias.sh
 
       - name: Execute installer bootstrap_phase tests
         run: bash tests/install_sh/bootstrap_phase.sh
@@ -200,6 +309,12 @@ jobs:
       # installer baixaria o asset glibc e morreria no loader.
       - name: Execute installer detect-platform tests
         run: bash tests/install_sh/detect_platform.sh
+
+      # Alias `garra` ao lado de `garraia` (#1328): a CLI, a wiki e o README
+      # mandam rodar `garra start`, e ate aqui so o build do fonte tinha esse
+      # nome. Cobre criar, reapontar, preservar arquivo real e o ramo sudo.
+      - name: Execute installer garra-alias tests
+        run: bash tests/install_sh/garra_alias.sh
 
   # `install.ps1` is the Windows sibling of `install.sh` and the `irm | iex`
   # entry point, so it gets the same treatment: a blocking lint plus unit tests
@@ -271,12 +386,24 @@ jobs:
       - name: Execute installer platform tests
         run: ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -File tests/install_ps1/platform.ps1
 
+      # Espelha tests/install_sh/garra_alias.sh (#1328, CLAUDE.md 16): o shim
+      # garra.cmd no lugar do symlink. Os casos que executam o shim so rodam
+      # na perna windows-latest, onde ha um cmd.exe para servir de garraia.exe.
+      - name: Execute installer garra-alias tests
+        run: ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -File tests/install_ps1/garra_alias.ps1
+
   # Lint with clippy (strict — bloqueante desde plan 0049 / GAR-429)
   clippy:
     name: Clippy Linting
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # Tag do MinIO que o step `storage-s3` constroi a partir do fonte
+      # (#1458). Tem de ser a mesma que `tests/s3_integration.rs` fixa — o
+      # step confere. Bump aqui, no teste e no `docker-compose.minio.yml`
+      # juntos; o script `scripts/ci/build-minio-image.sh` recebe por env.
+      MINIO_TAG: RELEASE.2025-02-28T09-55-16Z
     # Plan 0049 (GAR-429 Lote Q.1, 2026-04-22) limpou os 26 warnings
     # pré-existentes (too_many_arguments, collapsible_if, explicit_auto_deref,
     # assertions_on_constants, new_without_default, items_after_test_module,
@@ -292,18 +419,23 @@ jobs:
         with:
           components: clippy
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
 
       - name: Run clippy
-        # garraia-desktop (Tauri) is excluded because its build.rs depends on
-        # the GTK/glib system libraries and a Windows sidecar binary that are
-        # not available on GitHub-hosted runners. Desktop is built locally via
-        # scripts/build-installer.ps1.
+        # garraia-desktop (Tauri) is excluded from every cargo invocation in
+        # this workflow: its build.rs needs the GTK/webkit dev packages and a
+        # staged sidecar binary (binaries/garraia-<target-triple>), and these
+        # jobs install neither. That does not leave the crate unbuilt:
+        # .github/workflows/desktop.yml builds and bundles it (MSI/NSIS on
+        # windows-latest, .deb/AppImage on ubuntu-22.04) on every PR that
+        # touches crates/garraia-desktop/** or crates/garraia-cli/**. That
+        # workflow is path-filtered, so it is not a required check, and it
+        # runs no clippy and no tests on the crate.
         run: cargo clippy --workspace --exclude garraia-desktop --all-targets -- -D warnings
 
       - name: Run clippy (mcp-http)
@@ -315,22 +447,43 @@ jobs:
         # mas usa `SseStream::from_bytes_stream`, que só existe a partir da
         # 0.2.4), e nada no CI teria pegado. Este step fecha o buraco.
         # `garraia` é o nome do pacote em `crates/garraia-cli/`.
-        run: cargo clippy -p garraia --features mcp-http --all-targets -- -D warnings
+        #
+        # Issue #1242: clippy compila, mas NAO executa. O alvo
+        # `mcp_boot_pending_allowlist` do garraia-gateway declara
+        # `required-features = ["mcp-http"]`, e o `cargo test --workspace` do
+        # job `test` roda com as features default — um alvo com
+        # `required-features` nao satisfeitas e PULADO EM SILENCIO, sem uma
+        # linha no log. O teste que prova que uma falha de boot HTTP nao perde
+        # a allowlist existia e nao rodava em lugar nenhum. A linha de `test`
+        # abaixo e o que o faz rodar; o guard
+        # `scripts/ci/required_features_covered.py` (job `test`) impede que o
+        # proximo alvo assim volte a nascer orfao.
+        run: |
+          cargo clippy -p garraia --features mcp-http --all-targets -- -D warnings
+          cargo test -p garraia-gateway --features mcp-http --test mcp_boot_pending_allowlist
 
       - name: Run clippy + tests (mcp)
         # Buraco vizinho do `mcp-http` acima: `crates/garraia-agents` declara
-        # `default = []` e `mcp = ["dep:rmcp"]`, e o unico alvo de teste que
-        # exercita o ciclo de vida real do MCP
-        # (`crates/garraia-agents/tests/mcp_lifecycle.rs`) comeca com
+        # `default = []` e `mcp = ["dep:rmcp"]`, e tanto `pub mod mcp` quanto
+        # os alvos de teste que exercitam o ciclo de vida real
+        # (`tests/mcp_lifecycle.rs`, `tests/mcp_child_env.rs`) estao atras de
         # `#![cfg(feature = "mcp")]`. Como nenhum job passava `--features mcp`
-        # — e `--all-features` nao e usado em lugar nenhum —, os tres testes
-        # (`tool_survives_reconnect`, `detects_dead_child_and_reconnects`,
-        # `disconnect_all_is_bounded_with_stubborn_child`) nunca rodavam no CI.
-        # Issue #1089. O clippy vem junto pelo mesmo motivo dos outros steps:
-        # sem ele o codigo sob a feature apodrece sem aviso.
+        # — e `--all-features` nao e usado em lugar nenhum —, nada disso
+        # rodava no CI. Issue #1089.
+        #
+        # O `cargo test` aqui NAO nomeia alvo de proposito. A versao anterior
+        # deste step era `--test mcp_lifecycle`, um alvo unico, entao todo
+        # arquivo de teste novo sob a feature nascia compilado e nunca
+        # executado — foi exatamente o que aconteceu com `mcp_child_env.rs` e
+        # com os testes unitarios de `src/mcp/` (#1075). Sem `--test`, o cargo
+        # roda a lib e TODOS os alvos de integracao da feature, e um arquivo
+        # novo entra na cobertura sem ninguem lembrar de editar este YAML.
+        #
+        # O clippy vem junto pelo mesmo motivo dos outros steps: sem ele o
+        # codigo sob a feature apodrece sem aviso.
         run: |
           cargo clippy -p garraia-agents --features mcp --all-targets -- -D warnings
-          cargo test -p garraia-agents --features mcp --test mcp_lifecycle
+          cargo test -p garraia-agents --features mcp
 
       - name: Run clippy + tests (signal)
         # Mesmo buraco do `mcp-http` acima, e do `auth-integration` mais
@@ -366,6 +519,27 @@ jobs:
           cargo clippy -p garraia-channels --features line --all-targets -- -D warnings
           cargo test -p garraia-channels --features line --lib
 
+      - name: Run clippy + tests (whatsapp-linked)
+        # Variacao do mesmo buraco (#1238). Aqui a feature nao esta OFF no
+        # `--workspace`: o `garraia-cli` a liga, e a unificacao de features do
+        # cargo a acende para o workspace inteiro. A cobertura existe, mas por
+        # ACIDENTE — no dia em que alguem tirar `features = ["whatsapp-linked"]`
+        # da dependencia do CLI, ou mover o comando para tras de outra feature,
+        # o canal inteiro sai do CI em silencio, que e exatamente o modo de
+        # falha que os comentarios do `signal` e do `line` acima descrevem.
+        #
+        # Concreto: `apply_child_env` (`env_clear` + allowlist R3) e o unico
+        # controle que impede o filho `node` de herdar `ANTHROPIC_API_KEY`,
+        # `GARRAIA_JWT_SECRET`, a passphrase do cofre e oito vetores de
+        # execucao de codigo (`NODE_OPTIONS`, `LD_PRELOAD`, `NPM_CONFIG_*`).
+        # O teste que o prova morre junto com este step.
+        #
+        # Os testes de integracao entram junto (sem `--lib`): e neles que o
+        # ciclo de vida do processo filho roda contra a fixture Python.
+        run: |
+          cargo clippy -p garraia-channels --features whatsapp-linked --all-targets -- -D warnings
+          cargo test -p garraia-channels --features whatsapp-linked
+
       - name: Run clippy + tests (google_chat, teams, matrix, irc, voice)
         # Fecha o mesmo buraco dos dois steps acima para as cinco features
         # restantes de `garraia-channels`. Todas sao OFF por default, entao
@@ -387,6 +561,133 @@ jobs:
             cargo test -p garraia-channels --features "$feature" --lib
             echo "::endgroup::"
           done
+
+          # Mesmo buraco (#1089) para a feature `mqtt` do garraia-hardware
+          # (#1126): OFF por default, entao o `--workspace` de cima nao
+          # compilava uma linha dela. O adapter e o que fala com o broker —
+          # quebrar no escuro significaria descoberta, leitura e execucao
+          # de dispositivo morrendo no deploy sem nenhum gate ver.
+          echo "::group::garraia-hardware --features mqtt"
+          cargo clippy -p garraia-hardware --features mqtt --all-targets -- -D warnings
+          cargo test -p garraia-hardware --features mqtt --lib
+          echo "::endgroup::"
+
+          # Mesmo buraco para a feature `home-assistant` (#1127): idem —
+          # aqui SEM `--lib`, porque a feature traz testes de integracao
+          # contra um hub mockado (axum) em tests/, e e exatamente esse
+          # fluxo (descoberta, servicos, WebSocket de presenca) que precisa
+          # de gate.
+          echo "::group::garraia-hardware --features home-assistant"
+          cargo clippy -p garraia-hardware --features home-assistant --all-targets -- -D warnings
+          cargo test -p garraia-hardware --features home-assistant
+          echo "::endgroup::"
+
+          # Mesmo buraco para a feature `automations` (#1128): o motor de
+          # regras declarativas (TOML/JSON → eventos → gate → acao). SEM
+          # `--lib`, porque a feature traz o teste de integracao em tests/
+          # que roda o pipeline completo (carga de spec, condicao, teto de
+          # risco, rate limit, debounce) contra o MockDevice — o fluxo que
+          # decide se um dispositivo fisico liga sozinho. A combinacao com
+          # os adapters e a que o gateway usa; o `--workspace` de cima mais
+          # o gate do gateway cobre o resto.
+          echo "::group::garraia-hardware --features automations"
+          cargo clippy -p garraia-hardware --features automations --all-targets -- -D warnings
+          cargo test -p garraia-hardware --features automations
+          echo "::endgroup::"
+
+          # Mesmo buraco para a feature `skills` (#1131): o catalogo que le
+          # os manifestos `hardware-adapter`/`hardware-preset` do diretorio
+          # de skills. SEM `--lib`, porque a feature traz o teste de
+          # integracao em tests/skills.rs que carrega os skills oficiais
+          # VERSIONADOS NO REPO (skills/hardware/) — e esse teste que impede
+          # um manifesto oficial quebrado (transporte com typo, risco fora
+          # de r0..r5) de entrar, e que prende a regra de que um skill so
+          # sobe risco, nunca baixa.
+          echo "::group::garraia-hardware --features skills"
+          cargo clippy -p garraia-hardware --features skills --all-targets -- -D warnings
+          cargo test -p garraia-hardware --features skills
+          echo "::endgroup::"
+
+      # `storage-s3` estava fora da matriz de features (#1214): o modulo
+      # s3_compat.rs INTEIRO e `#[cfg(feature = "storage-s3")]`, entao
+      # nenhum job compilava o backend S3 de producao — clippy com a
+      # feature ligada chegou a falhar sem ninguem ver. Step proprio, e nao
+      # mais um bloco no step dos canais, pelo que os steps abaixo explicam
+      # sobre o alcance real deste gate.
+      # #1458: nao ha mais registry gratuito servindo `minio/minio` — o Docker
+      # Hub removeu o repositorio (#1230), o quay.io passou a exigir login para
+      # toda tag em 2026-09-24 (401 sustentado; o retry do #1457 nao muda
+      # nada) e o dl.min.io responde 410. O que segue publico e o FONTE, no
+      # GitHub. Entao a imagem que o testcontainer procura e CONSTRUIDA aqui:
+      # `scripts/ci/build-minio-image.sh` compila o `minio` a partir da tag
+      # upstream fixada (recusa se a tag nao apontar mais para o commit
+      # esperado), embala em debian:bookworm-slim e etiqueta a imagem com o
+      # nome:tag que `tests/s3_integration.rs` pede. O testcontainers 0.27 so
+      # faz pull quando o `create` devolve 404, entao a imagem local basta e
+      # nenhum registry entra no caminho. O binario compilado fica no cache
+      # do Actions, chaveado pela tag: so o primeiro run depois de um bump
+      # paga o `go build`. A falha, se houver, continua aparecendo AQUI, com
+      # o erro no log, e nao como timeout opaco dentro do teste.
+      - name: Restore the MinIO binary built from source
+        id: minio-bin
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/minio-bin
+          key: minio-bin-${{ env.MINIO_TAG }}-${{ runner.os }}-${{ runner.arch }}-1
+
+      - name: Build the MinIO image the testcontainer expects (no registry)
+        env:
+          MINIO_BIN_DIR: ${{ runner.temp }}/minio-bin
+        run: |
+          set -euo pipefail
+          # A tag vive em tres lugares — este env, o script (default) e o
+          # teste. O script le este env; o teste e conferido aqui, para o
+          # cache e o container nunca divergirem do que a suite pede.
+          grep -q "const MINIO_TAG: &str = \"${MINIO_TAG}\";" crates/garraia-storage/tests/s3_integration.rs \
+            || { echo "::error ::MINIO_TAG do workflow (${MINIO_TAG}) difere do que tests/s3_integration.rs fixa — alinhar os dois"; exit 1; }
+          scripts/ci/build-minio-image.sh
+
+      - name: Run clippy + tests (storage-s3)
+        # ATENCAO ao ler um verde daqui: este step cobre COMPILACAO, clippy e
+        # os testes unitarios do backend S3, E a suite de integracao real
+        # contra MinIO (tests/s3_integration.rs). A imagem vem do quay.io
+        # pelo motivo que o step de pre-pull acima explica (#1230).
+        # GARRAIA_REQUIRE_DOCKER="1" transforma em falha o skip que o teste
+        # faria se o container nao subir, para que um verde aqui prove que o
+        # MinIO rodou de verdade (segundos, nao milissegundos). `--nocapture`
+        # deixa o log do container visivel se algo der errado.
+        env:
+          GARRAIA_REQUIRE_DOCKER: "1"
+        run: |
+          cargo clippy -p garraia-storage --features storage-s3 --all-targets -- -D warnings
+          cargo test -p garraia-storage --features storage-s3 -- --nocapture
+
+      # #1225 S4: o sandbox por tool (`agent.sandbox`, backend docker) so
+      # tinha testes sobre a STRING que `wrap_command` monta — nenhum subia um
+      # container. Os dois steps abaixo rodam o teste de integracao contra o
+      # Docker real do runner, pela mesma razao de existir do step de
+      # storage-s3 acima: um verde que nunca tocou o backend nao prova nada.
+      - name: Pre-pull debian:bookworm-slim for sandbox_docker
+        # Mesmo racional do pre-pull do MinIO: se o registry parar de servir a
+        # imagem default da policy, a falha aparece AQUI, com o erro do
+        # registry no log, em vez de virar um timeout opaco dentro do teste.
+        # O teste em si continua pronto para o pull implicito (timeout 120 s)
+        # — este step e diagnostico, nao dependencia.
+        timeout-minutes: 5
+        run: docker pull debian:bookworm-slim
+
+      - name: Run sandbox Docker integration test (garraia-agents)
+        # tests/sandbox_docker.rs: `echo` de dentro do container (`/.dockerenv`
+        # presente), `getent hosts` falha com `--network none` e resolve no
+        # controle com rede, e o cwd do host aparece via `mount_workdir` e
+        # some sem ele. GARRAIA_REQUIRE_DOCKER="1" transforma em falha o skip
+        # que o teste faria sem daemon, para que o verde prove que o container
+        # rodou. `--nocapture` deixa a saida do container visivel se algo der
+        # errado. Sem `continue-on-error`: e gate.
+        timeout-minutes: 10
+        env:
+          GARRAIA_REQUIRE_DOCKER: "1"
+        run: cargo test -p garraia-agents --test sandbox_docker --test sandbox_docker_escape --test sandbox_docker_tools -- --nocapture
 
   # Supply-chain gate: license allow-list + crate bans + registry source bans
   # + RustSec advisories. Uses deny.toml at the repo root. Runs in parallel
@@ -493,14 +794,27 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
+      - name: Guard — every gated test target runs somewhere in CI
+        # Issue #1242. O `cargo test --workspace` do passo seguinte roda com
+        # as features default, e um alvo `[[test]]` cujas `required-features`
+        # nao estao satisfeitas e PULADO EM SILENCIO — sem log, sem "0 tests",
+        # sem aviso. Foi assim que `mcp_boot_pending_allowlist` nasceu escrito
+        # e nunca executado. Este guard le os manifests e as invocacoes de
+        # `cargo test` dos workflows e recusa qualquer alvo gated que nenhum
+        # job execute. Linux-only: e independente de SO e `python3` nem sempre
+        # esta no PATH do runner Windows.
+        if: runner.os == 'Linux'
+        run: python3 scripts/ci/required_features_covered.py
+
       - name: Build workspace
-        # See clippy job comment: garraia-desktop excluded on CI.
+        # See clippy job comment: garraia-desktop is excluded from this
+        # workflow (desktop.yml builds it).
         run: cargo build --workspace --exclude garraia-desktop
 
       - name: Run tests
@@ -523,9 +837,29 @@ jobs:
           fi
         shell: bash
 
+      - name: Compile cfg(windows) code under the mcp feature
+        # Issue #1253. O job `mcp` (ubuntu) roda clippy+test com
+        # `--features mcp`, mas o `#[cfg(windows)]` la dentro — o wrapper
+        # `cmd /c` do manager.rs que resolve npx/uvx/.cmd no CreateProcess —
+        # nao compila em plataforma NENHUMA: o `--no-run` deste job matrix
+        # compila so as features default. A saída barata e este step no
+        # runner Windows, onde a toolchain MSVC nativa ja existe. O caminho
+        # alternativo (cross mingw a partir do ubuntu) foi descartado com
+        # medição: `cargo check --target x86_64-pc-windows-msvc` leva 8m30s
+        # e falha no build script do `ring` sem toolchain C do alvo, e o
+        # container de desenvolvimento nao tem root para instalar
+        # gcc-mingw-w64. check, nao test: o alvo aqui e COMPILAR o codigo
+        # cfg(windows); rodar a suite mcp inteira no Windows fica para
+        # quando houver evidencia de que os testes de spawn de filho passam
+        # la (o padrao do #1236 — injecao — cobre a semantica em qualquer
+        # plataforma).
+        if: runner.os == 'Windows'
+        run: cargo check -p garraia-agents --features mcp --all-targets
+        shell: bash
+
   # Integração garraia-auth com test-support (plan 0354).
   #
-  # Os 16 binários de teste de integração do garraia-auth (extractor, matriz
+  # Os 15 binários de teste de integração do garraia-auth (extractor, matriz
   # RLS de 81 cenários, signup_flow, sessions_lifecycle, password_change, …)
   # declaram `required-features = ["test-support"]`, que NÃO é default — o
   # `cargo test --workspace` do job `test` os pula SILENCIOSAMENTE. Até este
@@ -583,7 +917,9 @@ jobs:
   #     blocking via GAR-453).
   #
   # Excludes (matching test/build/clippy/msrv):
-  #   - garraia-desktop  — Tauri sidecar + GTK absent on GHA runners.
+  #   - garraia-desktop  — Tauri sidecar + GTK/webkit not installed by this
+  #                        job (see the clippy job comment; desktop.yml
+  #                        builds the crate).
   #   - garraia-auth     — integration tests need testcontainers + secrets
   #                        (this job intentionally has no GARRAIA_JWT_SECRET
   #                        or DATABASE_URL provisioned). Coverage of this
@@ -603,11 +939,15 @@ jobs:
   #              avoid restoring target/ from the `test` job (compiled
   #              without `llvm-tools-preview` instrumentation).
   #   - MEDIUM:  `garraia-auth` and `garraia-workspace` excluded (see above).
-  #   - LOW:     `timeout-minutes: 30` to bound runaway test hangs.
+  #   - LOW:     `timeout-minutes: 45` to bound runaway test hangs (30 until v0.4.5).
   coverage:
     name: Coverage (cargo-llvm-cov)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45 e nao 30: o job levava 21-24 min ate a v0.4.4, e o trem da onda B da
+    # v0.4.5 (#1375) o levou ao teto — cancelado em main (af3227c) aos 30 min,
+    # com todos os testes ja verdes e o relatorio ja gerado, a ~30 s do fim.
+    # O teto continua pegando hang; so deixa de derrubar o job por volume.
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write   # required for gh pr comment
@@ -638,9 +978,9 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -710,24 +1050,43 @@ jobs:
         # `permissions:` declaration; without this guard, the `gh pr comment`
         # step would 403 on every fork PR, breaking the §11.3 contract that
         # the job runs on every PR.
+        #
+        # #1228 (slice E): o comentario e EDITADO no lugar a cada push
+        # (`scripts/ci/upsert_pr_comment.py`, achado pelo marcador E pelo
+        # autor `github-actions[bot]`), em vez de um comentario novo por push.
+        # O corpo leva so a linha TOTAL e o link do run; a tabela inteira vai
+        # para o job summary. Dado do evento chega por `env:`.
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          PR_NUMBER="${{ github.event.pull_request.number }}"
+          set -euo pipefail
           {
-            echo '<!-- coverage-comment -->'
             echo '## Coverage Report (cargo-llvm-cov)'
-            echo
-            echo '_Generated by `coverage` job in this PR run. Soft-gate: no threshold; artifact + summary only._'
-            echo
-            echo 'Excluded crates: `garraia-desktop`, `garraia-auth`, `garraia-workspace` (see ci.yml comment).'
             echo
             echo '```'
             cat coverage-summary.txt
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          total="$(grep -E '^TOTAL' coverage-summary.txt | tail -n 1 || true)"
+          {
+            echo '<!-- coverage-comment -->'
+            echo '## Coverage Report (cargo-llvm-cov)'
+            echo
+            echo '_Soft-gate: no threshold. Excluded crates: `garraia-desktop`, `garraia-auth`, `garraia-workspace` (see ci.yml comment)._'
+            echo
+            echo '```'
+            echo "${total:-TOTAL line not found in coverage-summary.txt}"
+            echo '```'
+            echo
+            echo "Full per-file table: job summary of [this run]($RUN_URL) (also the \`coverage-summary\` artifact)."
           } > pr-comment.md
-          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file pr-comment.md
+          python3 scripts/ci/upsert_pr_comment.py \
+            --repo "$REPO" --pr "$PR_NUMBER" \
+            --marker '<!-- coverage-comment -->' --body-file pr-comment.md
 
   # Build only (no test) for faster feedback on other platforms if needed
   build:
@@ -742,15 +1101,16 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
 
       - name: Build workspace
-        # See clippy job comment: garraia-desktop excluded on CI.
+        # See clippy job comment: garraia-desktop is excluded from this
+        # workflow (desktop.yml builds it).
         run: cargo build --workspace --exclude garraia-desktop --release
 
   # MSRV gate (GAR-441) — bloqueante. Drift descoberto em smoke test do
@@ -772,8 +1132,8 @@ jobs:
   # o piso real é ditado pela árvore do wasmtime, não pelas demais deps.
   # `--locked` garante que o lockfile não é regerado durante o check
   # (qualquer drift falha o build). `garraia-desktop` excluído pelos
-  # mesmos motivos do clippy/build (GTK + sidecar Windows ausentes em
-  # runners GHA).
+  # mesmos motivos do clippy/build (este job não instala GTK/webkit nem
+  # prepara o sidecar; quem compila a crate é o desktop.yml).
   msrv:
     name: MSRV check (1.95)
     runs-on: ubuntu-latest
@@ -790,9 +1150,9 @@ jobs:
         # propor de novo um toolchain inexistente (ex.: @1.100, PR #819).
         uses: dtolnay/rust-toolchain@1.95
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -823,9 +1183,9 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -945,9 +1305,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -1095,9 +1455,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 

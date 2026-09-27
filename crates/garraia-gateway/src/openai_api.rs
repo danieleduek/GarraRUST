@@ -240,10 +240,66 @@ pub async fn chat_completions(
     let session_id = resolve_session_id(&headers)
         .await
         .unwrap_or_else(|_| Uuid::new_v4().to_string());
+
+    // #1462: uma `X-Session-Id` escolhida pelo cliente so alcanca sessao das
+    // superficies locais do operador. O id de uma sessao de canal
+    // (`whatsapp-linked-<numero>`, `telegram-<chat>` — adivinhaveis por
+    // construcao) ou do mobile responde como inexistente, e a sessao nao e
+    // tocada: a checagem vem ANTES de `hydrate_session_history`, que
+    // carregaria a conversa da vitima para este request e anotaria `vscode`
+    // na linha dela. Sem header o id e um UUID novo e nao ha o que conferir.
+    // O log nao leva o id: o de canal carrega telefone.
+    if headers.contains_key("x-session-id") {
+        match state.id_de_sessao_do_cliente_alcanca(&session_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    request_id = %request_id,
+                    "X-Session-Id aponta para sessao de outra superficie; recusada como inexistente"
+                );
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": "session not found",
+                            "type": "invalid_request_error",
+                            "code": "session_not_found",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                warn!(request_id = %request_id, erro = %e, "falhou ao ler o sessions.db para conferir a X-Session-Id");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": "failed to read session store",
+                            "type": "server_error",
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
     let is_streaming = body.stream.unwrap_or(false);
 
     // Resolve user identity from Authorization header
     let user_id = resolve_user_id(&headers, &state);
+    // #1343: quem pode aprovar, no proximo request desta `X-Session-Id`, um
+    // pedido de confirmacao que pausar este. O dono resolvido pelo servidor
+    // (nunca `X-User-Id`) mais o hash dos bytes do `Authorization` que
+    // chegou: outro cliente com a mesma sessao e outra credencial nao
+    // aprova, e um header que nao e UTF-8 continua sendo a credencial dele
+    // (nunca o anonimo). Sem dono, `None` — e sem escopo a pausa e terminal.
+    // Sem `X-Session-Id` a sessao e um UUID novo por request, entao nao ha
+    // o que retomar: o cliente que quer o "sim" manda a mesma sessao.
+    let aprovador = crate::approval_scope::remetente_openai(
+        user_id.as_deref(),
+        headers.get(axum::http::header::AUTHORIZATION),
+    );
 
     // GAR-234/238: Extract mode from header for logging and apply to session
     let agent_mode = headers
@@ -495,6 +551,7 @@ pub async fn chat_completions(
             messages,
             continuity_key,
             user_id,
+            aprovador,
         )
         .await
     } else {
@@ -505,6 +562,7 @@ pub async fn chat_completions(
             messages,
             continuity_key,
             user_id,
+            aprovador,
         )
         .await
     };
@@ -530,6 +588,7 @@ async fn handle_streaming(
     messages: Vec<ChatMessage>,
     continuity_key: String,
     user_id: Option<String>,
+    aprovador: Option<String>,
 ) -> Response<Body> {
     // Create channel for streaming deltas
     let (delta_tx, delta_rx) = mpsc::channel::<String>(100);
@@ -573,9 +632,18 @@ async fn handle_streaming(
                 Some(model_clone.as_str()),
                 None,
                 None,
-                &state
-                    .exec_context_for(&session_id, user_id.as_deref())
-                    .await,
+                // #1343: canal fixo `openai`, nunca o da sessao — uma
+                // `X-Session-Id` apontando para uma sessao do Telegram nao
+                // alcanca o pedido pendente do Telegram. Aprovador vazio =
+                // sem escopo (`ApprovalScope::new` recusa).
+                &crate::approval_scope::com_escopo(
+                    state
+                        .exec_context_for(&session_id, user_id.as_deref())
+                        .await,
+                    crate::approval_scope::CANAL_OPENAI,
+                    &session_id,
+                    aprovador.as_deref().unwrap_or(""),
+                ),
             )
             .await
         {
@@ -706,6 +774,7 @@ async fn handle_non_streaming(
     messages: Vec<ChatMessage>,
     continuity_key: String,
     user_id: Option<String>,
+    aprovador: Option<String>,
 ) -> Response<Body> {
     // Get the user message (last message)
     let user_text = messages
@@ -735,9 +804,15 @@ async fn handle_non_streaming(
             Some(model.as_str()),
             None,
             None,
-            &state
-                .exec_context_for(&session_id, user_id.as_deref())
-                .await,
+            // #1343: ver o ramo streaming.
+            &crate::approval_scope::com_escopo(
+                state
+                    .exec_context_for(&session_id, user_id.as_deref())
+                    .await,
+                crate::approval_scope::CANAL_OPENAI,
+                &session_id,
+                aprovador.as_deref().unwrap_or(""),
+            ),
         )
         .await;
 

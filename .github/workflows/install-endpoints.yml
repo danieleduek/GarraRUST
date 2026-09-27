@@ -15,6 +15,22 @@
 # morto. Daí as duas regras do script atual: nenhum comando falível fora de
 # guarda `|| var=$?`, e o código HTTP de cada sonda SEMPRE aparece no log.
 #
+# Terceiro apagão (2026-09-18, run #27): o serving do garraia.org mudou sem
+# nenhum publish novo — sem commit no repo do site desde 2026-09-05 e com o
+# corpo servido byte-idêntico ao de véspera. Dois sintomas juntos: os
+# instaladores passaram a sair como `application/octet-stream` (o irm
+# devolveria byte[] e o `| iex` quebra para o usuário real) e a borda passou
+# a recusar com HTTP 403 o cliente .NET do Invoke-RestMethod vindo de IP de
+# datacenter — o curl do MESMO runner recebe 200 no mesmo minuto, e de IP
+# residencial qualquer User-Agent passa, então o bloqueio não é nem de IP
+# nem de UA: é do fingerprint do cliente .NET. Efeito prático: a sonda irm
+# não consegue MAIS exercitar o cliente de verdade contra o garraia.org
+# a partir de runners. O que segue asserível pelo cliente que a borda
+# aceita é o fato do lado servidor — o Content-Type servido e a assinatura
+# do corpo — e é isso que o fallback curl do passo irm abaixo faz quando
+# leva 403: a asserção do contrato permanece (octet-stream deixa o run
+# vermelho), só a fidelidade do cliente é que degrada, avisada.
+#
 # Por que NÃO é gate de PR: estas asserções falam do estado *implantado*, que
 # um PR não tem como consertar. Um deploy ruim do site travaria todo PR do
 # core. Roda no schedule e sob demanda; a falha vira notificação, não bloqueio.
@@ -61,9 +77,11 @@ jobs:
           FRESHNESS_MARKER="TERMUX_VERSION"
 
           # fail <label> <mode> <mensagem> — ::error e conta, ou ::warning.
+          # O modo warn continua disponível como 4º argumento do probe()
+          # para futuras tolerâncias temporárias; nenhum probe atual o usa.
           fail() {
             if [ "$2" = "warn" ]; then
-              echo "::warning ::$1: $3 (tolerado — ver nota release-cdn)"
+              echo "::warning ::$1: $3 (tolerado)"
             else
               echo "::error ::$1: $3"
               failures=$((failures + 1))
@@ -156,25 +174,6 @@ jobs:
             return 0
           }
 
-          # --- release-cdn/install.ps1: tolerância temporária ----------------
-          # A v0.3.3 (2026-08-28) antecede o instalador Windows; o release.yml
-          # já publica install.ps1 nas próximas tags. Enquanto a "latest" for
-          # EXATAMENTE v0.3.3, a ausência vira ::warning. Qualquer tag
-          # posterior sem install.ps1 volta a ser erro duro, e se a consulta
-          # da tag falhar o modo também é erro duro (fail-safe, nunca
-          # silenciosamente tolerante). REMOVER este bloco (e o argumento
-          # extra do probe lá embaixo) depois da primeira release >= v0.3.4.
-          KNOWN_PRE_PS1_TAG="v0.3.3"
-          latest_tag=""
-          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY:-michelbr84/GarraRUST}/releases/latest" \
-            --jq .tag_name 2>/dev/null)" || latest_tag=""
-          release_ps1_mode="error"
-          if [ "${latest_tag}" = "${KNOWN_PRE_PS1_TAG}" ]; then
-            release_ps1_mode="warn"
-            echo "release mais recente ainda é ${KNOWN_PRE_PS1_TAG} (pré-ps1):" \
-              "release-cdn/install.ps1 roda em modo warning"
-          fi
-
           # --- probes --------------------------------------------------------
 
           # --- canal primário: o que a documentação e o site mandam usar -----
@@ -193,8 +192,7 @@ jobs:
           probe "release-cdn/install.sh" \
             "https://github.com/michelbr84/GarraRUST/releases/latest/download/install.sh" "#!/bin/sh"
           probe "release-cdn/install.ps1" \
-            "https://github.com/michelbr84/GarraRUST/releases/latest/download/install.ps1" "<#" \
-            "${release_ps1_mode}"
+            "https://github.com/michelbr84/GarraRUST/releases/latest/download/install.ps1" "<#"
 
           if [ "${failures}" -ne 0 ]; then
             echo "::error ::${failures} endpoint(s) de instalação quebrados"
@@ -237,8 +235,40 @@ jobs:
               }
             } catch {
               $code = try { [int]$_.Exception.Response.StatusCode } catch { 'n/a' }
-              Write-Host "::error ::irm ${url}: HTTP $code — $($_.Exception.Message)"
-              $failures++
+              if ($code -eq 403 -and $url.Contains('garraia.org')) {
+                # A borda do site recusa o cliente .NET de IP de datacenter
+                # (curl no mesmo runner passa; usuário real em IP residencial
+                # passa — ver o terceiro apagão no cabeçalho). O contrato do
+                # lado servidor segue asserido pelo cliente que a borda
+                # aceita: HTTP 200, Content-Type texto (o que o irm precisa
+                # para devolver [string]) e corpo começando com '<#'. Um
+                # octet-stream aqui continua deixando o run vermelho.
+                Write-Host "::warning ::irm ${url}: HTTP 403 — a borda recusa o cliente .NET de datacenter; asserindo o contrato via curl"
+                $probe = (& curl -s -o /dev/null -w '%{http_code} %{content_type}' --max-time 60 $url 2>$null) -split ' ', 2
+                $http = $probe[0]; $ctype = $probe[1]
+                if ($http -ne '200') {
+                  Write-Host "::error ::irm ${url} (fallback curl): HTTP ${http}"
+                  $failures++
+                } elseif ($ctype -notmatch '^text/') {
+                  Write-Host "::error ::irm ${url} (fallback curl): Content-Type '$ctype' — o irm devolveria byte[], não [string]; 'irm | iex' quebra"
+                  $failures++
+                } else {
+                  $tmp = New-TemporaryFile
+                  & curl -s --max-time 60 -o $tmp $url 2>$null
+                  $raw = Get-Content -Raw -ErrorAction SilentlyContinue $tmp
+                  Remove-Item $tmp -ErrorAction SilentlyContinue
+                  if (-not $raw -or -not $raw.StartsWith('<#')) {
+                    $head = if ($raw) { ($raw.Substring(0, [Math]::Min(80, $raw.Length)) -replace "`r?`n", ' ') } else { '(vazio)' }
+                    Write-Host "::error ::irm ${url} (fallback curl): corpo não começa com '<#' (início: $head)"
+                    $failures++
+                  } else {
+                    Write-Host "OK (fallback curl) — HTTP 200, Content-Type '$ctype', corpo começa com '<#'"
+                  }
+                }
+              } else {
+                Write-Host "::error ::irm ${url}: HTTP $code — $($_.Exception.Message)"
+                $failures++
+              }
             }
             Write-Host '::endgroup::'
           }

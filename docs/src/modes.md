@@ -57,6 +57,30 @@ Cada modo tem uma política de ferramentas que define:
 - **Required**: Ferramentas obrigatórias
 - **Whitelist Mode**: Se `true`, nega tudo que não está na lista de allowed
 
+A whitelist cobre **ferramenta MCP também** (#1264). Uma ferramenta de
+servidor MCP se chama `servidor__ferramenta`, e a `allowed` aceita três
+formas de nomeá-la:
+
+- **nome completo** — `meu-servidor__consulta` libera só aquela;
+- **servidor inteiro** — `meu-servidor/*` cobre `meu-servidor__<qualquer
+  nome>`, e só ele;
+- **operação em qualquer servidor** (#1384) — `*/read_text_file` cobre
+  `<qualquer servidor>__read_text_file`, com a operação exata. É a forma que
+  um modo somente-leitura usa para enxergar a leitura do MCP `filesystem` sem
+  liberar o servidor inteiro: o `search` nativo declara as dez operações de
+  leitura do `@modelcontextprotocol/server-filesystem` (`read_file`,
+  `read_text_file`, `read_media_file`, `read_multiple_files`,
+  `list_directory`, `list_directory_with_sizes`, `directory_tree`,
+  `search_files`, `get_file_info`, `list_allowed_directories`); `write_file`,
+  `edit_file`, `create_directory`, `move_file` e qualquer nome fora da lista
+  continuam barrados.
+
+`denied` vence qualquer uma das três.
+
+Aviso importante: `whitelist_mode: true` com `allowed` vazia **permite
+tudo** — é compatibilidade preservada, não proteção. O runtime emite um
+aviso por turno nesse caso (`#1264`); popule a lista ou desligue a flag.
+
 ### Exemplos de Política
 
 **Search Mode** (read-only):
@@ -74,6 +98,89 @@ Cada modo tem uma política de ferramentas que define:
   "whitelist_mode": false
 }
 ```
+
+### `tool_program` (#1226)
+
+`tool_program` é uma ferramenta **intrínseca** do runtime: o modelo manda
+uma lista de passos (`{"steps": [{"tool": "...", "args": {...}, "as": "..."}]}`)
+e o runtime os executa em sequência, no mesmo turno, sem voltar ao LLM entre
+um passo e outro. Ela não é registrada como as outras: aparece na lista que o
+modelo vê sempre que existe ao menos uma ferramenta real registrada, e passa
+pelo mesmo filtro do modo.
+
+**Quais modos nativos a expõem.** Os perfis que não usam whitelist: `auto`,
+`code` e `ask` (e a sessão sem modo escolhido). Os perfis com whitelist
+(`search`, `architect`, `debug`, `orchestrator`, `review`, `edit`) não a
+listam em `allowed`, então não a expõem. Com `/mode auto`, vale o perfil do
+modo que a heurística escolher para a mensagem — e, se ela não classificar,
+o portão aberto, que expõe. O teste
+`tool_program_exposto_so_nos_perfis_nativos_sem_whitelist` fixa essa tabela —
+mudar a exposição de um modo nativo tem de ser decisão deliberada.
+
+**Decisão (#1226 S-C): os perfis nativos com whitelist ficam sem
+`tool_program`.** `search`, `architect`, `debug`, `orchestrator`, `review` e
+`edit` não ganham `tool_program` em `allowed`, e isso é definitivo, não
+pendência. Os motivos:
+
+- Uma whitelist é o contrato explícito do que o modelo pode chamar naquele
+  modo. Acrescentar um envelope alarga a superfície que o operador aceitou,
+  mesmo com cada passo ainda passando pelo portão.
+- Esses fluxos são majoritariamente de leitura e de poucos passos: ganham
+  pouco com lote, e um lote torna o turno mais difícil de acompanhar.
+- Nos modos que já expõem (`auto`, `code`, `ask`), o gate por passo deixa um
+  programa estritamente equivalente às chamadas avulsas, então a exposição
+  ali não concede privilégio novo.
+
+Quem quiser o envelope num fluxo de whitelist cria um perfil customizado e
+lista `tool_program` em `allowed` (abaixo); `denied` continua vencendo. O
+teste `tool_program_exposto_so_nos_perfis_nativos_sem_whitelist` é a guarda
+de regressão desta decisão.
+
+**Como liberar ou negar num perfil customizado.** Pelo nome, como qualquer
+ferramenta. Num perfil com whitelist, liste `tool_program` em `allowed`; em
+qualquer perfil, `denied: ["tool_program"]` a desliga (e vence tudo):
+
+```json
+{
+  "allowed": ["tool_program", "file_read", "repo_search"],
+  "whitelist_mode": true
+}
+```
+
+Liberar `tool_program` **não** libera nenhuma outra ferramenta. O que vale
+dentro do programa é o mesmo que vale fora dele:
+
+- **Gate por passo.** Cada passo passa pelo mesmo `ToolGate` do modo (o
+  despacho é recursivo, com um único ponto de consulta ao portão no fonte).
+  Um passo negado encerra o programa ali — a resposta traz os passos já
+  executados e `parou_no_passo` — e os seguintes não rodam. No `ask`, um
+  programa não alcança `bash`, `file_write` nem `device_execute`.
+- **Orçamento.** Um programa de N passos custa **1 + N** chamadas contra
+  `max_per_turn`/`max_per_task`: o envelope mais uma por passo. Esgotar só o
+  teto do turno para o programa com o relatório parcial (o loop segue na
+  próxima volta, como seguiria com chamadas avulsas); esgotar a tarefa aborta
+  a conversa.
+- **Detecção de loop.** Os passos entram na janela de assinaturas; o envelope,
+  não. Três passos idênticos em sequência — no mesmo programa ou em programas
+  de um passo repetidos volta após volta — abortam a conversa, como três
+  chamadas avulsas idênticas.
+- **Confirmação humana (GAR-187).** Um passo que pede confirmação pausa o
+  programa. O humano lê só o pedido daquele passo, nunca a saída dos passos
+  anteriores; o modelo recebe o pedido mais o relatório parcial (passos
+  executados, `parou_no_passo` e as variáveis salvas em `vars`). Depois do
+  "sim", o modelo reenvia só os passos a partir do pausado, e a aprovação
+  cobre só aquele pedido.
+- **Eventos.** Cada passo emite o seu `tool_started`/`tool_finished` dentro
+  do par do próprio programa; todo início tem o seu fim, inclusive o de um
+  passo negado.
+- **Variáveis.** `as` guarda a saída de um passo, que tem de ser um número
+  inteiro (senão o passo falha); `"$nome"` num passo seguinte vira esse
+  número. Um `"$nome"` sem valor faz o passo falhar antes de rodar — nunca
+  chega à ferramenta como texto.
+
+**Limites.** No máximo 16 passos (`MAX_PROGRAM_STEPS`); teto agregado de 120 s
+(`PROGRAM_AGGREGATE_TIMEOUT_SECS`), checado entre passos e somado ao timeout
+por passo; `tool_program` dentro de `tool_program` é recusado.
 
 ## API de Modos
 
@@ -167,6 +274,15 @@ POST /api/modes/custom
   }
 }
 ```
+
+> **Limite conhecido (v0.4.5):** o prompt do modo chega ao provider em todo
+> turno, e o `max_tokens` do modo tambem, salvo quando o chamador ou a config
+> (`agent.max_tokens`) definem o seu (precedencia chamador > runtime > modo; o
+> CLI sempre define 4096). A `temperature` do modo ainda nao chega: os turnos
+> de chat, canais e API mandam o pedido sem temperatura, e o provider usa o
+> default dele. Manda-la mudaria o pedido de todo turno com modo, porque os
+> modos embutidos declaram de 0.3 a 0.7, e essa mudanca fica para quando o
+> provider souber omitir o parametro nos modelos que o recusam.
 
 ### Limites por Modo
 

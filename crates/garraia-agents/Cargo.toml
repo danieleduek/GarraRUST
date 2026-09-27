@@ -3,6 +3,7 @@ name = "garraia-agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "LLM agent runtime and orchestration for GarraIA"
 
 [dependencies]
@@ -11,6 +12,9 @@ garraia-common = { workspace = true, features = ["ssrf"] }
 # nenhum consumidor de `TurnEvent` precisar lembrar de redigir.
 garraia-security = { workspace = true }
 garraia-db = { workspace = true }
+# ADR 0020 (epic #1124): as tools device_list/read/execute são a integração
+# do agente com o mundo físico — registry + gate R0-R5 do crate.
+garraia-hardware = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -59,5 +63,14 @@ metrics-util = { version = "0.20", features = ["debugging"] }
 # producao este crate emite via `garraia_common::metrics`, nao direto.
 metrics = { workspace = true }
 tempfile = "3"
+# #1346: conta eventos de log nos testes de recuperacao do cache npx
+# (o erro de "max restarts" tem de sair UMA vez, nao a cada tick).
+tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 tokio-stream = { workspace = true }
+# #1249: `start_paused` para o teste que conta tentativas ao primario. O
+# caminho 429 dorme 500ms+1s+2s de backoff real; o que o teste afirma e a
+# CONTAGEM, nao o relogio, entao tempo virtual. Mesmo arranjo que
+# garraia-gateway, garraia-auth e garraia-cli ja usam (`full` do tokio nao
+# inclui `test-util`).
+tokio = { workspace = true, features = ["test-util"] }

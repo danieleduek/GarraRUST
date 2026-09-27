@@ -1,6 +1,9 @@
-use axum::extract::State;
+use std::collections::HashMap;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 /// WebSocket handler for the Garra Desktop overlay — GET /ws/parrot
 ///
@@ -29,12 +32,88 @@ use crate::state::SharedState;
 const SESSION_ID: &str = "parrot-desktop";
 const CHANNEL: &str = "desktop";
 
-pub async fn parrot_ws_handler(State(state): State<SharedState>, ws: WebSocketUpgrade) -> Response {
+pub async fn parrot_ws_handler(
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    uri: Uri,
+    State(state): State<SharedState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // #1182: anti-CSRF do handshake. O gate de `api_key` (logo abaixo) mora
+    // dentro deste handler, e nao no middleware, entao antes daqui QUALQUER
+    // pagina visitada pelo dono abria
+    // `new WebSocket("ws://localhost:3888/ws/parrot")`, mandava
+    // `{"type":"message"}` e recebia um turno completo do agente — com as
+    // tools, com a chave de LLM do dono, e escrevendo na sessao persistente
+    // do desktop. O cliente legitimo e a webview Tauri (`ORIGENS_TAURI`) ou
+    // um cliente sem `Origin`; pagina web nenhuma consegue apresentar essas
+    // origens. O `cross_origin_guard` do router ja julgou o handshake (e e
+    // ele quem loga `gateway: cross-origin request refused` com
+    // `path=/ws/parrot` se o desktop nao conectar); repetir aqui e defesa em
+    // profundidade, para o handler nao depender da montagem.
+    if !crate::origin_guard::ws_upgrade_permitido(
+        &crate::origin_guard::Pedido::de(&headers, &uri),
+        crate::origin_guard::esquema_efetivo(&state.config.gateway),
+        &crate::origin_guard::origens_validas_silenciosa(&state.config.gateway),
+    ) {
+        // Nada do pedido e ecoado.
+        warn!(
+            "Garra Desktop WebSocket upgrade rejected: cross-origin (see origin_guard::ORIGENS_TAURI)"
+        );
+        return (StatusCode::FORBIDDEN, crate::origin_guard::CORPO_WS).into_response();
+    }
+
+    // #1240 (auditoria R4 do PR #1251): o gate de `gateway.api_key`.
+    //
+    // O `ws_upgrade_permitido` acima passa **de proposito** quando nao ha
+    // header `Origin` — cliente nao-navegador (app, CLI, `curl`) nao manda
+    // um. Ate aqui essa era a unica guarda desta rota, e um
+    // `websocat ws://host:3888/ws/parrot` dirigia um turno completo do
+    // agente (com as tools e a chave de LLM do dono) sem credencial nenhuma,
+    // mesmo com `gateway.api_key` configurada e o gateway em `0.0.0.0`. Para
+    // o cliente sem `Origin` o gate e a barreira; e ele nao existia. Este e o
+    // mesmo bloco de `ws.rs`, pela mesma razao.
+    //
+    // **Por que nao em `is_gated_path`.** O middleware so aceita a chave por
+    // header, e `new WebSocket(...)` nao consegue mandar header nenhum — nem
+    // na webview Tauri, nem no navegador. Por isso os dois clientes legitimos
+    // mandam o token pela **query string** do handshake:
+    //
+    //   - Garra Desktop: `crates/garraia-desktop/ui/ws.js` monta
+    //     `?token=${encodeURIComponent(chave)}`, com a chave vinda do comando
+    //     Tauri `gateway_api_key` (`src-tauri/src/commands.rs`), que a le do
+    //     mesmo `config.yml` que este gateway carregou.
+    //   - Web Console: `webchat.html` faz o mesmo com `State.gatewayKey`.
+    //
+    // Gatear a rota no middleware generico de `/api/*` recusaria os dois,
+    // porque la a query nao e olhada. Como no `/ws`, a query e aceita **aqui**
+    // e so aqui. Quem mover esta decisao para o middleware quebra os dois
+    // clientes; quem a apagar reabre o buraco.
+    let gate = crate::gateway_auth::ApiKeyGate::from_config(&state.config.gateway);
+    if gate.is_enabled() {
+        let token_from_query = params.get("token").or_else(|| params.get("api_key"));
+        let token_from_header = crate::auth_common::extract_bearer(&headers);
+        let token = token_from_query.map(|s| s.as_str()).or(token_from_header);
+
+        // `admits` compara em tempo constante tambem no comprimento (o helper
+        // passa os dois por SHA-256 antes do `ct_eq`); nada do pedido e
+        // ecoado no corpo nem no log.
+        if !gate.admits(token) {
+            warn!("Garra Desktop WebSocket connection rejected: invalid API key");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+
     ws.on_upgrade(move |socket| handle_parrot_socket(socket, state))
 }
 
 async fn handle_parrot_socket(socket: WebSocket, state: SharedState) {
     let (mut sender, mut receiver) = socket.split();
+
+    // #1343: a sessao do desktop e fixa (`SESSION_ID`) e qualquer socket que
+    // passe pelo gate a usa, entao quem aprova um pedido pausado e esta
+    // CONEXAO — um nonce do servidor que o cliente nunca ve.
+    let conexao = crate::approval_scope::nonce_de_conexao();
 
     // Hydrate persistent history for the desktop session
     state
@@ -102,7 +181,12 @@ async fn handle_parrot_socket(socket: WebSocket, state: SharedState) {
         let text_for_agent = user_text.clone();
         // Lido **antes** do `spawn`: dentro da task seguraria o lock do store
         // pelo tempo do turno inteiro.
-        let exec = state.exec_context_for(SESSION_ID, None).await;
+        let exec = crate::approval_scope::com_escopo(
+            state.exec_context_for(SESSION_ID, None).await,
+            crate::approval_scope::CANAL_PARROT,
+            SESSION_ID,
+            &conexao,
+        );
         let task = tokio::spawn(async move {
             agents
                 .process_message_streaming_with_agent_config(

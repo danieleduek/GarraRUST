@@ -131,6 +131,20 @@ Componente: `crates/garraia-agents/src/providers/*.rs` (OpenAI, OpenRouter, Anth
 | **I** Information disclosure | **Conteúdo de message enviado ao provider terceiro** — provider pode reter conforme política interna (OpenAI retém 30 dias por default; Anthropic zero-retention opt-in). **Risco primário do componente.** | TOS informa usuário; `do-not-retain` headers quando provider suporta (ex.: `OpenAI-Beta: no_retention`); local-first (Ollama / mistral.rs ADR 0001) elimina esse caminho. | PII scrubbing opcional via `presidio`/regex antes de enviar (plano futuro Fase 5, `agent.sensitive_data_filter` config). |
 | **D** Denial of service | Provider rate-limit retorna 429 em cascade; provider down. | `AgentRuntime` retry com backoff; provider fallback (Ollama quando OpenAI down). | Circuit breaker per provider; budget de tokens/minuto por grupo. |
 | **E** Elevation of privilege | Tool call response cria comando privileged em host; prompt injection via user input faz agent ignorar system prompt. | Tool whitelist + input sanitization em tool arguments; system prompt não-user-influenced. | Structured output enforcement (JSON schema) + adversarial prompt testing (plan futuro). |
+| **E** Elevation of privilege (`tool_program`, #1226) | O modelo — ou conteúdo de terceiro que o induz — usa a intrínseca `tool_program` (até 16 chamadas num turno, sem voltar ao LLM) para: alcançar ferramenta que o modo nega (`bash`/`device_execute` no `ask`); escapar do orçamento ou do corte de loop repetindo o mesmo passo em programas seguidos; mandar um `"$var"` sem valor que chega ao `bash` como texto e é expandido como variável de ambiente; ou colher o "sim" do humano com saída de ferramenta colada ao pedido de aprovação. | Cada passo reentra no mesmo `dispatch_tool_call` (um único ponto de consulta ao `ToolGate` no fonte), então `denied` e whitelist valem por passo e um passo negado encerra o programa. O programa custa 1 + N chamadas no `ExecutionBudget`; o envelope não entra na janela de assinaturas, e o corte de loop vale entre programas. `"$var"` sem valor falha o passo antes do despacho, e `as` exige saída inteira. Na pausa (GAR-187), o humano lê só o pedido do passo; o relatório parcial vai só para o modelo, depois do pedido, e o primeiro marcador do conteúdo é sempre o do pedido. Testes em `crates/garraia-agents/src/runtime.rs`: `despacho_de_tool_tem_um_unico_ponto_de_gate`, `tool_program_bate_com_o_gate_direto_em_todos_os_perfis_nativos` (9 perfis, sondas de whitelist e de cada `denied`), `tool_program_no_modo_ask_nativo_nao_alcanca_o_que_ask_nega`, `tool_program_exposto_so_nos_perfis_nativos_sem_whitelist`, `tool_program_repetido_entre_voltas_cai_no_detector_de_loop`, `tool_program_respeita_o_orcamento_de_chamadas_do_turno`, `tool_program_aborta_a_conversa_quando_a_tarefa_esgota`, `tool_program_falha_o_passo_com_variavel_sem_valor_antes_de_rodar`, `tool_program_pausa_no_passo_que_pede_confirmacao`, `tool_program_pausado_da_o_relatorio_ao_modelo_e_so_o_pedido_ao_humano`, `tool_program_retomado_apos_aprovacao_ve_o_relatorio_e_roda_so_o_aprovado`. | Os perfis nativos sem whitelist (`auto`, `code`, `ask`) já expõem `tool_program`; a decisão de exposição por modo é a fatia S-C da #1226. O teto agregado de 120 s é checado entre passos, então um passo em andamento não é interrompido; o limite desse passo é o próprio timeout por passo. |
+
+**Guard de injeção indireta — mapa de cobertura (#1213, #1243)**: o conteúdo
+de terceiro que entra no contexto do modelo passa por
+`garraia_security::sanitize_indirect` (remove caracteres invisíveis e devolve
+o relatório; suspeito chega precedido do `warning_banner` de dado
+não-confiável) nestas superfícies:
+
+| Superfície | Coberto desde | Por quê |
+|---|---|---|
+| `web_fetch` | #1213 | corpo HTTP é conteúdo de terceiro |
+| resultado de tool MCP (`McpTool::execute`) | #1243 (fatia 1) | o servidor MCP é tipicamente um `npx` de terceiro; payload hostil entrava cru, e sem teto de tamanho era vetor de exaustão de contexto (cap 256 KiB com marca visível, alinhado ao `MAX_CONNECTOR_FRAME_BYTES`) |
+| `file_read` | #1243 (fatia 2) | o conteúdo de arquivo lido a pedido do modelo é texto de quem controla o arquivo; entra emoldurado quando suspeito, com a origem nomeada, e código-fonte limpo segue byte a byte |
+| `device_read`/`device_list` | #1243 (fatia 3) | id, `friendly_name`/`state` do Home Assistant e payload de MQTT/serial são escritos por quem está no barramento; leitura é R0 sem confirmação humana — entra emoldurado quando suspeito, com a origem nomeada (moldura na tool, ADR 0020) |
 
 ---
 
@@ -213,6 +227,15 @@ o GET.
 | **I** Information disclosure | Resposta distingue "não existe" de "fora das raízes", virando oráculo de existência de diretório. | 400 com corpo idêntico para todas as variantes de erro, como o 401 byte-idêntico de `/v1/auth/login`. | — |
 | **T** Tampering | Symlink dentro da raiz apontando para fora, criado entre o registro e a leitura (TOCTOU). | `canonicalize` resolve o symlink, e a re-validação em `list_project_files` roda no momento da leitura. | Janela residual entre o `canonicalize` e o `read_dir` é inerente ao filesystem; reduzida, não eliminada. |
 
+**Nota sobre o pressuposto "auth-free por desenho" (#1182)**: todo o `/api/*`
+ser auth-free se apoia em "quem alcança a porta é o dono". O pressuposto tem um
+buraco: **o navegador do dono alcança a porta rodando código de terceiros**.
+Basta o dono visitar uma página qualquer para ela disparar
+`POST /api/projects {"path":"…"}` contra `127.0.0.1:3888` de dentro do
+navegador dele — com cookies, com a rede local, com tudo. Fechado para a
+superfície HTTP mutante e para os handshakes de `/ws` e `/ws/parrot` pela
+guarda da §5.10.
+
 **Nota sobre `working_dir`**: desde o #1028, `POST /api/sessions`
 (`api::create_session`) aceita `working_dir` e o passa por
 `project_root::confine` **antes** de criar a sessão — fora das raízes é 400 com
@@ -224,6 +247,201 @@ o confinava, segue **não roteado**. Guards:
 `post_sessions_confines_working_dir` e
 `post_sessions_accepts_working_dir_inside_the_allowed_root` em
 `tests/projects_test.rs`.
+
+## 5.72. Caminhos de filesystem vindos da tool call do LLM (#1244)
+
+Fechado em 2026-09-16. A §5.7 fechou o caminho que vem do **request HTTP**. O
+que ficou aberto foi o irmão dele: o caminho que vem da **tool call do modelo**.
+
+`file_read`, `file_write` e `list_dir` recebiam o argumento `path` cru,
+expandiam `~` e aceitavam caminho absoluto sem confinamento. O parâmetro
+`allowed_directories` existia no construtor, tinha teste próprio, e os dois
+pontos de registro em produção (`bootstrap/mod.rs` do gateway e `chat.rs` da
+CLI) passavam `None`. Um prompt chegando por Telegram, Discord ou WhatsApp
+mandava o modelo ler `~/.ssh/id_rsa`, `/etc/shadow` ou o próprio `config.yml`
+do gateway — que carrega chave de LLM em claro quando o operador não usa o
+cofre. `list_dir` era o reconhecimento: com ela o modelo achava o alvo antes de
+pedir a leitura.
+
+Combina mal com três coisas que existem: o guard de injeção indireta não cobre
+`file_read` (o conteúdo lido vira instrução), o `sandbox` por tool tem default
+`Off`, e a §5.9 já descreve a rota de chat como identidade não verificada.
+
+**Mitigação**: `garraia_agents::FileJail`, o mesmo "resolve, depois confina" da
+§5.7, com a diferença que a escrita exige. As raízes efetivas de uma chamada
+são a união de `agent.file_roots` (config, vazia por padrão, mais a env
+`GARRAIA_FILE_ROOTS`) com o `working_dir` da sessão. **Conjunto vazio nega
+tudo** — sem raiz conhecida não há como afirmar que um caminho é seguro. No
+gateway isso faz a raiz padrão ser o diretório da sessão e nada mais, e esse
+`working_dir` já passou por `project_root::confine` (§5.7) antes de ser
+gravado. Na CLI o CWD do processo entra como raiz, porque quem roda
+`garra chat` é o dono da máquina no diretório que escolheu.
+
+O alvo de uma escrita normalmente não existe, então `canonicalize` falharia: o
+jail sobe até o **ancestral existente mais próximo**, canonicaliza esse e
+recola a cauda. É o que barra `raiz/link-para-fora/novo.txt` — que uma checagem
+só do `parent` textual deixaria passar, e que é o vetor de escrita equivalente
+ao symlink de leitura.
+
+**E aqui está a parte contraintuitiva, que a primeira versão desta mitigação
+errou e a auditoria R4 pegou: `canonicalize` falhar não quer dizer "não
+existe", quer dizer "não resolve".** Um symlink *pendurado* — cujo alvo não
+existe — falha no `canonicalize` e existe para o `lstat`; e o `open(O_CREAT)`
+de uma escrita **segue** esse link e cria o arquivo no alvo. Com a cauda
+recolada dentro da raiz, o `starts_with` aprovava e o byte caía fora. O vetor
+plausível não passa pelo `bash`: um repositório clonado traz
+`raiz/evil -> ../../../home/u/.ssh/authorized_keys` versionado no git, o CWD é
+raiz na CLI, e uma injeção indireta no README manda escrever em `evil` — que é
+exatamente a tese da #1244. Por isso **todo componente que não canonicaliza
+ainda passa por `symlink_metadata`**: existir para o `lstat` sem resolver é
+recusa, não "cauda inexistente". O caminho é normalizado por `components()`
+antes desse `lstat`, porque com barra final (`raiz/evil/`) o `lstat` segue o
+link por POSIX e o pendurado voltaria a parecer inexistente.
+
+Custo aceito: um pendurado apontando para **dentro** da raiz também é recusado.
+Distinguir exigiria reimplementar resolução de symlink à mão — alvo relativo,
+ciclo, teto de profundidade — e fail-closed sai mais barato que uma segunda
+resolução caseira. O furo também tinha reaberto o oráculo de existência da
+terceira linha da tabela abaixo: link vivo devolvia a frase de recusa, link
+pendurado devolvia `Ok` — e escrevia.
+
+O construtor das três tools passou a **exigir** o jail: `FileReadTool::new(None)`
+não compila mais. Era o ponto exato da falha — um jail opcional é um jail
+esquecido.
+
+| STRIDE | Cenário concreto | Mitigação atual | Gap / Planejada |
+|---|---|---|---|
+| **I** Information disclosure | Prompt de canal faz o modelo chamar `file_read {"path": "~/.ssh/id_rsa"}` ou o `config.yml` do gateway. | `FileJail::confine` nas três tools, obrigatório no construtor; testes que pedem a tool ao runtime de `build_agent_runtime`, não ao construtor. | — |
+| **I** Information disclosure | Symlink dentro da raiz apontando para fora (`raiz/atalho → /etc`). | `canonicalize` resolve o link **antes** da comparação, que é por componente (`Path::starts_with`). | — |
+| **I** Information disclosure | Recusa distingue "não existe" de "existe mas está fora", virando oráculo. | Uma única frase para as três recusas, sem caminho e sem raiz. A mensagem útil da #923 fica só para arquivo ausente **dentro** da raiz. | — |
+| **T** Tampering | `file_write` cria arquivo fora da raiz através de um diretório-symlink. | Subida até o ancestral existente + canonicalização dele. | — |
+| **T** Tampering | `file_write` cria arquivo fora da raiz através de um symlink **pendurado** (`raiz/evil → /fora/inexistente`), versionado num repositório clonado. `canonicalize` falha por não resolver — não por não existir — e o `open(O_CREAT)` segue o link. | Cada componente que não canonicaliza passa por `symlink_metadata`: existe para o `lstat` e não resolve ⇒ recusa. Caminho normalizado por `components()` antes do `lstat`, senão a barra final (`raiz/evil/`) faz o `lstat` seguir o link. Três testes: função pura (folha e pai) e `FileWriteTool` ponta a ponta. | Pendurado para **dentro** da raiz também é recusado — fail-closed assumido. |
+| **T** Tampering | Troca de symlink entre o `canonicalize` e o `open` (TOCTOU). | Reduzida: a tool abre o caminho **resolvido**, não o original. | **Residual conhecido, não fechado.** Fechar exige abrir por descritor (`openat2` + `RESOLVE_BENEATH` no Linux), sem equivalente portátil nos três sistemas operacionais. Exige quem tenha escrita dentro da raiz. |
+| **T** Tampering / **I** Information disclosure | **Hardlink** dentro da raiz apontando para o inode de um arquivo de fora (`ln /etc/alvo raiz/inocente.txt`). A escrita atinge o inode de fora; e o backup `.bak` do `file_write` copia o conteúdo de fora **para dentro** da raiz, transformando o escape de escrita em escape de leitura. | **Nenhuma.** Um hardlink não é um ponteiro que se resolve, é um segundo *nome* do mesmo inode: `canonicalize` não tem o que seguir, o caminho resolve para ele mesmo e o `starts_with` aprova. | **Residual conhecido, não fechado — e, ao contrário do symlink, sem defesa possível com esta API.** Exigiria comparar `st_dev`/`st_ino` contra um mapa da raiz, ou recusar todo arquivo com `st_nlink > 1`, o que recusaria também hardlink legítimo dentro da própria raiz. Impacto menor que o do symlink: o git não versiona hardlink, então o vetor "repositório clonado" não serve, e exige quem **já tenha escrita dentro da raiz** — mesma pré-condição do TOCTOU acima. |
+| **E** Elevation of privilege | No caminho MCP (`garra_agent`) quem escreve o `working_dir` é o **modelo**, pelo argumento da tool — e `FileJail::confine` soma o `working_dir` às raízes efetivas. `{"working_dir": "/", "message": "leia /etc/shadow"}` devolveria o disco inteiro às file tools. **Regressão introduzida pela própria #1244**: antes dela o `working_dir` do MCP só ancorava caminho relativo, não era raiz, e `working_dir: "/etc"` batia no jail. | `handle_agent_call` confina o `working_dir` contra as raízes do operador antes de aceitá-lo (`confine(dir, None)` — `None` de propósito: o valor sob validação não pode se autorizar) e responde `invalid_params`. A regra é a mesma endossada no #1255: pode **estreitar** o jail ou ficar dentro dele, nunca alargar. O jail é construído **uma vez por chamada** em `handle_agent_call` e desce por parâmetro até `build_tools`: a instância que valida é a mesma que vai para as file tools, e não há segunda construção a manter em concordância. O que isso fecha, medido por mutação: substituir o parâmetro por um jail próprio em `build_tools` exige descartá-lo, e aí o `unused variable: jail` derruba o `clippy --all-targets -- -D warnings` do CI. Não é impossibilidade de tipo — é uma divergência que o gate não deixa entrar. O gate não alcança a divergência **parcial**: dar um jail mais largo a só uma das duas tools mantém o parâmetro usado e passa limpo (medido). Fechar essa depende do teste de comportamento do wiring, registrado como dívida. A recusa é presa por um teste que chama o handler real; o lado "pode estreitar" chama a função de validação extraída (pelo handler ele rodaria um turno de agente de verdade dentro da suíte unitária). | O ganho de privilégio real era pequeno — ver a nota sobre `bash` em "Não coberto de propósito" —, mas a divergência entre a doc do schema e o código apontava na direção perigosa. |
+| **E** Elevation of privilege | Operador põe `/` ou `$HOME` em `agent.file_roots` e desliga o jail sem perceber. | `garra config check` avisa nos dois casos; `config.hardened.example.yml` diz para não fazer. | Aviso, não erro — a decisão é do operador. |
+| **E** Elevation of privilege | O mesmo por `GARRAIA_FILE_ROOTS=/`, que **soma** raízes às da config e não aparecia em lugar nenhum: o `config check` só lia o YAML e o boot só contava raízes (`roots().len()`). O jail apertado cria pressão operacional exatamente nessa direção. | `config check` valida também a env (campo `env.GARRAIA_FILE_ROOTS`); o `info!` do boot **nomeia** as raízes e um `warn!` sai por raiz que, já resolvida, seja `/` ou o `$HOME`. Comparação depois do `canonicalize`, senão `$HOME/../$USER` passa. | Continua aviso, não erro. |
+
+**Não coberto de propósito** (cada um com o porquê):
+
+- `repo_search` não recebe **caminho** do modelo: ele roda `rg`/`grep` com
+  `current_dir` no `working_dir` da sessão e alvo fixo `.`, e o `file_pattern`
+  vai por `--glob=…` (valor **colado** na opção), que não escapa da raiz da
+  busca. Sem `working_dir` ele cai no CWD do processo — e a resposta nomeia o
+  diretório (paridade do #1258).
+  **Correção de um parágrafo errado desta mesma seção:** a versão anterior
+  concluía daí que `repo_search` era "nem melhor nem pior", e esse raciocínio
+  olhou só o `file_pattern`. O `query` ia como argumento solto — literalmente
+  `cmd.arg(query).arg(".")`, **sem nenhum `--` separando opção de operando** —
+  e a auditoria R4 achou ali injeção de flag: um `query` começando com `-` era
+  lido pelo `rg` como opção. Aberto como **#1266** (P0) e corrigido no
+  **PR #1268**: construtores puros de argv, query depois do terminador `--`
+  (nos dois fallbacks), `findstr` embalado em `/C:` (que é o equivalente dele,
+  pois não tem `--`), e teste pela tool que o runtime registra (via
+  `find_tool`).
+- `git_diff` e `code_review` passam `file_path` como pathspec para o `git`, que
+  só enxerga o repositório. Dois defeitos vizinhos registrados aqui foram
+  corrigidos depois: o **argv** (#1269 — `file_path` depois do `--`; revisão
+  `{from}..{to}` com `-` inicial recusada antes da linha de comando, pois atrás
+  do `--` perde a semântica de revisão; paridade completa no `code_review`) e o
+  **de correção** (#1258 — `run_git_command`/`get_diff` sem `current_dir`
+  respondiam sobre o repositório do CWD do processo do gateway; agora `RepoDir`
+  decide entre `working_dir` da sessão e CWD, e a resposta nomeia o escolhido).
+- `bash` e `run_tests` são a fronteira da #1225 (sandbox por tool) e da §6, não
+  desta. Um `bash` irrestrito lê qualquer arquivo — mas o ponto da #1244 é
+  justamente que o modelo não precisava do `bash`.
+  **Medido, não presumido** (auditoria R4 da #1244, dimensionamento do
+  `working_dir`): com o `BashTool::new(None)` que o `build_tools` do MCP
+  registra e `agent.bash_allowlist` vazia (o padrão), `cat /etc/shadow`,
+  `head -c 32 /etc/passwd`, `ls /etc`, `echo pwned > /tmp/x` e
+  `tee /tmp/y < /etc/hostname` **executam com `requires_confirmation=false` e
+  `is_error=false`** — leitura *e* escrita fora de qualquer raiz, sem
+  confirmação. Nenhum desses programas está na `DENY_LIST`, na `CONFIRM_LIST`
+  nem em `SENSITIVE_PROGRAMS`, e a `bash_allowlist` do operador é uma lista
+  *positiva* (dispensa confirmação, não restringe), então configurá-la não
+  aperta nada. Consequência para quem for dimensionar um achado do jail no
+  caminho MCP: enquanto o mesmo servidor entregar esse `bash`, o ganho de
+  privilégio de furar o jail das file tools é ~nulo em capacidade. O jail
+  continua valendo como defesa em profundidade, pelo dia em que o `bash`
+  apertar — e porque no **gateway** (canal de chat, identidade não verificada
+  da §5.9) é ele que segura, não o `bash`.
+  **Apertou na #1272 (2026-09-21):** em `execution.profile = standard` o
+  `garraia mcp-server` e o gateway **não registram** `bash` sem um sandbox
+  `docker`/`podman` válido (`garraia_gateway::bootstrap::exposicao_do_bash`);
+  com ele, o comando só enxerga o diretório de trabalho montado. Em
+  `isolated-pod` explícito o `bash` roda no host do pod (§5.15). As cinco
+  leituras/escritas medidas acima viraram o teste
+  `standard_nega_leitura_e_escrita_fora_por_bash_e_por_file_tools`
+  (`crates/garraia-cli/src/mcp_agent.rs`), que dirige a montagem real do
+  `garra_agent` com um provider de stub; e o escape pelo container tem o
+  seu (`crates/garraia-agents/tests/sandbox_docker_escape.rs`, Docker real).
+- A segunda implementação de `RepoSearchTool`/`ListDirTool` (sem jail), que
+  vivia em `garraia-tools` e só era consumida por `garraia-runtime::executor`,
+  foi removida junto com as duas crates na #1226. Só as tools de
+  `garraia-agents` existem.
+
+**Varredura sistêmica de argv injection (#1270, 2026-09-19)** — inventário de
+todo `std::process::Command` nas tools, com argumento vindo de campo de tool
+call do modelo, cobrindo o pedido do sign-off do PR #1268:
+
+| Tool | Filho | Dado do modelo | Defesa |
+|---|---|---|---|
+| `repo_search` | `rg` / `grep` / `findstr` | `query`, `file_pattern` | construtores puros; query atrás de `--`, glob colado em `--glob=`, findstr em `/C:` (#1266, PR #1268) |
+| `git_diff` | `git diff` | `file_path`, `{from}..{to}` | pathspec atrás de `--`; revisão com `-` inicial recusada (#1269); `--no-ext-diff` contra `diff.external` (#1075) |
+| `code_review` | `git diff` | `commit_range`, `file_path` | paridade do `git_diff` (#1269) + `--no-ext-diff` (#1075) |
+| `run_tests` | `cargo` / `npm` | `test_name`, `-- crate` | `validate_test_name` (recusa `-` inicial, controle, >200 chars; charset fechado no `-p`) + `--` (#1084) |
+| `bash` | `bash -c` / `powershell -Command` | o comando inteiro | a classe não se aplica — o comando é **um** argv só, nunca posição de flag; contenção é a do sandbox e do jail (#1075, #1225) |
+
+Demais ocorrências de `Command::new` no inventário são fixture `#[cfg(test)]`
+(`repo_dir.rs`); a `crates/garraia-tools/`, que não montava processo nenhum,
+foi removida na #1226.
+**Zero achados novos.** Os filhos herdam só a allowlist de env
+(`R3_ENV_ALLOWLIST`) e têm stdin nulo em todas as sites acima.
+
+**Dívida registrada, não corrigida aqui** (auditoria R4 da #1244):
+
+- Só o wiring do **gateway** tem teste de comportamento do jail.
+  `chat.rs::register_cli_tools` não tem nenhum, e em `mcp_agent` o que os testes
+  do `working_dir` cobrem é `file_jail()` — que o jail montado chegue às **duas**
+  file tools de `build_tools` (`ListDirTool` é pulada de propósito no caminho
+  MCP; "três" é a contagem do gateway) continua sem teste de comportamento.
+  O que **está** fechado, e por construção e não por disciplina, é a divergência
+  entre a régua que valida e a régua que executa: `build_tools` não constrói
+  jail nenhum, recebe por parâmetro o mesmo que `handle_agent_call` usou para
+  confinar o `working_dir`. Enquanto eram duas chamadas a `file_jail()`, trocar
+  a de `build_tools` por `FileJail::from_roots(["/"])` entregava o disco inteiro
+  às file tools com a suíte inteira verde (medido na revisão da rodada 4: 505 +
+  11 + 1 testes passando, incluindo os três do `working_dir`). Depois do
+  refactor, substituir o parâmetro inteiro por um jail próprio exige descartá-lo,
+  e aí não compila sob o `-D warnings` do CI (`unused variable: jail`) — gate,
+  não sistema de tipos. E o gate **para aí**: medido na passada curta de
+  segurança, trocar o jail de **uma só** das duas tools (`FileReadTool` com
+  `from_roots(["/"])`, `FileWriteTool` com o parâmetro) mantém o parâmetro
+  usado, não gera aviso nenhum, e passa com clippy limpo e 506 testes verdes,
+  com o `file_read` enxergando o disco inteiro. Ou seja: o CI pega a
+  substituição total, não a divergência parcial tool a tool. O que fecharia
+  essa é o teste de comportamento do wiring, que segue como dívida no item
+  acima — não o `#[deny(unused)]` (pega a mesma forma que o CI já pega) nem um
+  newtype `JailValidado`, que só provaria alguma coisa se `FileReadTool::new` e
+  `FileWriteTool::new` passassem a exigi-lo, mudando a API de todos os pontos
+  de registro.
+  Vale registrar o que a mitigação anterior **não** cobria, porque o texto antigo
+  deste bullet já convenceu um auditor do contrário: o construtor **exigir** o
+  `FileJail` (`Default` = zero raízes = nega tudo) transforma "esqueci de passar"
+  de fail-open em fail-closed, e só isso — não dizia nada sobre **passar um jail
+  diferente e mais largo**, que era o modo de falha real aqui.
+  Mas o defeito original da #1244 foi exatamente "ponto de chamada em produção
+  que nenhum teste exercitava", e ele ainda vale para o `chat.rs`.
+- Um symlink **quebrado apontando para dentro da raiz** recebe a mensagem de
+  "fora das raízes". É seguro e está declarado em teste (fail-closed assumido,
+  ver o Gap da linha do pendurado), mas confunde o usuário legítimo: um
+  `node_modules` clonado pela metade produz uma recusa de segurança onde o
+  problema é um link quebrado.
+- As duas varreduras de fonte do boot (que provam que o wiring de produção
+  passa o jail) afirmam só que *a linha existe em algum lugar do arquivo*:
+  mover o laço para uma função privada que ninguém chama as mantém verdes. A
+  alternativa é `build_agent_runtime` expor a contagem de raízes perigosas e o
+  teste asserir o valor.
 
 ## 5.75. Saída de ferramenta escrita no terminal (#995)
 
@@ -369,10 +587,631 @@ assinatura diz isso.
 | **I** Information disclosure | O **dono** escrito no log de toda requisição. No WhatsApp o dono é o próprio número de telefone (`bootstrap/whatsapp.rs:88`, `claim_owner(&from_number)`); no iMessage, número ou Apple ID. | O valor nunca sai: o log diz só se houve dono ou não. Guard `o_valor_do_dono_nao_vai_para_o_log`. | — |
 | **E** Elevation of privilege | Barramento de memória "por usuário" que na verdade é global, ligado por quem leu a assinatura. | Parâmetro removido: a assinatura não sugere mais escopo por pessoa. | Barramento por pessoa, se desejado, exige função nova e decisão explícita. |
 
+**Emenda #1182**: o mesmo pressuposto vale aqui e tinha o mesmo buraco. A rota
+não ter camada de auth não a torna alcançável só pelo dono: o navegador do dono
+alcança a porta rodando código de terceiros, e `POST /v1/chat/completions` gasta
+a chave de LLM **dele**. A identidade gravada deixou de ser escolhida pelo
+chamador no #1012; quem podia *disparar* a chamada só passou a ser restrito na
+§5.10.
+
 **O que ficou fora, de propósito**: promover `Security Gate (BOLA & Tenant
 Isolation)` a required check da `main` (hoje os obrigatórios são quatro —
 `docs/security/protect-main-ruleset.md`). É mudança de branch protection, que
 é do dono.
+
+---
+
+## 5.10. CSRF de navegador contra o gateway local (#1182)
+
+Fechado em 2026-09-13. As §5.7 e §5.9 registram a postura "`/api/*` é auth-free
+por desenho: quem alcança a porta é o dono". O #1093 já tinha mostrado o buraco
+do pressuposto em `/api/learning/*`, e fechado **só ali**. O #1182 é o mesmo
+buraco no resto da superfície.
+
+**O vetor**: o dono visita uma página qualquer. Ela roda
+`fetch("http://127.0.0.1:3888/api/settings", {method:"PATCH", body:…})` — e o
+navegador do dono, que está no loopback, entrega. Nenhum token é necessário
+porque a instalação default não tem `gateway.api_key`. O que dava para fazer:
+
+| Rota | Efeito |
+|---|---|
+| `PATCH /api/settings` | reescrever a config do gateway |
+| `POST /api/mode/select` / `POST /api/modes/custom` | trocar o modo do agente (e com ele o `ToolGate`) |
+| `POST /api/mcp/marketplace/install` | instalar servidor MCP |
+| `POST /api/skills` / `PUT /api/skills/{n}` | escrever skill que o agente executa |
+| `POST /v1/chat/completions`, `POST /v1/messages`, `POST /chat` | gastar a chave de LLM do dono |
+| `DELETE /api/memory`, `DELETE /api/sessions/{id}` | destruir dados |
+| `POST /api/projects` | (§5.7) registrar raiz de projeto |
+
+E a **resposta voltava legível**: o CORS default era `allow_origin(Any)` +
+`allow_methods(Any)` + `allow_headers(Any)`, então a página do atacante não só
+disparava a escrita como lia o retorno — o `GET /api/settings/effective` inteiro,
+por exemplo. Em `/ws` era pior de outro jeito: WebSocket não passa por CORS
+nenhum, então `new WebSocket("ws://127.0.0.1:3888/ws")` de qualquer página subia
+uma sessão de chat completa.
+
+**Mitigação**, em três peças:
+
+1. `garraia_gateway::origin_guard::cross_origin_guard` — middleware sobre
+   `POST`/`PUT`/`PATCH`/`DELETE` de toda a superfície (e sobre todo handshake
+   de WebSocket, ver 3), montado **por dentro** do gate de `gateway.api_key`
+   (o 401 do gate vem primeiro). Recusa com `403` de corpo constante quando o
+   `Origin` não é o do próprio gateway (mesmo esquema, mesma authority do
+   `Host`, gramática RFC 6454 estrita, `Origin: null` e `Sec-Fetch-Site:
+   cross-site` inclusos) ou quando, havendo `Origin`, o `Host` é um nome DNS
+   que não é `localhost`/`*.localhost` nem está em `gateway.allowed_origins`
+   — a âncora anti-DNS-rebinding. O `Host` vem do header ou, em HTTP/2, da
+   `:authority` (senão o console servido com TLS nativo, onde o navegador
+   negocia h2 e não manda `Host`, seria recusado). O esquema do transporte é
+   o que o `server.rs` de fato serve (`esquema_efetivo`: feature `tls` **e**
+   cert **e** chave) — `tls_cert_path` preenchido num binário sem a feature
+   cai para `http` nos dois lugares. Skip-list só para quem tem guarda
+   própria mais estrita (`/api/learning/`, `/api/plugins/`) ou é
+   server-to-server assinado (`/webhooks/`); `/admin/` **não** está nela,
+   porque `POST /admin/api/setup` (cria o primeiro admin), `/admin/api/login`
+   e `/admin/api/recovery/*` são montados fora do `require_csrf` do
+   sub-router admin. Nada do pedido é ecoado no corpo nem no log.
+2. **CORS default deixou de ser allow-all.** Sem `gateway.allowed_origins`,
+   nenhuma origem cross-origin é anunciada. O Web Console é servido pelo
+   próprio gateway e é same-origin — não usa CORS; cliente não-navegador
+   (app mobile, `curl`, Claude Code) ignora CORS. Uma entrada `*` é ignorada
+   com aviso (o `AllowOrigin::list` do tower-http entraria em pânico no boot).
+3. **`/ws` e `/ws/parrot` checam o `Origin` do handshake**
+   (`ws_upgrade_permitido`) — no middleware, para qualquer rota com
+   `Upgrade: websocket`, e de novo em cada handler como defesa em
+   profundidade. Sem `Origin` (app, CLI) o handshake segue como antes. Uma
+   página web só consegue apresentar `Origin` `http`/`https` (ou `null`),
+   então origem de esquema de app (`tauri://localhost`, extensão de
+   navegador) passa; e a webview do Garra Desktop passa pela sua origem exata
+   (`origin_guard::ORIGENS_TAURI`: `tauri://localhost` em Linux/macOS;
+   `ORIGENS_TAURI_WEBVIEW2`: `http://tauri.localhost`/`https://tauri.localhost`,
+   aceitas **só quando o gateway roda em Windows** — o `ws.js` conecta em
+   `localhost`, então webview e gateway estão no mesmo SO, e num gateway
+   Linux/macOS um `Origin` `http://tauri.localhost` só pode ser navegador:
+   o Safari entrega `*.localhost` ao resolvedor do sistema, que num Wi-Fi
+   hostil é do atacante). Pelo mesmo motivo a âncora anti-rebinding aceita
+   `localhost` **exato**, nunca `*.localhost`. Essa lista foi derivada do
+   fonte do Tauri 2.11 (`tauri_protocol_url` e o parse do header `Origin` no
+   protocolo de IPC, cujos testes usam `tauri://localhost`), **não medida em
+   runtime nesta entrega** — o ambiente não tem GTK/webkit nem `DISPLAY`. Se
+   o pássaro parar de conectar após o upgrade, a guarda do router responde
+   antes do handler: o log diz `gateway: cross-origin request refused` com
+   `path=/ws/parrot method=GET`, e a lista é o lugar a olhar.
+
+**Recorte deliberado**: o guarda genérico **não** herdou o
+`503 auth not configured` do `learning_mutations_guard` para peer não-loopback
+sem credencial. Herdá-lo mataria o app mobile na LAN contra um Garra sem
+`api_key`, que é cenário suportado. Contra quem já executa código na máquina, o
+gate de verdade continua sendo `gateway.api_key` — este módulo fecha o que o
+**navegador** pode ser forçado a fazer.
+
+**Quebra conhecida**: alcançar o console por **nome DNS** sem o nome em
+`allowed_origins` — reverse proxy com domínio próprio, mas também mDNS
+(`nas.local`), Tailscale MagicDNS, nome de serviço Docker/Compose e ingress. A
+âncora só conhece IP literal, `localhost` e nomes declarados; no reverse proxy
+há ainda o esquema (`Origin: https://…` contra um gateway que fala `http`).
+Efeito: 403 em `POST`/`PATCH`/`DELETE` e no handshake do chat (`/ws`).
+Mitigação: listar a origem em `gateway.allowed_origins`, que é aceita como
+declarada pelo dono (escotilha `origem_declarada`, a mesma confiança que a
+lista já carregava para o CORS). Documentado em `docs/hardening-gateway.md`,
+com a linha adicionada às receitas de proxy do `production-runbook.md`.
+
+### Residual: leitura `GET` sob DNS rebinding
+
+Depois de um rebinding bem-sucedido a página do atacante é **same-origin** com
+o gateway, e o navegador **não manda `Origin` em `GET` same-origin** — então
+nenhuma regra baseada em `Origin` distingue `GET /api/sessions`,
+`/api/memory/recent` ou `/api/logs` vindos dessa página de um `GET` do console
+legítimo. Fechar isso exigiria recusar todo `Host` que é nome DNS não
+declarado, **inclusive sem `Origin`**, o que mataria `curl http://nas.local:3888/health`,
+o app mobile por hostname e os healthchecks do Compose. Fica registrado como
+residual: escrita e WebSocket estão fechados; leitura sob rebinding depende de
+`gateway.api_key` (o gate de verdade, que o rebinding não tem como fornecer) ou
+de servir o console só por IP/`localhost`.
+
+| STRIDE | Cenário concreto | Mitigação atual | Gap / Planejada |
+|---|---|---|---|
+| **T** Tampering | Página visitada pelo dono dispara `PATCH /api/settings` contra `127.0.0.1:3888` e reescreve a config. | `origin_guard::cross_origin_guard` em toda a superfície mutante fora da skip-list; tabela de rotas reais em `origin_guard.rs` e no `build_router` de verdade em `tests/origin_guard_layering.rs`. | — |
+| **E** Elevation of privilege | Página visitada pelo dono dispara `POST /admin/api/setup` numa instalação nova e cria o primeiro admin com credenciais do atacante (rota pública, sem `require_csrf`). | `/admin/` fora da skip-list: a guarda cobre o bootstrap do admin. | — |
+| **I** Information disclosure | CORS `allow_origin(Any)` deixava a página do atacante **ler** a resposta (`/api/settings/effective`, `/api/sessions`). | Sem `allowed_origins`, nenhuma origem cross-origin é anunciada. | — |
+| **E** Elevation of privilege | DNS rebinding: domínio do atacante re-resolvido para `127.0.0.1` faz `Origin` e `Host` casarem entre si. | Âncora `ancora_ok`: só IP literal, `localhost`/`*.localhost` ou nome declarado em `allowed_origins`. | — |
+| **I** Information disclosure | DNS rebinding + `GET` same-origin (sem `Origin`) lê `/api/sessions`, `/api/logs`. | **Residual** — ver acima. | `gateway.api_key`; console só por IP/`localhost`. |
+| **T** Tampering | `new WebSocket("ws://127.0.0.1:3888/ws")` de qualquer página abre sessão de chat (WebSocket não passa por CORS). | `ws_upgrade_permitido` no middleware e no `ws_handler`. | — |
+| **T** Tampering | O mesmo contra `/ws/parrot` (overlay do desktop): turno completo do agente, com tools, escrevendo na sessão persistente `parrot-desktop`, resposta legível — e sem gate de `api_key`, que só cobre `/api/*`. | `ws_upgrade_permitido` no middleware e no `parrot_ws_handler`, com `ORIGENS_TAURI` para a webview. | Medir o `Origin` real da webview por plataforma (Linux WebKitGTK, Windows WebView2) na próxima release do desktop e confirmar a lista. |
+| **D** Denial of service | Console alcançado por nome DNS não declarado deixa de aceitar mutação e chat de navegador. | Quebra conhecida e deliberada; escotilha por `gateway.allowed_origins`. | — |
+| **D** Denial of service | `allowed_origins: ["*"]` (o reflexo de quem quer o allow-all de volta) derrubaria o gateway no boot. | Entrada ignorada com aviso (`origens_validas`). | Report em `garraia config check` e no boot (#1247: todo `start`/`restart` roda o `run_check` e loga os achados; so a allowlist `BLOQUEIA_O_BOOT` recusa o boot). |
+| **E** Elevation of privilege | `HOST=0.0.0.0` (ou `--host 0.0.0.0`) sem `gateway.api_key`: o gate de `/api/*` e `/ws` fica desligado e a rede alcanca as tools e o `/api/mcp/marketplace/install`. | #1261: o boot RECUSA (exit 78) bind nao-loopback sem credencial, antes do bind, do fork e do stop do `restart`; decisao sobre o bind resolvido (flag > env > default), TLS nao isenta; credencial por `GARRAIA_GATEWAY_API_KEY` sem editar o arquivo. | Opt-out `gateway.allow_unauthenticated_network_bind` so no arquivo (sem env/flag), com aviso em todo boot. |
+
+---
+
+## 5.11. Pareamento de canais — `/pair` e `PairingManager` (#1189, #1191)
+
+O `/pair` (`Role::Owner`) gera um código de 6 dígitos (~20 bits) que vale
+5 minutos; um usuário não autorizado que o envie ao bot entra na allowlist
+**em disco** (`Allowlist::add`). Até o #1190 cada canal tinha um
+`PairingManager` próprio e o `claim()` nunca casava com o código do `/pair`
+(que mora em `state.pairing`) — o pareamento não funcionava, e por isso o
+caminho de `claim()` nunca tinha sido exercido em produção. O #1190 uniu as
+instâncias; o #1191 endureceu o `claim()` que passou a ser alcançável.
+
+| STRIDE | Cenário concreto | Mitigação atual | Gap / Planejada |
+|---|---|---|---|
+| **S** Spoofing | Conta não autorizada chuta códigos de 6 dígitos em mensagens comuns dentro da janela de 5 min; a única barreira era o rate limit do transporte (Telegram/Discord), que não é nosso. | `ClaimLimits`: 5 erros do mesmo `user_id` → 15 min de `LockedOut` (sem comparar, e sem contar no global); 20 erros comparados de qualquer usuário desde o último `/pair` → todo código pendente é queimado (`Burned`). 20 palpites num espaço de 10^6 = 2e-5 por ciclo de `/pair`. O usuário vê o mesmo "unauthorized" nos três casos — a resposta não revela se o código existia. Um `/pair` em outro canal **não** zera o contador enquanto um código pendente sobrevive. | **DoS do pareamento**: 4 identidades × 5 erros queimam o código. Onde identidade custa (Telegram, WhatsApp, Signal) o `/pair` seguinte é seguro enquanto os ofensores estão em `lockout`; onde é grátis (IRC sem NickServ, alts de Discord) um atacante persistente queima cada código novo. O dono **fica sabendo**: o `/pair` seguinte diz que o anterior foi queimado e com quantos erros (`GenerateStatus::previous_burned`). **Decidido (dono, 2026-09-14):** o código fica em 6 dígitos — com 20 palpites comparados por ciclo a chance é 2e-5, e o código é ditado por voz/telefone; os limites (5 por usuário / 15 min / 20 globais) ficam fixos, sem knob de config, até um deployment real pedir. |
+| **I** Information disclosure | Comparação `==` sai no primeiro byte diferente (side channel de tempo). | `subtle::ConstantTimeEq`, percorrendo todos os códigos pendentes sem sair no primeiro que casa. Sinal fraco pela rede + transporte de chat, mas consistente com `garraia-auth`. | — |
+| **E** Elevation of privilege | `claim()` ignora o `channel_id`: código gerado num canal é resgatável em qualquer canal habilitado. | Coerente com o desenho atual — a allowlist é global por instalação e o `/pair` gera com a chave literal `"telegram"` em todo canal. | **Decidido (dono, 2026-09-14): pareamento global por instalação.** Um dono, uma allowlist, um código válido em qualquer canal habilitado — o `channel_id` do `PairingManager` é informativo, não um escopo. Escopar por canal só voltaria à mesa com allowlist por canal, que é outro produto. |
+| **R** Repudiation / UX | Um segundo `/pair` sobrescrevia em silêncio o código pendente que o dono acabou de mandar para alguém; uma queima era invisível para dono e convidado (o canal descarta em silêncio). | `generate_with_status` devolve `replaced_pending` e `previous_burned`; o `/pair` avisa os dois casos, no `commands.rs` e no `/pair` local do Discord. | — |
+
+O log de `Burned` leva só contagens — nunca `user_id` nem código. Esta seção
+descreve o mundo **depois do #1190** (um `PairingManager` por processo); sem
+ele, cada canal tem o seu e o `claim()` do Telegram nunca casa com o `/pair`.
+
+---
+
+## 5.12. Ambiente dos filhos MCP (#1075 — continuação)
+
+Um servidor MCP de transporte stdio é um processo filho do gateway, quase
+sempre um pacote de terceiro resolvido na hora (`npx -y algum-server`).
+Até esta correção o `McpManager::connect` montava o `Command` sem
+`env_clear()`: o filho herdava o ambiente **inteiro** do gateway —
+`GARRAIA_JWT_SECRET`, `GARRAIA_REFRESH_HMAC_SECRET`, `ANTHROPIC_API_KEY` /
+`OPENROUTER_API_KEY`, `GarraIA_VAULT_PASSPHRASE`, `DATABASE_URL` e tudo que
+o `dotenvy` tivesse carregado do `.env`. O mapa `env` da config era aplicado
+**por cima** dessa herança, não no lugar dela. O #1075 já tinha fechado esse
+mesmo buraco para as tools de shell (`bash_tool`, `run_tests`, `git_diff`,
+`code_review`, `repo_search`) via `R3_ENV_ALLOWLIST`; o caminho MCP ficou
+de fora.
+
+O ambiente agora é construído do zero, nesta ordem: allowlist
+(`garraia_common::safety_gate::is_mcp_child_env_allowed` — só caminhos,
+locale, temp e identidade) e, por cima, o mapa `env` daquele servidor. A
+allowlist MCP é um superset da R3 porque um servidor MCP é um programa real
+(`npx`/`uvx`/`python`) e não um comando de shell efêmero; as duas listas
+ficam separadas para que afrouxar uma não afrouxe a outra.
+
+| STRIDE | Cenário concreto | Mitigação atual | Gap / Planejada |
+|---|---|---|---|
+| **I** Information disclosure | Um servidor MCP de terceiro (`npx`) lê `std::env` no `main()` e exfiltra o JWT secret e as chaves de provider do dono na primeira execução. Não precisa de tool call, prompt injection nem rede do agente — basta ser spawnado. | `cmd.env_clear()` + allowlist + mapa `env` explícito do servidor. Nenhum nome com `key`/`token`/`secret`/`password`/`passphrase` pode entrar na allowlist (teste de unidade é o gate). | Residual: o filho roda com o **mesmo UID** do gateway e pode ler `/proc/<pid>/environ` do pai. Sandbox real do processo MCP segue no #1225; os limites atuais (`setrlimit`, PDEATHSIG) são limites de recurso, não confinamento. |
+| **E** Elevation of privilege | Servidor MCP usa uma credencial do gateway (ex.: `DATABASE_URL` do Postgres de workspace) para agir fora do escopo que o operador lhe deu. | A credencial não chega mais ao filho por herança. O que ele recebe é o que o operador declarou em `env` — auditável por servidor — e `vault:` nele resolve no boot e no registry (GAR-291, #1237): referência que não resolve é fail-closed (servidor não sobe, aviso sem o valor). | Residual: o cofre é leitura do ambiente do processo do gateway (`GARRAIA_VAULT_PASSPHRASE`); sandbox real do processo MCP segue no #1225. |
+| **D** Denial of service | Um servidor legado que dependia de variável herdada (`HTTP_PROXY`/`HTTPS_PROXY` corporativo, `NODE_OPTIONS`, `npm_config_*`) para de subir após a atualização. Bundles de CA (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`) estão na allowlist porque são caminhos; as variáveis de proxy não, porque a URL pode embutir credencial. | Válvula de escape por servidor `inherit_env: true`, que restaura a herança completa e emite `warn!` nomeando o servidor a cada conexão. Padrão `false`. | O caminho certo é migrar a variável para o mapa `env` do servidor; `inherit_env` é destravamento temporário, não configuração de regime. |
+
+O `warn!` de `inherit_env` leva apenas o **nome** do servidor — nunca nome
+nem valor de variável — e é emitido no primeiro connect daquele servidor; os
+reconnects automáticos registram em `debug!`, para que um servidor em loop de
+restart não afogue o log justamente quando ele está sendo lido.
+
+A válvula existe só no `config.yml`/`mcp.json`. Servidores criados **ou
+reiniciados** pela admin API conectam sempre com o ambiente isolado, mesmo
+quando o arquivo declara `inherit_env: true` para aquele nome. Desde #1273
+o `McpServerConfig` do registro do gateway carrega o campo (para round-trip
+do arquivo), mas o handler de restart mantém o `false` explícito: a
+divergência deixou de ser falta de informação e é política do reconnect
+pela admin API — o boot honra a declaração, o restart isola mais (nunca
+menos).
+## 5.13. Sandbox por tool (`agent.sandbox`) — #1222, #1225
+
+O `BashTool` pode envolver o comando num backend em vez de executá-lo direto
+no host. A política mora em `garraia_agents::sandbox::SandboxPolicy`, a
+configuração do operador é a seção `agent.sandbox` (#1225) e a tradução entre
+as duas é `garraia_gateway::bootstrap::sandbox_policy_from` — a mesma função
+nos três pontos de produção (gateway, `garra chat`, `garra mcp-server` — tool
+`garra_agent`).
+
+Até a #1225 a seção não existia: os três construtores fixavam
+`SandboxPolicy::default()` (= `off`) e `set_sandbox_policy` só era chamado
+pelos próprios testes. A contenção estava escrita, testada e **inalcançável**
+— que é o motivo de esta seção existir antes da matriz.
+
+### O que cada backend garante
+
+| Backend | Rede | Sistema de arquivos | Privilégios | Onde o comando roda | O que **não** cobre |
+|---|---|---|---|---|---|
+| `docker` | `--network none` quando `network_disabled` (default `true`) | Só o `cwd` **canônico e absoluto** montado rw quando `mount_workdir` (default `true`); `cwd` relativo, inexistente, com `:`, ausente (sessão sem `working_dir` — o cwd do processo nunca é montado), `/`, o `$HOME` ou ancestral dele é recusa fail-closed (#1272); o resto é a imagem | `--security-opt no-new-privileges`, `--cap-drop ALL`, `--pids-limit 512`, `--user <uid>:<gid>` do operador (#1272); **sem** `--read-only` nem limite de memória | Container efêmero (`--rm`) no host local | O daemon do Docker é root, então escape do *kernel* a partir do container é escape para root; o `cwd` montado é rw e é código do projeto (por isso o git das tools de leitura roda endurecido, #1272 S3) |
+| `podman` | igual ao `docker` | igual ao `docker` | igual ao `docker`, com `--userns=keep-id` no lugar do `--user`, mais o rootless do próprio podman quando instalado assim | Container efêmero no host local | Idem, menos a parte do daemon root quando rootless |
+| `ssh` | **nenhuma** — e a policy é **recusada** (fail-closed, em todo comando) enquanto `network_disabled = true`, que é o default | **nenhuma** — idem enquanto `mount_workdir = true`; `image` é ignorado | os do usuário SSH no host remoto | Máquina remota, shell do usuário SSH | **Não é sandbox.** É execução remota: isola o host *local* e nada mais. O comando roda com tudo que aquele usuário pode fazer, inclusive rede. Só passa com `network_disabled = false` **e** `mount_workdir = false` explícitos — o reconhecimento do operador (#1225 S3, ADR 0019) |
+| *qualquer* | — | — | — | **Tools cobertas: `bash`, `run_tests`, `git_diff`, `code_review`, `repo_search`** (`TOOLS_SANDBOXAVEIS`). `bash` vai por `wrap_command` (linha `sh -lc`); as outras quatro por `wrap_argv` + `sandbox_spawn` (#1225 S2): argv montado sem shell, `-e HOME=/tmp`. Nos dois caminhos o container leva `--name garra-sbx-<uuid>` e o timeout roda `rm -f` nele (o `bash` também, com `kill_on_drop`); o `working_dir` do `run_tests` passa pelo jail das file tools antes de virar mount; exit 127 só vira "programa ausente na imagem" com a mensagem do próprio runtime no stderr | `HOST_ONLY_SPAWNING_TOOLS` ficou **vazia**, presa por teste que varre `src/tools/` (quem spawna por `Command::new` sem consultar a policy volta a aparecer ali). `backend = ssh` é recusado para as quatro tools de diretório de trabalho. O `git config` que lista os filtros a anular (`git_endurecido`, #1272 S3) roda no host — só lê config. O aviso de subida (`avisa_cobertura_do_sandbox`, uma vez por processo) diz que a imagem precisa da toolchain |
+
+Três limites valem para os três backends:
+
+- **As cinco tools que spawnam processo são envolvidas** (#1225 S2). A
+  imagem precisa dos programas delas: com a default (`debian:bookworm-slim`,
+  só `grep`) `run_tests` e `git_diff` respondem que o programa não existe
+  na imagem (exit 127 do runtime vira mensagem que aponta `agent.sandbox.image`),
+  e `repo_search` cai do `rg` para o `grep`
+  **dentro** do container — nunca no host. **Migração de quem já tinha
+  `mode = all`**: imagem com a toolchain, ou a tool em `elevated`; com
+  `network_disabled = true` o `cargo` não baixa crates. Os gates próprios
+  de cada tool (`validate_test_name`, revisão com `-`, confirmação do
+  `run_tests`, tier arriscado sem canal) continuam rodando **antes** do
+  sandbox — teste por tool com runtime falso em `sandbox_spawn.rs`, e smoke
+  com Docker real em `tests/sandbox_docker_tools.rs`.
+- **Unix, e agora dito em voz alta.** No Windows o `BashTool` escolhe
+  `powershell -Command` e receberia uma linha com quoting POSIX
+  (`docker run ... sh -lc '…'`), que o PowerShell não reparseia da mesma
+  forma — o quoting de aspa simples lá é `''`, não `'\''`. Desde a #1225
+  isso não é mais só documentação: `wrap_command` **recusa fail-closed**
+  fora de unix e o `config check` reporta Error, em vez de deixar a
+  contenção parecer ligada.
+- **`elevated` roda no host.** É o escape hatch: a tool listada pula o
+  backend mesmo em `mode = all`. Ele é duplamente gated só quando
+  `agent.tool_confirmation_enabled = true`; sem isso resta apenas a denylist
+  do `safety_gate`, e o `garra config check` avisa.
+
+### `ssh` + container remoto: won't-do (#1225 S5)
+
+Um backend que fizesse `ssh host -- docker run ...` não entra, por quatro
+razões:
+
+1. **Já existe pelo caminho do Docker.** `backend = docker` com um
+   `docker context` apontando para `ssh://host` roda o container na máquina
+   remota pelo transporte do próprio Docker: o `HOME` chega ao filho
+   (`safety_gate::allowed_child_env`), e com ele o contexto do operador. Sem
+   código novo. Atenção: com um contexto remoto, o `-v <cwd>:<cwd>` monta o
+   caminho do host **remoto**, não o do local.
+2. **Reabriria a injeção que a S2 fecha.** Seriam três camadas de `sh_quote`
+   numa linha de shell (local, ssh, `sh -lc` remoto) — a superfície que a
+   #1231 apontou e que o argv da S2 elimina.
+3. **Não serve às tools de diretório de trabalho.** O host remoto não tem os
+   arquivos do projeto; a resposta sairia sobre outra árvore, em silêncio.
+4. **Ninguém pediu**, e o custo de manter um controle de segurança é
+   contínuo.
+
+### Matriz
+
+| STRIDE | Cenário concreto | Mitigação atual | Gap / Planejada |
+|---|---|---|---|
+| **T** Tampering | Tool call do LLM (influenciável por injeção indireta de prompt, #1213) escreve fora do projeto. | Denylist + tier arriscado do `safety_gate` rodam **antes** do sandbox; com `docker`/`podman` o comando só enxerga o `cwd` montado. | `--read-only` no rootfs e mount do `cwd` em `ro` quando a tool for de leitura: slice próprio da #1225. |
+| **I** Information disclosure | Comando lê `~/.ssh`, `.env` do host, ou exfiltra por rede. | `--network none` por default; `#1075 R3` já limpa o env do filho para uma allowlist; fora do mount o container não vê o host. | Com `backend = ssh` **nada disso vale** — a seção acima diz por quê. |
+| **E** Elevation of privilege | Escape do container; `sudo` dentro do comando; binário setuid ou device deixado no `cwd` montado. | `--security-opt no-new-privileges`, `--cap-drop ALL`, `--user <uid>:<gid>` (docker) / `--userns=keep-id` (podman), `--pids-limit` (#1272). Teste com Docker real: `id -u` é o uid do operador, artefato no mount pertence a ele, `mknod` falha. | O daemon do Docker continua root fora; podman rootless segue a recomendação para quem quer tirar isso da equação. |
+| **E** Elevation of privilege | Operador liga `mode = all` e acredita que o agente perdeu o host. | Desde a #1225 S2 as cinco tools que spawnam processo (`bash`, `run_tests`, `git_diff`, `code_review`, `repo_search`) entram no sandbox com `mode = all`; o `config check` e esta seção dizem quais ficam de fora em `elevated`. | — |
+| **D** Denial of service | Comando consome CPU/memória da máquina inteira dentro do container. | Timeout do próprio `BashTool` + orçamento de tool calls. | `--pids-limit 512` desde a #1272; limite de memória (`--memory`) e rootfs `--read-only` continuam fora, registrados como limite conhecido da v0.4.5. |
+| **R** Repudiation | Não se sabe depois se um comando rodou contido ou no host. | `tracing::info!` "comando executado dentro do sandbox" no caminho envolvido e `tracing::error!` no fail-closed. | Evento de audit dedicado (`agent.tool.sandboxed`) quando o audit de tools existir. |
+| **S** Spoofing | Backend ausente no host faz o comando cair no host em silêncio. | **Fail-closed**: `wrap_command` devolve erro e o `BashTool` recusa o comando; `backend = ssh` sem `ssh_host` também não constrói backend nenhum. | — |
+| **E** Elevation of privilege | **Injeção de opção** por `ssh_host` / `image`: `sh_quote` garante um token, não um *operando*. O host fica antes do `--` em `ssh {host} -- sh -lc …`, então `ssh_host: "-oProxyCommand=…"` é lido como flag e executa no host **local**, já depois do `safety_gate`; `image: "-…"` desloca o posicional do `docker run`. | Valor começando com `-` é recusado em **três** camadas. Duas rodam sempre e são as que garantem a propriedade: `sandbox_policy_from` no boot (backend não é construído / imagem cai no default, com `warn!` que nunca loga o valor) e o próprio `wrap_command` (Err fail-closed, antes do `is_available()`). A terceira é o `garraia config check`, que **reporta** Error — e, desde o #1247, o mesmo check roda no boot e loga o achado, mas ele não está na allowlist que recusa o boot (`BLOQUEIA_O_BOOT`), então quem garante a propriedade continuam sendo as duas primeiras. Nenhum host e nenhuma imagem reais começam com `-`. | Conserto estrutural: montar **argv** em vez de uma linha de shell, eliminando a classe inteira. A #1225 S2 fez isso para `run_tests`, `git_diff`, `code_review` e `repo_search` (`wrap_argv`); o `bash` continua uma linha de shell, limite conhecido da v0.4.5. |
+| **T** Tampering | Sandbox ligado numa plataforma onde o wrap não tem significado. | `wrap_command` devolve `Err` fail-closed fora de unix, e o `config check` reporta Error em `cfg!(windows)` — em vez de entregar uma linha POSIX ao `powershell -Command`. | — |
+| **S** Spoofing | Operador escreve `backend: ssh` + `ssh_host` e mais nada, e a config **lê** como rede desligada e workdir contido (`network_disabled`/`mount_workdir` têm default `true`) — quando o ramo `ssh` não tem `--network none` nem mount e, até a S3, **ignorava** as duas em silêncio. | **Fail-closed** (#1225 S3, ADR 0019): `SandboxPolicy::chaves_que_ssh_nao_honra` lista o que está ligado e o ssh não honra, e `wrap_command` recusa cada comando enquanto a lista não for vazia — antes do `is_available()`, para o erro de "ssh não instalado" não mascarar este. É o ponto único por onde gateway, `garra chat` e `garra mcp-agent` passam; `sandbox_policy_from` **não** desliga as flags nem rebaixa o modo, só emite `warn!` no boot (sem o host). O `config check` reporta **Error** por chave ligada, nomeando a chave e a ação. Destrava-se só com `network_disabled = false` **e** `mount_workdir = false` explícitos: o `false` é o reconhecimento de que ssh é execução remota sem isolamento de rede/mount. A superfície `agent.sandbox` não saiu em release antes disto, então não há migração. | Se um dia o ssh passar a honrar alguma das duas (ex.: `-o` de túnel/`sshfs`), é o predicado que encolhe — nunca o ramo que cresce em silêncio. |
+
+### Config mínima
+
+```yaml
+agent:
+  tool_confirmation_enabled: true   # `elevated` sem isto é single-gated
+  sandbox:
+    mode: all                       # off (default) | all | allowlist
+    backend: podman                 # docker | podman | ssh
+    image: debian:bookworm-slim
+    network_disabled: true
+    mount_workdir: true
+    elevated: []                    # tools que rodam NO HOST
+```
+
+E a única forma de `ssh` passar (#1225 S3) — as duas flags em `false`
+**explícito**, porque o ssh não honra nenhuma delas e o default `true` é
+recusado:
+
+```yaml
+agent:
+  sandbox:
+    mode: all
+    backend: ssh                    # execução REMOTA, não contenção
+    ssh_host: bastiao.interno
+    network_disabled: false         # reconhecimento: ssh não desliga rede
+    mount_workdir: false            # reconhecimento: ssh não monta nada
+```
+
+O `garra config check` é um relatório que o operador roda (`config_cmd.rs`) ou
+que o `garra doctor` invoca — **não** é um gate de boot, e um gateway com a
+seção inválida sobe. O que ele faz é dar nome ao problema antes de alguém
+esbarrar nele em produção; quem impede o comando de rodar são as camadas 2 e 3
+descritas acima.
+
+Ele reporta Error para `mode != off` sem `backend`, `backend: ssh` sem
+`ssh_host`, `backend: ssh` com `network_disabled` ou `mount_workdir` em `true`
+(um Error por chave ligada, nomeando a chave e o `false` explícito que a
+destrava — #1225 S3), `ssh_host` ou `image` começando com `-`, e para a seção
+ligada fora de unix. Avisa (Warning) que `ssh` é execução remota — **sempre**,
+mesmo com a seção coerente —, que
+`elevated` sem confirmação humana é escape hatch desacompanhado, que
+`mode: all` com `bash` em `elevated` deixa a seção inerte, que `allowlist` com
+lista vazia sandboxa nada, que uma tool de `HOST_ONLY_SPAWNING_TOOLS` listada
+em `sandboxed_tools`/`elevated` roda no host com qualquer `mode` (só quando
+listada — a seção coerente fica verde sob `--strict`; #1225 S2), e nomeia cada
+entrada de `sandboxed_tools`/`elevated` que não é uma tool que o sandbox saiba
+envolver.
+Nenhum finding ecoa o `ssh_host`; nomes de tool são ecoados de propósito — é o
+ponto do finding.
+
+## 5.14. WhatsApp pessoal (`whatsapp_linked`) — piso de ferramenta por nome (#1327)
+
+O canal `whatsapp_linked` recebe mensagem de **qualquer pessoa que conheça o
+número pessoal do operador**, por um socket que a própria conta abriu
+(`crates/garraia-gateway/src/bootstrap/whatsapp_linked.rs`). É a maior
+superfície de injeção de prompt do projeto, e o que separa um remetente do
+host são duas camadas que não se substituem: a allowlist do canal (quem
+entra — fail-closed, sem `AllowlistMode::Open`) e o `ToolGate` do modo (o
+que pode fazer). Sessão sem modo escolhido cai no perfil `search`
+(`piso_somente_leitura`), e não em "sem política". `default_mode` só aceita
+modo **nativo** e diferente de `auto` (`modo_padrao`): nome desconhecido não
+vira portão aberto — o canal não sobe (`NaoSubiu::ModoPadraoInvalido`).
+
+Até a #1327 havia uma terceira camada: o canal recusava subir — e recusava
+cada turno — enquanto houvesse **qualquer** ferramenta de servidor MCP
+registrada no runtime. Ela nasceu para a #1264, quando `ToolGate::permite`
+isentava do whitelist todo nome com `__`; a #1288 fechou a isenção, e a
+recusa ficou sem função — mas continuou ligada, e como toda instalação nova
+ganha o servidor `filesystem` no primeiro boot, o canal nunca subia em
+instalação padrão. A recusa saiu; **o controle vivo é o portão, por nome**.
+
+| STRIDE | Cenário concreto | Mitigação atual | Gap / Planejada |
+|---|---|---|---|
+| **E** Elevation of privilege | Remetente admitido — ou uma página buscada por `web_fetch`, que está na whitelist do `search` — induz o modelo a chamar `filesystem__write_file` do servidor MCP provisionado por padrão. | O `ToolGate` do perfil `search` nega a ferramenta **por nome**, em cada turno, contra o inventário vivo (`ToolGate::para_o_turno`): ferramenta MCP não declarada em `allowed` não entra na lista que o modelo vê, e o guard de pré-execução a recusa se ele a pedir mesmo assim. `denied` (`file_write`, `bash`, `device_execute`) vence tudo, prefixo declarado incluso. Testes: `o_portao_do_turno_nega_ferramenta_mcp_por_nome_no_perfil_padrao` (portão montado como o turno monta) e `turno_roda_com_ferramenta_mcp_registrada_e_o_modelo_nao_a_ve` (fiação inteira, ponte falsa). | — |
+| **T** Tampering (configuração) | Operador troca `channels.whatsapp_linked.default_mode` por um perfil nativo **sem** whitelist (`ask`, `code`), em que passa tudo que o `denied` não nomeia — e o servidor MCP fica exposto a quem manda mensagem. | Não é recusa: `default_mode` é decisão declarada do operador. Na subida, `avisar_drift_de_mcp` monta o portão sobre o modo **já validado** — `ToolGate::for_mode_name`, o mesmo caminho do turno — e emite **um** `warn!` nomeando os servidores liberados e o **motivo** (`motivo_da_liberacao`: sem whitelist / whitelist com `allowed` vazia / `allowed` declara), nunca argumento nem segredo. Perfil customizado como padrão do canal não é alcançável (linha abaixo), então o caso `allowed: ["filesystem/*"]` só existe por `/mode` explícito na sessão — escolha da sessão, resolvida por `exec_context_for_inner`. | O aviso sai na subida; um servidor registrado depois pela admin API, sob um perfil já permissivo, não o reemite. |
+| **E** Elevation of privilege (configuração) | `default_mode` com typo (`pesquisa`), com `auto`, ou com o nome de um modo customizado. `ToolGate::for_mode_name` trata nome desconhecido como portão **aberto** — `bash`, `file_write` e toda ferramenta MCP registrada —, e `piso_somente_leitura` só gravava o nome no `ExecContext`; `auto` deixa o texto do remetente escolher o perfil e cai em portão aberto quando a heurística não classifica. Antes da #1327 a recusa por MCP mascarava isso em instalação padrão; sem ela, expunha tudo (finding da revisão da #1327). | Fail-closed em duas camadas: `deve_supervisionar` exige `modo_padrao` (nativo, não `auto`) e devolve `NaoSubiu::ModoPadraoInvalido` com a ação no `Display` (o valor da config aparece — é config do operador, não PII); `piso_somente_leitura` cai para `search` quando o nome não resolve, para que nenhum call-site que pule a subida monte portão aberto. Testes: `tabela_do_que_impede_a_supervisao`, `default_mode_desconhecido_nao_vira_portao_aberto_no_turno` (portão montado como o turno monta, com texto que a heurística de `auto` classificaria como `code`), `o_boot_nao_sobe_canal_desligado_sem_sessao_ou_com_default_mode_invalido` (call-site de boot, com servidor MCP registrado). | Modo customizado como piso do canal exigiria resolver o perfil do banco na subida e em cada turno — fora do escopo; `/mode` na sessão cobre o caso. |
+| **R** Repudiation | Canal ligado que não sobe, sem que o operador saiba por quê — o sintoma da #1327 era `INFO … (FerramentaMcpRegistrada)`, com `garra whatsapp status` dizendo "vinculado". | Qualquer `NaoSubiu` diferente de `Desabilitado` sai em `WARN` com a **ação** (`Display`: ligar na config, corrigir `default_mode` para um modo nativo ou remover a chave, `garra whatsapp link`, instalar Node.js 20+ e garantir `node` na PATH). `unknown channel type: whatsapp_linked` deixou de ser emitido para a seção que a própria CLI escreve. | `garra whatsapp status` e o check `whatsapp.linked` ainda não distinguem "vinculado" de "canal de pé". |
+
+---
+
+## 5.15. Perfil `isolated-pod` — poder total dentro do pod, nada implícito fora (#1329)
+
+Decisão: [ADR 0024](../adr/0024-perfis-de-execucao-isolated-pod.md). Guia do
+operador: [`../execution-profiles.md`](../execution-profiles.md).
+
+Tudo até aqui assume **uma** postura: o Garra roda numa máquina que ele não
+controla e é ele quem separa o agente do resto (§5.72 jail, §5.13 sandbox,
+§5.14 piso do canal). A #1329 expôs o cenário oposto: o operador instala o
+Garra num pod/container **descartável** justamente para dar ao agente
+autonomia plena, e ali a postura de fábrica atrapalha (o piso `search` nega
+o `filesystem__write_file` que o operador quer) enquanto o `filesystem`
+autoprovisionado em `$HOME` — dentro do pod, o pod inteiro; numa máquina
+compartilhada, o contorno do jail — não sabe em qual dos dois está.
+
+**Fronteira.** Em `isolated-pod` a fronteira de segurança é o **pod**, não o
+Garra. O perfil libera *ferramentas* (piso `code` para o dono do WhatsApp em
+1:1; raiz do MCP `filesystem` em `execution.pod_root`); ele **não** desliga
+*proteções* (jail das file tools nativas, gate de comando arriscado do
+`bash`, `agent.sandbox`, `/mode` explícito) e **não** cria isolamento
+nenhum.
+
+**Premissas de confiança que o operador assume ao ligar o perfil:**
+
+1. O processo roda num container/pod **descartável**: sem volume do host,
+   sem socket do Docker/Podman, sem `--privileged`, sem `--pid=host` nem
+   `--network=host`, sem mounts não declarados, sem segredos do host no
+   ambiente. O Garra não verifica nada disso — não pode.
+2. Quem está em `channels.whatsapp_linked.owners` é o próprio operador (ou
+   alguém com o mesmo nível de confiança), e a identidade que o Baileys
+   autentica para esse JID é dele.
+3. O que o agente puder destruir dentro do pod é aceitável perder.
+
+**O que o gate ainda impõe, mesmo em `isolated-pod`:**
+
+| STRIDE | Cenário concreto | Mitigação | Gap / Planejada |
+|---|---|---|---|
+| **E** Elevation of privilege (inferência) | Container com socket do Docker montado ou `--pid=host` "parece" pod isolado; uma autodetecção (`/.dockerenv`, `/proc/1/cgroup`, `KUBERNETES_SERVICE_HOST`) liberaria poder total num host real. | O perfil **nunca é inferido**: só `execution.profile` (arquivo) ou `GARRAIA_EXECUTION_PROFILE` (env, vence o arquivo), resolvidos uma vez no `ConfigLoader` com a origem registrada. Dois testes varrem o fonte (`garraia-config::execution` e `garraia-gateway::bootstrap::execution`) e reprovam os literais de detecção. Sem config e sem env = `standard`. | — |
+| **E** Elevation of privilege (valor inválido) | Typo no manifest do pod (`isolated_pod`, `pod`) e o processo cai em `standard` em silêncio — ou pior, em portão aberto. | Valor inválido é **erro de carga**: o gateway não sobe; `config check` reporta `Error` em `execution.profile` (exit 2) com a env e os valores aceitos na mensagem. | — |
+| **T** Tampering (persistência) | `garra config set` / `garra whatsapp link` fazem load-modify-save com a env presente; copiar a env para `profile` promoveria um override efêmero a config persistida — tirar a env deixaria o arquivo dizendo `isolated-pod`. | A env vive num campo `#[serde(skip)]` privado; `perfil()`/`origem()` a preferem, `save` nunca a grava. | — |
+| **S** Spoofing (identidade do dono) | Remetente forja o número do dono; contato pareado por código de 6 dígitos se passa por dono; dono manda de um grupo e o grupo herda o poder. | Identidade vem do JID que o Baileys autentica; normalização (`normalizar_identidade`: dígitos, ou JID `@lid` cru) e comparação byte a byte contra `owners`. Pareamento **nunca** confere o perfil completo (credencial fraca, memória do processo). Grupo **nunca** herda: `perfil_do_turno` devolve `Padrao` para `is_group`, para admitido-não-dono e para identidade desconhecida (fail-closed). `from_me` continua fora. Testes gêmeos: cada positivo tem o negativo (tirar de `owners`, voltar para `standard`, mandar do grupo) para que remover a autorização **quebre** a suíte. | "Note to self" (`from_me`) não é suportado nesta fatia. |
+| **E** Elevation of privilege (`owners` fora do perfil) | Operador lista `owners` em `standard` esperando poder. | `owners` fora de `isolated-pod` é `Warning` no `config check` ("só tem efeito em isolated-pod") e nunca muda o piso — todo admitido fica em `default_mode`. | — |
+| **T** Tampering (comando destrutivo no pod) | Dono, ou uma página via `web_fetch`, induz `rm -rf /` dentro do pod. | O gate de comando arriscado do `bash` continua ligado nos dois perfis; sem canal de confirmação é fail-closed. `agent.bash_allowlist` alarga por escolha do operador. Jail das file tools nativas (`agent.file_roots` ∪ `working_dir`) inalterado — `execution.pod_root` muda só a raiz do MCP `filesystem`. | O pod é descartável por premissa; o que o gate protege é o operador de um acidente, não o host de um ataque. |
+| **I** Information disclosure (raiz implícita) | `filesystem` autoprovisionado em `$HOME` numa máquina compartilhada. | `$HOME` nunca é raiz em nenhum perfil: `standard` → `agent.file_roots` ou `<data_dir>/workspace`; `isolated-pod` → `execution.pod_root` ou o mesmo workspace. Raiz logada no provisionamento; check `mcp.filesystem_root` no `/api/diagnostics`. | `mcp.json` anterior à v0.4.4 mantém o `$HOME` (nunca reescrito): o diagnóstico avisa em `standard` com o passo para corrigir; não há migração automática. |
+| **E** Elevation of privilege (`bash` sem humano, #1272) | Em `standard`, o `garra_agent` do `garraia mcp-server` ou um remetente de canal em `/mode code` pede `bash` `cat /etc/shadow` / `echo x > /fora` — nada disso é "arriscado" para o gate textual. | `bash` só é registrado com sandbox `docker`/`podman` válido (`exposicao_do_bash`); `ssh`, `elevated`, `allowlist` sem `bash`, backend ausente ou binário ausente = sem `bash`. Em `isolated-pod` explícito ele roda no host do pod (salvo quando a policy exige sandbox e ele é inutilizável: fica de fora). A mesma regra vale para o `run_tests` do gateway, que executa `scripts.test`/`build.rs`/`conftest.py` que o `file_write` escreve (teste `file_write_mais_run_tests_nao_executa_codigo_no_host_em_standard`). `warn!` único no boot, check `tools.bash` no `/api/diagnostics`, system prompt diz que não há shell. Testes: `standard_nega_leitura_e_escrita_fora_por_bash_e_por_file_tools`, `isolated_pod_roda_bash_no_working_dir_e_mantem_a_denylist`, `gateway_em_standard_sem_sandbox_nao_registra_bash`, `modulo_nao_infere_nada_de_container`. | `garraia chat` fica como está (humano confirma no terminal). |
+| **R** Repudiation | Perfil ligado fora de um pod, e ninguém percebe. | `WARN` único no boot (origem, `pod_root`, o que foi liberado, o que NÃO é isolado, como reverter); `Warning` **permanente** em `/api/diagnostics` (`execution.profile`, com origem, piso do dono, número de donos, raiz do MCP e `next_step`); linha read-only `security.execution_profile` em `/api/settings/effective`; linha em `garra whatsapp status`; perfil e origem no sumário do `config check`; cada turno do WhatsApp loga `phone_last4` + `perfil` + piso (nunca JID, telefone, `push_name` ou texto). | — |
+
+**Residual aceito:** o perfil é uma declaração, e o Garra a honra sem poder
+verificá-la. Um operador que liga `isolated-pod` num host compartilhado dá ao
+dono do WhatsApp `bash` e `file_write` nesse host, dentro do jail e do gate de
+comando — que são proteção contra acidente, não contra um dono hostil. A
+mitigação é a soma das superfícies de observação acima e o nome
+autoexplicativo do perfil.
+
+## 5.16. Aprovação retomada entre turnos — quem pode dizer "sim" (#1343)
+
+O fluxo GAR-187 pausa o turno quando uma ferramenta pede confirmação (`bash`
+arriscado com `agent.tool_confirmation_enabled`, `device_execute` R3/R4,
+`run_tests`) e espera o "sim" no turno seguinte. Até a v0.4.4 a aprovação só
+vinha do histórico (`detect_confirmation_approval`), e todo canal de produção
+guarda e reidrata o histórico como texto: o `ToolResult` pausado nunca
+voltava, e a pausa era terminal. Falhava fechado, mas o humano nunca
+conseguia aprovar.
+
+Desde a v0.4.5 o runtime guarda o pedido pausado em memória
+(`garraia_agents::tools::pending_approval::PendingApprovals`), um por
+`(canal, sessão)`, com o remetente que pode aprovar e a impressão digital
+HMAC do pedido — nunca o assunto cru (o comando do `bash` pode ter segredo).
+Um turno só grava e só lê esse registro quando chega com
+`ExecContext::approval_scope`, montado pelo gateway em
+`crates/garraia-gateway/src/approval_scope.rs` e pela CLI em
+`exec_do_turno` (`garraia chat`). Com escopo, o histórico deixa de ser
+consultado para aprovar.
+
+**O remetente é sempre derivado pelo servidor:**
+
+| Caminho | Canal | Remetente |
+|---|---|---|
+| `/ws` (Web Console) | `web` | nonce da conexão WebSocket, gerado no servidor e nunca enviado ao cliente |
+| `/ws/parrot` (desktop) | `parrot` | nonce da conexão |
+| `/v1/chat/completions` | `openai` | dono da allowlist (nunca `X-User-Id`) + SHA-256 dos bytes do `Authorization` recebido (header que não é UTF-8 continua sendo a credencial dele, nunca o anônimo); sem dono, sem escopo |
+| `POST /chat` (mobile) | `mobile` | `sub` do JWT |
+| `bootstrap/<canal>.rs` (11 canais) | nome do canal | id do usuário na plataforma, o mesmo que a allowlist confere |
+| `whatsapp_linked` | `whatsapp_linked` | remetente normalizado; em grupo a sessão é do grupo |
+| `garraia chat` | `cli` | `local-tty` — o processo é a fronteira de usuário |
+
+**Retomar exige a mesma sessão.** Em `/v1/chat/completions` a sessão é a
+`X-Session-Id` do cliente; sem ela, cada request ganha um UUID novo do
+servidor, e o "sim" cai numa sessão sem pedido pendente — a pausa é terminal.
+O cliente que quer aprovar manda a mesma `X-Session-Id` (e o mesmo
+`Authorization`) no pedido e no "sim". Os dois ramos da rota (com
+`"stream": true` e sem stream) montam o mesmo escopo, então pausar num e
+aprovar no outro vale.
+
+**Matriz de recusa.** A coluna "Teste" nomeia o que prende cada linha; onde
+não há teste dedicado, ela diz por quê. `e2e` é
+`crates/garraia-gateway/tests/approval_resume_e2e.rs` (handlers reais sobre
+HTTP/WS); `registro` é `crates/garraia-agents/src/tools/pending_approval.rs`;
+`runtime` é o módulo de testes do #1343 em `crates/garraia-agents/src/runtime.rs`.
+
+| Tentativa | Resultado | Teste |
+|---|---|---|
+| "sim" do mesmo remetente, mesma sessão e canal, dentro de 5 min | aprova **uma vez** o `(ferramenta, assunto)` pausado | e2e `ws_sim_no_turno_seguinte_roda_uma_vez_e_replay_pausa`, `parrot_mesma_conexao_aprova_e_outra_conexao_nao`, `openai_sim_com_a_mesma_credencial_roda_uma_vez`, `openai_stream_sim_com_a_mesma_credencial_roda_uma_vez`, `openai_pausa_num_ramo_e_o_sim_no_outro_aprova`, `mobile_sim_do_mesmo_sub_roda_e_outro_sub_nao_alcanca`, `canal_o_mesmo_usuario_aprova_o_proprio_pedido_uma_vez`; `whatsapp_linked` `dono_no_pod_recebe_o_pedido_e_o_sim_roda_uma_vez`; CLI `chat::aprovacao_tests::sim_no_turno_seguinte_roda_uma_vez_e_replay_pausa`; registro `mesmo_escopo_aprova_uma_vez_so` |
+| Segundo "sim" (replay) | pausa de novo | os mesmos e2e de web, OpenAI (dois ramos) e canal, e o da CLI |
+| Outra conexão WebSocket retomando a mesma sessão sem token | não aprova, e encerra o pedido | e2e `ws_outra_conexao_na_mesma_sessao_nao_aprova`, `parrot_mesma_conexao_aprova_e_outra_conexao_nao` |
+| Outra sessão | não alcança o pedido | e2e `ws_outra_sessao_nao_aprova`; runtime `outra_sessao_e_outro_canal_nao_aprovam`; CLI `sim_em_outra_sessao_nao_aprova` |
+| `X-Session-Id` escolhida pelo cliente apontando para uma sessão de outro canal | não alcança o pedido (o canal é fixado por quem chama, nunca lido da sessão) | e2e `openai_com_session_id_de_outro_canal_nao_consome_o_pedido` |
+| Mesma `X-Session-Id`, outro `Authorization` | não aprova, e encerra o pedido | e2e `openai_outra_credencial_na_mesma_sessao_nao_aprova`, `openai_stream_outra_credencial_na_mesma_sessao_nao_aprova` |
+| `Authorization` que não é UTF-8 (obs-text) contra um cliente sem header | não aprova: o hash é dos bytes, e não cai no remetente anônimo | e2e `openai_authorization_nao_utf8_nao_vira_o_anonimo`; unitário `approval_scope::tests::authorization_nao_utf8_nao_vira_o_anonimo` |
+| `/v1/chat/completions` sem `X-Session-Id` | não retoma: cada request é uma sessão nova | e2e `openai_sem_x_session_id_o_sim_nao_aprova` |
+| Outro membro do grupo | não aprova, e encerra o pedido (fail-closed) | `whatsapp_linked`: `no_grupo_o_sim_de_outro_membro_nao_aprova_o_pedido`, pela ponte falsa. Os 11 canais de `bootstrap/`: **não há teste ponta a ponta por canal** — o e2e `canal_dois_usuarios_na_mesma_sessao_nao_aprovam_o_pedido_um_do_outro` exercita o caminho comum (`com_escopo` + runtime, dois ids na mesma sessão), e `approval_scope_coverage.rs` prende, por arquivo, qual identificador vai como remetente (`REMETENTES`) |
+| "não" (qualquer mensagem que não seja palavra de aprovação) e depois "sim" | não aprova | e2e `ws_nao_depois_sim_nao_aprova`; runtime `recusado_e_depois_sim_nao_aprova`; registro `recusado_depois_sim_nao_aprova` |
+| Registro vencido (TTL 300 s) | não aprova | registro `pedido_vencido_nao_aprova` (relógio injetado; sem e2e, que teria de esperar 5 min) |
+| Marcador copiado ou forjado no histórico, com escopo | ignorado — só o registro conta | runtime `com_escopo_marcador_copiado_no_historico_nao_aprova` |
+| Pedido re-emitido com outro assunto depois do "sim" | `ToolApproval::covers` recusa; a aprovação é gasta | runtime `assunto_diferente_depois_do_sim_nao_roda_e_gasta_a_aprovacao`; registro `aprovacao_nao_cobre_outra_tool_nem_outro_assunto` |
+| Dois "sim" concorrentes no mesmo escopo | exatamente um aprova | registro `dois_sim_concorrentes_dao_uma_aprovacao_so` |
+| Gateway reiniciado com pedido pendente | não aprova | **sem teste**: vale por construção — o registro vive só na memória do processo e a chave do HMAC é aleatória por processo (`approval.rs::marker_key`) |
+
+**Caminhos sem escopo, de propósito** — ali a pausa continua terminal: A2A
+(`a2a.rs`) e OpenClaw (`bootstrap/openclaw.rs`), porque quem fala é outro
+agente; `POST /api/sessions/{id}/messages` (`api.rs`), porque o Web Console é
+auth-free e a sessão vem do path; a resposta do agente no chat do workspace
+(`rest_v1/messages.rs`), one-shot com histórico vazio; a tarefa agendada
+(`process_heartbeat` em `server.rs`), que não tem humano no turno; `garraia
+ask` e o `garra_agent` do `garraia mcp-server`, one-shot e dirigidos por
+agente.
+
+**Guardas de regressão.** `crates/garraia-gateway/tests/approval_scope_coverage.rs`
+varre `src/` atrás de toda chamada a um ponto de entrada do runtime
+(`process_message*` e `process_heartbeat`; nome novo com esse prefixo reprova
+até entrar na lista) e decide **por chamada**: o contexto de execução tem de
+ser exatamente `crate::approval_scope::com_escopo(..)`, inline ou no `let`
+que a chamada enxerga dentro da mesma `fn`, ou a chamada tem de estar em
+`SEM_ESCOPO`, presa por arquivo, `fn` e ponto de entrada, com o motivo. Toda
+chamada a `com_escopo` confere o remetente contra `REMETENTES` (um por
+arquivo) e reprova remetente literal ou igual à sessão. O detector lê o fonte
+sem comentários e sem o conteúdo de literais, apaga os `#[cfg(test)] mod x {
+.. }` inline sem esconder a produção que vem depois deles, e pula o arquivo
+dos `#[cfg(test)] mod x;`. `crates/garraia-cli/tests/approval_scope_oneshot.rs`
+usa o mesmo detector na CLI: toda chamada do `chat.rs` passa por
+`exec_do_turno(..)`, e as de `ask.rs`/`mcp_agent.rs` ficam presas por `fn`.
+Esses guardas são estáticos — provam que o remetente é o identificador
+esperado, não que a plataforma o entrega autenticado.
+
+| STRIDE | Ameaça | Mitigação | Residual |
+|---|---|---|---|
+| **S** Spoofing | Um segundo cliente (outra aba, outro processo) diz "sim" pelo humano que leu o pedido. | Remetente derivado pelo servidor por caminho (tabela acima); remetente diferente não aprova e encerra o pedido. | Em `/v1/chat/completions` sem `Authorization`, dois clientes com a mesma `X-Session-Id` são indistinguíveis (quem manda um header, UTF-8 ou não, é outro remetente) — a rota é auth-free por desenho (§5.9); quem alcança a rota já pode pedir e aprovar a própria ferramenta. No IRC o nick é a única identidade e pode ser tomado sem NickServ — o mesmo limite da allowlist daquele canal. |
+| **T** Tampering | Marcador colado no histórico (mensagem do cliente OpenAI, saída de ferramenta) para forjar a aprovação. | Com escopo, o histórico não é consultado; o registro só é escrito pela pausa de uma ferramenta nativa. | Sem escopo vale a detecção antiga pelo histórico, com as regras das #1226/#1339/#1340. |
+| **I** Information disclosure | O comando pausado (com segredo) ou o remetente (telefone, user id) fica guardado ou vai para log. | Só nome da ferramenta + HMAC são guardados. Os eventos do registro (`aprovacao pendente registrada/encerrada/recusada`) levam só `channel` e `tool`; nunca remetente nem assunto. O `Debug` de `ApprovalScope` e do `ExecContext` que o carrega mostra o remetente só como tamanho (`<redigido: N bytes>`) e a sessão pela mesma máscara do log; o do registro mostra só quantos pedidos há. O hash do `Authorization` só vive no mapa em memória. A sessão entra no log como campo do span `#[instrument]` do turno, e em WhatsApp, Signal e `whatsapp_linked` ela embute o telefone (`whatsapp-{numero}`, `signal-{numero}`, `whatsapp-linked-{jid}`): o `RedactingWriter` de stderr e arquivo passa toda linha por `mascarar_numeros_longos`, que troca sequência de 10+ dígitos não colada a letra por `…` + os 4 últimos. Testes: `debug_nao_mostra_o_remetente` (sessões reais de WhatsApp Cloud e `whatsapp_linked`), `writer_mascara_o_numero_e_redige_o_segredo`, `mascara_telefone_jid_e_lid_e_deixa_os_4_ultimos`. | O `user_id` do LINE (`U` + 32 hexa) não é sequência de dígitos e continua legível no span; número com menos de 10 dígitos também. Saída que não passa pelo `RedactingWriter` (um `println!` fora do tracing) não é mascarada. |
+| **D** Denial of service | Encher o mapa de pedidos. | Teto de 4096 registros; vencidos são varridos em toda escrita e o mais antigo sai quando cheio — o humano dele é perguntado de novo. | — |
+| **E** Elevation of privilege | Um "sim" aprova mais do que o pedido lido, ou duas vezes. | A aprovação cobre só o `(ferramenta, assunto)` do HMAC, é consumida sob um único lock em todo desfecho e dura um turno. | — |
+
+---
+
+## 5.17. Sessão por id — leitura de cliente vs. leitura do operador (#1462)
+
+Fechado em 2026-09-26 (opção 3, decisão do dono). Achado da revisão
+independente da PR #1448: `session_id` era uma fronteira furada por mais de
+uma porta. A PR #1468 fechou a **escrita** (`X-Session-Id` em
+`/v1/chat/completions` e `POST /api/sessions/{id}/messages`). Restava a
+**leitura direta**: `GET /api/sessions/{id}/history` devolvia o histórico
+verbatim (`{role, content}`) de qualquer sessão em memória — sem LLM no meio,
+parseável por script, enumerável em loop —, porque o ramo `EmMemoria` de
+`AppState::sessao_da_api` retornava cedo sem olhar a superfície. Uma sessão
+de canal está em memória no caso normal: é a hidratação do canal que a põe
+lá. Com `gateway.api_key` configurada o gate cobre a rota, mas a chave é
+única e compartilhada por toda a LAN, e os ids são adivinháveis por
+construção (`whatsapp-linked-<numero>`, `telegram-<chat>`): é um gap de
+**authz horizontal**, não de autenticação.
+
+**Desenho.** Duas leituras, duas credenciais. A regra do cliente mora num
+lugar só — `sessao_da_api` aplica `sessao_em_memoria_e_local` no ramo em
+memória e `sessao_readotavel_pela_api` no do disco —, e é o que
+`exigir_sessao_da_api` consulta para as três rotas por id:
+
+| Rota | Antes | Depois |
+|---|---|---|
+| `GET /api/sessions/{id}/history` | qualquer sessão em memória; do disco, só a REST | só sessão das superfícies locais (`api`, `vscode`, `web`, `parrot`), em memória ou readotada do disco; canal/mobile → `404` byte-idêntico ao de id inexistente, sem hidratar |
+| `GET /api/sessions` | toda sessão em memória (id + canal) | só as locais — o id de canal carrega telefone/chat id, e nomeá-lo já confirma que a conversa existe |
+| `DELETE /api/sessions/{id}` | desconectava, revogava e gravava `api_logout` em qualquer sessão em memória | só as locais; canal/mobile → `404`, sem tocar a sessão nem a linha |
+| `POST /api/sessions/{id}/messages`, `X-Session-Id` | só as locais (PR #1468) | idem; a checagem extra do handler saiu, a regra é a de `sessao_da_api` |
+| `/ws`, `resume` sem token | qualquer sessão em memória | só as locais; com token válido, o de sempre (o token prova o dono) |
+| `GET /admin/api/sessions/{id}/history` | — | **nova**: qualquer sessão, em memória ou só no `sessions.db`; cookie do `/admin` + `Permission::ManageSessions` (`viewer` → 403, sem cookie → 401); lê **sem hidratar**; cada leitura vai para a auditoria (`read_history` / `session`) |
+| `GET /chat/history` (mobile) | sessão derivada do `sub` do JWT | inalterada — nunca recebe id do cliente |
+
+O Web Console usa a leitura administrativa (listagem e Export) quando o
+navegador está logado no `/admin`; sem login, mostra só as sessões locais e
+diz onde entrar (`data-testid="sessions-admin-hint"`). A leitura do operador
+não hidrata de propósito: `hydrate_session_history(id, Some("api"))`
+reescreveria o `channel_id` da linha e anotaria a superfície REST na sessão
+— exatamente as marcas que `sessao_alcancavel_por_id_do_cliente` lê para
+decidir.
+
+| STRIDE | Ameaça | Mitigação | Residual |
+|---|---|---|---|
+| **I** Information disclosure | `GET /api/sessions/{id}/history` com id de canal lê a transcrição da vítima, sem LLM. | Regra única em `sessao_da_api` (memória e disco); `404` idêntico ao de id inexistente; a sessão não é hidratada nem reetiquetada. | As superfícies locais compartilham sessão por desenho (o VS Code continua o que começou no console) — é o operador dos dois lados. |
+| **I** Information disclosure | `GET /api/sessions` nomeia `whatsapp-linked-<telefone>` e `telegram-<chat>`. | A listagem de cliente filtra pela mesma regra. | O operador logado vê tudo — por definição. |
+| **T** Tampering | `DELETE /api/sessions/{id}` desconecta a sessão de um canal e grava `api_logout` na linha dela. | Mesma regra; a desconexão administrativa continua em `DELETE /admin/api/sessions/{id}` (cookie + CSRF). | — |
+| **S** Spoofing | `resume` sem token no `/ws` com id de canal em memória anexa o chat web à conversa do canal. | Sem token, só sessão local; o token continua sendo a prova de dono para o resto. | Entre sessões locais, o `resume` sem token segue permissivo, como antes (#922). |
+| **E** Elevation of privilege | `viewer` exporta transcrições pela rota administrativa. | `has_permission(role, ManageSessions)`; `viewer` não tem. | Papel custom herda o que declarar. |
+
+Testes: `crates/garraia-gateway/tests/leitura_de_sessao_por_id_do_cliente.rs`
+— 12 cenários sobre o `build_router` real com `sessions.db` real (memória e
+disco para cliente e operador, 401/403 da admin, auditoria, mobile por JWT,
+listagem, `DELETE`, `resume` do `/ws`, varredura do `webchat.html`) —, mais
+`x_session_id_nao_alcanca_sessao_de_canal.rs` (PR #1468) e a tabela unitária
+de `state.rs`.
+
+---
+
+## 5.18. WhatsApp pessoal — política de acesso por principal (ADR 0025, #1388)
+
+Fechado em 2026-09-26 (missão v0.4.6; PRs #1489, #1490, #1493, #1494, #1497,
+#1499, #1503). Quem manda mensagem para o número vinculado é, para o agente,
+um **remetente não autenticado** — a fronteira de confiança é a admissão do
+canal, e depois dela a política decide **até onde** cada um vai. Até a v0.4.5
+só existia a allowlist (`allow`/`owners`); a partir da 0.4.6 a seção
+`channels.whatsapp_linked.access` é a política v2.
+
+**Desenho.** Três decisões, nesta ordem e a cada turno, sempre pela config
+**viva** (`admissao_vigente`: um bloqueio ou uma revogação vale na mensagem
+seguinte, sem restart):
+
+1. **Admissão** (`access.admission`): `restricted` (default — só identidades
+   declaradas em `allow`/`owners`/`access.users`, ou pareadas por código) ou
+   `open` (**declarado**, nunca inferido de lista vazia nem de um `*` na
+   lista; a CLI e o console avisam e exigem confirmação para abrir). Fora da
+   admissão não há turno, não há resposta (responder confirmaria ao estranho
+   que o número roda um bot) e a recusa é **contada por motivo** (#1422:
+   `restricted_policy`, `unresolved_lid`, `blocked_user`, `channel_disabled`,
+   `prompt_injection`), só com o final da identidade.
+2. **Principal** (`principal_do_turno`): bloqueio vence tudo (inclusive
+   admissão aberta e pareamento anterior); depois dono, usuário declarado
+   (`level` `chat|read|full` + `write`), pareado por código (`read`),
+   desconhecido (`access.default`, `chat` por padrão) e **grupo** (política
+   do grupo ou `groups.default`; o dono dentro de um grupo **é o grupo**, e
+   nunca herda o poder do 1:1).
+3. **Teto ∧ piso**: o alcance do principal vira um `TetoDeCapacidades` por
+   classe (#1385) composto com o piso do modo da sessão pelo `ToolGate` do
+   runtime, por nome **e** classe, ferramenta MCP inclusa. `full` não é poder
+   absoluto: só o dono, em 1:1, num processo `isolated-pod` (ADR 0024) recebe
+   o piso do pod; em `standard` todo mundo fica no piso `search` (salvo
+   `default_mode` declarado). `write` liga **só** escrita de arquivo (nativa
+   e MCP) — shell, dispositivo, mensagem e agenda são controles separados.
+
+**Ameaças e mitigação.**
+
+| Ameaça | Mitigação | Prova |
+|---|---|---|
+| Estranho conversa com o Garra | admissão `restricted` por padrão; `open` só declarado e confirmado | `tests/politica.rs`; E2E `desconhecido_e_negado_em_restricted_e_so_conversa_em_open` |
+| Escalada via grupo (dono presente) | grupo é principal próprio, sem herança | E2E `grupo_nao_herda_o_full_do_dono`; ADR 0024 tests |
+| Usuário `read` muta arquivos (nativa ou MCP) | teto por classe nega `filesystem.write` e `mcp.write`; MCP confinado ao jail (#1482) | E2E `usuario_read_le_mas_nao_muda_…` (nativa e MCP com a mesma recusa) |
+| Mudança de política não pega a sessão viva | política relida por turno; bloqueio descarta a mensagem seguinte | E2E (write a quente; `blocked: true` a quente) |
+| Config legada vira brecha | `allow`/`owners` legados ficam sem teto (o piso decide, como sempre); política malformada falha fechado com `avisos` | `PoliticaDeAcesso::da_secao` |
+| Superfícies divergem (CLI × API × console) | um motor: `visao::documento`, `mutacao::aplicar`, `impacto` pelo `ToolGate` real, `auditoria` | `tests/admin_whatsapp_access.rs`, CLI `whatsapp/tests/politica.rs` |
+| Identidade vaza em log/audit/console | `…1234` em toda superfície; guardas de fonte nos testes | `fonte_nao_loga_jid_cru_nem_material_de_sessao` |
+
+**Residual.** `open` + `default` acima de `chat` é escolha do operador (o
+console e a CLI mostram o default real antes de confirmar); `default_mode`
+declarado sobe o piso de todo admitido (avisado no boot); um usuário
+declarado só em `allow` legado não tem teto próprio e fica no piso do modo —
+migrar para `access.users` é o passo, e `garraia whatsapp access` mostra
+quem está assim.
 
 ---
 
@@ -405,6 +1244,7 @@ Agregado das matrizes. Prioridade = (likelihood × impact) dado o estado atual d
 | 6 | Plugin WASM runtime ainda scaffold | Plugins | Baixa (não shipped) | Fase 2.2 |
 | 7 | Storage HMAC integrity + allow-list MIME pendente impl | Storage (future) | Baixa (ADR apenas) | GAR-394 |
 | 8 | Mobile Android `FLAG_SECURE` ausente | Mobile | Baixa | plan futuro |
+| 9 | Container do sandbox sem `--read-only` nem limite de memoria (cobertura das 5 tools desde a #1225 S2; `--user`, `--cap-drop`, `--pids-limit` desde a #1272) | Agents | Baixa | plan futuro |
 
 ---
 
@@ -418,6 +1258,7 @@ Agregado das matrizes. Prioridade = (likelihood × impact) dado o estado atual d
 - **Rate limit per-user** (plan 0022 F-03).
 - **Metrics endpoint auth** (Bearer + IP ACL + startup fail-closed, plan 0024).
 - **Telemetry hardening**: REDACT_HEADERS + idempotent init + cardinality guard debug assert (plan 0025/0026).
+- **WhatsApp pessoal — política de acesso por principal** (ADR 0025, §5.18): admissão declarada, principal por turno pela config viva, teto por classe ∧ piso do modo, grupo sem herança, recusas contadas por motivo e audit com `…1234`.
 
 ---
 

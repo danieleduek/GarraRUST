@@ -8,6 +8,8 @@ curl -fsSL https://garraia.org/install.sh | sh
 
 O script baixa o binário da release mais recente (verificado por SHA-256 via `SHA256SUMS`), roda `garra init` (wizard de provedor LLM + cofre criptografado de credenciais) e `garra start`.
 
+Ele deixa dois nomes no PATH: `garraia` (o asset da release) e o alias `garra` (symlink para ele) — os dois valem, e os comandos `garra …` desta wiki funcionam como estão.
+
 Variáveis úteis do instalador:
 
 | Variável | Efeito |
@@ -64,7 +66,8 @@ irm https://garraia.org/install.ps1 | iex
 ```
 
 Irmão Windows do `install.sh`: verifica o SHA-256, instala `garraia.exe` em
-`%LOCALAPPDATA%\Programs\GarraIA`, registra no PATH do usuário e encadeia
+`%LOCALAPPDATA%\Programs\GarraIA` junto com o shim `garra.cmd` (para `garra`
+também funcionar), registra o diretório no PATH do usuário e encadeia
 `init` + `start`. Sem privilégio de administrador.
 
 Para passar flags — `irm | iex` não recebe argumentos:
@@ -101,6 +104,22 @@ garra ask "resuma este arquivo" # pergunta única, sem chat interativo
 garra status    # verifica se está rodando
 ```
 
+### Instalação num pod descartável (RunPod, Docker)
+
+Se o Garra vai rodar num container **descartável**, criado justamente para dar autonomia plena ao agente, declare o perfil de execução antes de subir — ele nunca é inferido (ADR 0024, v0.4.4):
+
+```bash
+export GARRAIA_EXECUTION_PROFILE=isolated-pod   # vence o config.yml; valor inválido recusa o boot
+garra init
+garra start
+```
+
+Com `isolated-pod` o dono do WhatsApp pessoal (declarado em `channels.whatsapp_linked.owners`, conversa 1:1) recebe o piso `code` e o MCP `filesystem` nasce em `execution.pod_root` (ou `<data_dir>/workspace`). O perfil **não** isola volume do host, socket do Docker, `--privileged` nem segredos do host — se algum desses vale para o seu container, fique em `standard`. Lista completa, exemplo de `config.yml` e troubleshooting: [`docs/execution-profiles.md`](https://github.com/michelbr84/GarraRUST/blob/main/docs/execution-profiles.md) · [Runpod](https://github.com/michelbr84/GarraRUST/blob/main/docs/deployment-runpod.md) · [Docker](https://github.com/michelbr84/GarraRUST/blob/main/docs/deployment.md).
+
+> Desde a v0.4.5 (#1261), num bind exposto (`0.0.0.0`, como o da imagem Docker) o `garraia start` recusa subir sem credencial de gateway (exit 78). Defina `GARRAIA_GATEWAY_API_KEY` no ambiente do container (`openssl rand -hex 32`) ou `gateway.api_key` no `config.yml`; o `garraia init` grava a chave sozinho num pod RunPod.
+
+> A instrução impressa ao fim do `garra whatsapp link` ("inicie o gateway: `garraia start`" ou "`garra start`") usa o nome do executável que você está rodando — os dois são o mesmo binário.
+
 ## Atualização e rollback
 
 ```bash
@@ -114,7 +133,7 @@ garra rollback  # volta para a versão anterior
 
 ```bash
 git clone https://github.com/michelbr84/GarraRUST.git && cd GarraRUST
-cargo build --release -p garraia          # requer Rust 1.94+
+cargo build --release -p garraia          # requer Rust 1.95+
 cargo build --release -p garraia --features plugins   # com suporte a plugins WASM
 ```
 

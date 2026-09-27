@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use garraia_common::Result;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
 
+use super::repo_dir::RepoDir;
 use super::{Tool, ToolContext, ToolOutput};
 use crate::providers::{ChatMessage, ChatRole, ContentBlock, LlmProvider, LlmRequest, MessagePart};
 
@@ -27,6 +27,8 @@ pub struct CodeReviewTool {
     model: String,
     /// Timeout for git operations
     timeout: Duration,
+    /// #1225 S2: `agent.sandbox`. Default `off` = host, como sempre.
+    sandbox: crate::sandbox::SandboxPolicy,
 }
 
 impl CodeReviewTool {
@@ -40,20 +42,50 @@ impl CodeReviewTool {
             provider,
             model: model.into(),
             timeout: Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS)),
+            sandbox: crate::sandbox::SandboxPolicy::default(),
         }
     }
 
-    /// Get git diff output
+    /// #1225 S2: a policy de `agent.sandbox` que o spawn consulta.
+    pub fn set_sandbox_policy(&mut self, policy: crate::sandbox::SandboxPolicy) {
+        self.sandbox = policy;
+    }
+
+    /// #1225 S2: [`Self::set_sandbox_policy`] em forma de builder, para o
+    /// ponto de registro.
+    #[must_use = "devolve a tool com a policy; o receptor e consumido"]
+    pub fn com_sandbox(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
+        self.sandbox = policy;
+        self
+    }
+
+    /// Get git diff output, **from the repository in `repo`**
     async fn get_diff(
         &self,
+        repo: &RepoDir,
         commit_range: Option<&str>,
         file_path: Option<&str>,
     ) -> std::result::Result<String, String> {
         // --no-ext-diff: .git/config plantado (diff.external) não transforma
         // o code_review em execução arbitraria (#1075 — auditoria).
-        let mut args = vec!["diff".to_string(), "--no-ext-diff".to_string()];
+        // #1272 S3: e `--no-textconv`, pelo mesmo motivo.
+        let mut args = vec!["diff".to_string()];
+        args.extend(
+            crate::git_endurecido::OPCOES_DO_DIFF
+                .iter()
+                .map(|s| s.to_string()),
+        );
 
         if let Some(range) = commit_range {
+            // #1269 (paridade com o `git_diff`): o `commit_range` vem do modelo
+            // e é um argumento argv — começando com `-` ele vira flag do git
+            // (`--output=…` escreve arquivo, `-O…`, `--stdin`). Recusado antes
+            // de entrar na linha de comando.
+            if range.starts_with('-') {
+                return Err(format!(
+                    "commit_range '{range}' recusado: revisão não pode começar com '-'"
+                ));
+            }
             args.push(range.to_string());
         }
 
@@ -62,21 +94,29 @@ impl CodeReviewTool {
             args.push(path.to_string());
         }
 
-        let mut cmd = Command::new("git");
-        cmd.args(&args);
-        // #1075 R3 (parity — auditoria do hardening): o filho git herda só a
-        // allowlist de env do pai.
-        #[cfg(unix)]
-        {
-            cmd.env_clear();
-            for (key, value) in garraia_common::safety_gate::allowed_child_env() {
-                cmd.env(key, value);
-            }
-        }
-        let result = tokio::time::timeout(self.timeout, cmd.output()).await;
+        // #1272 S3: mesmo prefixo endurecido do `git_diff`.
+        let prefixo = crate::git_endurecido::prefixo(repo.cwd_do_git(), self.timeout).await?;
+        // #1258 (mesmo defeito raiz do `git_diff`): o git roda no
+        // `working_dir` da sessão quando há um — ver [`RepoDir`].
+        // #1225 S2: spawn por `sandbox_spawn::executar` (env reduzido, stdin
+        // nulo, container quando `agent.sandbox` se aplica).
+        let mut argv: Vec<String> = prefixo;
+        argv.extend(args);
+        let result = crate::sandbox_spawn::executar(
+            &self.sandbox,
+            crate::sandbox_spawn::Pedido {
+                tool: "code_review",
+                programa: "git",
+                args: &argv,
+                cwd: repo.cwd_do_git(),
+                env: crate::git_endurecido::ENV,
+                timeout: self.timeout,
+            },
+        )
+        .await;
 
         match result {
-            Ok(Ok(output)) => {
+            crate::sandbox_spawn::Desfecho::Saida(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 if stdout.is_empty() {
                     Err("No diff output (no changes found)".to_string())
@@ -95,8 +135,11 @@ impl CodeReviewTool {
                     }
                 }
             }
-            Ok(Err(e)) => Err(format!("Failed to run git diff: {}", e)),
-            Err(_) => Err(format!(
+            crate::sandbox_spawn::Desfecho::NaoExecutou(e) => {
+                Err(format!("Failed to run git diff: {}", e))
+            }
+            crate::sandbox_spawn::Desfecho::Recusado(motivo) => Err(motivo),
+            crate::sandbox_spawn::Desfecho::Timeout => Err(format!(
                 "git diff timed out after {}s",
                 self.timeout.as_secs()
             )),
@@ -209,18 +252,17 @@ impl Tool for CodeReviewTool {
         })
     }
 
-    async fn execute(
-        &self,
-        _context: &ToolContext,
-        input: serde_json::Value,
-    ) -> Result<ToolOutput> {
+    async fn execute(&self, context: &ToolContext, input: serde_json::Value) -> Result<ToolOutput> {
         let commit_range = input.get("commit_range").and_then(|v| v.as_str());
         let file_path = input.get("file_path").and_then(|v| v.as_str());
 
+        // #1258: de qual repositório sai o diff que vai para o LLM.
+        let repo = RepoDir::decidir(context.working_dir.as_deref());
+
         // Get the diff
-        let diff = match self.get_diff(commit_range, file_path).await {
+        let diff = match self.get_diff(&repo, commit_range, file_path).await {
             Ok(d) => d,
-            Err(e) => return Ok(ToolOutput::error(e)),
+            Err(e) => return Ok(ToolOutput::error(repo.com_contexto(&e))),
         };
 
         // Review the diff
@@ -228,6 +270,11 @@ impl Tool for CodeReviewTool {
             Ok(review) => {
                 let mut output = String::new();
                 output.push_str("## Code Review\n\n");
+
+                // #1258: a resposta diz de qual repositório ela falou. Sem
+                // `working_dir` na sessão o diretório continua sendo o do
+                // processo — mas agora explicitamente, não por acidente.
+                output.push_str(&format!("**Repositório:** {}\n", repo.descricao()));
 
                 if let Some(range) = commit_range {
                     output.push_str(&format!("**Commit range:** {}\n", range));
@@ -241,13 +288,220 @@ impl Tool for CodeReviewTool {
 
                 Ok(ToolOutput::success(output))
             }
-            Err(e) => Ok(ToolOutput::error(format!("Review failed: {}", e))),
+            Err(e) => Ok(ToolOutput::error(
+                repo.com_contexto(&format!("Review failed: {}", e)),
+            )),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::providers::LlmResponse;
+    use crate::tools::repo_dir::{contexto_de_teste as ctx, repo_git_temporario};
+
+    /// Provedor que devolve o prompt recebido como se fosse a revisão. É o que
+    /// deixa o teste afirmar **qual diff** chegou ao LLM, sem rede nenhuma.
+    struct ProvedorQueEcoa;
+
+    #[async_trait]
+    impl LlmProvider for ProvedorQueEcoa {
+        fn provider_id(&self) -> &str {
+            "eco-de-teste"
+        }
+
+        async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse> {
+            let texto = request
+                .messages
+                .iter()
+                .map(|m| match &m.content {
+                    MessagePart::Text(t) => t.clone(),
+                    MessagePart::Parts(_) => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            Ok(LlmResponse {
+                content: vec![ContentBlock::Text { text: texto }],
+                model: "eco".to_string(),
+                stop_reason: None,
+                usage: None,
+            })
+        }
+
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn tool_com_eco() -> CodeReviewTool {
+        CodeReviewTool::new(Arc::new(ProvedorQueEcoa), "modelo-de-teste", Some(15))
+    }
+
+    /// #1272 S3: o `code_review` usa o mesmo git endurecido — config
+    /// plantada nao executa nada, e o diff ainda chega ao revisor.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_plantada_no_repo_nao_roda_programa_nenhum() {
+        let repo = repo_git_temporario("alvo-review-1272", "ramo-review-1272");
+        let marcas = tempfile::tempdir().expect("tmp");
+        let marcadores =
+            crate::git_endurecido::planta_programas_no_repo(repo.path(), marcas.path());
+        let wd = repo.path().to_string_lossy().into_owned();
+        let saida = tool_com_eco()
+            .execute(&ctx(Some(&wd)), serde_json::json!({}))
+            .await
+            .expect("execute");
+        assert!(!saida.is_error, "{}", saida.content);
+        assert!(
+            saida.content.contains("alvo-review-1272"),
+            "{}",
+            saida.content
+        );
+        for m in &marcadores {
+            assert!(!m.exists(), "code_review executou {}", m.display());
+        }
+    }
+
+    /// #1272 S3: filtro declarado na config PROPRIA de um submodulo, com o
+    /// superprojeto em `diff.submodule=diff`, nao roda pelo `code_review`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn code_review_nao_roda_filtro_de_submodulo() {
+        let repo = repo_git_temporario("alvo-review-sub", "ramo-review-sub");
+        let marcas = tempfile::tempdir().expect("tmp");
+        let marca = crate::git_endurecido::planta_filtro_em_submodulo(repo.path(), marcas.path());
+        let wd = repo.path().to_string_lossy().into_owned();
+        let saida = tool_com_eco()
+            .execute(&ctx(Some(&wd)), serde_json::json!({}))
+            .await
+            .expect("execute");
+        assert!(!saida.is_error, "{}", saida.content);
+        assert!(!marca.exists(), "code_review rodou o filtro do submodulo");
+    }
+
+    /// #1258 (item 4 da aceitação): o `code_review` tinha o **mesmo** defeito
+    /// raiz — `Command::new("git")` sem `current_dir` em `get_diff` —, então
+    /// ganha a mesma prova, também pelo caminho do agente.
+    ///
+    /// **Mutação que este teste pega**: comente o `cmd.current_dir(dir)` de
+    /// `CodeReviewTool::get_diff` e ele fica vermelho.
+    #[tokio::test]
+    async fn diff_revisado_vem_do_working_dir_da_sessao() {
+        let repo_a = repo_git_temporario("alvo-review-a", "ramo-review-a");
+        let repo_b = repo_git_temporario("alvo-review-b", "ramo-review-b");
+        let tool = tool_com_eco();
+
+        for (repo, meu, do_outro) in [
+            (&repo_a, "alvo-review-a", "alvo-review-b"),
+            (&repo_b, "alvo-review-b", "alvo-review-a"),
+        ] {
+            let wd = repo.path().to_string_lossy().into_owned();
+            let saida = tool
+                .execute(&ctx(Some(&wd)), serde_json::json!({}))
+                .await
+                .expect("execute");
+
+            assert!(!saida.is_error, "{}", saida.content);
+            assert!(
+                saida.content.contains(meu),
+                "o diff revisado tinha de vir de {wd}:\n{}",
+                saida.content
+            );
+            assert!(
+                !saida.content.contains(do_outro),
+                "o diff revisado veio do repositório errado:\n{}",
+                saida.content
+            );
+            assert!(
+                saida
+                    .content
+                    .contains(&format!("**Repositório:** {wd} (working_dir da sessão)")),
+                "{}",
+                saida.content
+            );
+        }
+    }
+
+    /// #1258, caso 2 no `code_review`: sem `working_dir` o CWD do processo é
+    /// mantido e a resposta o nomeia. Vale para os dois desfechos — a revisão
+    /// de uma árvore suja e o "No diff output" de uma árvore limpa, que é
+    /// caminho de erro —, então o teste afirma só o que é comum aos dois.
+    #[tokio::test]
+    async fn sem_working_dir_o_code_review_nomeia_o_repositorio_do_cwd() {
+        let tool = tool_com_eco();
+        let cwd = std::env::current_dir().expect("CWD do processo de teste");
+
+        let saida = tool
+            .execute(&ctx(None), serde_json::json!({}))
+            .await
+            .expect("execute");
+
+        assert!(
+            saida.content.contains(&cwd.display().to_string()),
+            "{}",
+            saida.content
+        );
+        assert!(
+            saida.content.contains("a sessão não tem working_dir"),
+            "{}",
+            saida.content
+        );
+    }
+
+    /// #1269 no `code_review` (paridade): o `commit_range` vem do modelo e é
+    /// um argumento argv — começando com `-` viraria flag do git
+    /// (`--output=/tmp/x` escreve arquivo, `-O…`, `--stdin`). Recusado antes
+    /// de entrar na linha de comando, no mesmo formato que o `git_diff` usa.
+    ///
+    /// **Mutação que este teste pega**: tire o `if range.starts_with('-')` de
+    /// `get_diff` e ele fica vermelho.
+    #[tokio::test]
+    async fn commit_range_comecando_com_hifen_e_recusado() {
+        let tool = tool_com_eco();
+
+        for range in ["--output=/tmp/vazou-1258.diff", "-O/tmp/x", "--stdin"] {
+            let saida = tool
+                .execute(&ctx(None), serde_json::json!({"commit_range": range}))
+                .await
+                .expect("execute");
+
+            assert!(saida.is_error, "{range}: {}", saida.content);
+            assert!(
+                saida.content.contains("recusado"),
+                "{range}: {}\n{}",
+                range,
+                saida.content
+            );
+        }
+    }
+
+    /// Controle positivo da recusa: um `commit_range` legítimo — revisão que
+    /// não começa com `-` — passa pela tool, e o diff de verdade chega ao LLM.
+    #[tokio::test]
+    async fn commit_range_valido_ainda_passa() {
+        let repo = repo_git_temporario("alvo-range-valido", "ramo-range-valido");
+        let tool = tool_com_eco();
+        let wd = repo.path().to_string_lossy().into_owned();
+
+        let saida = tool
+            .execute(&ctx(Some(&wd)), serde_json::json!({"commit_range": "HEAD"}))
+            .await
+            .expect("execute");
+
+        assert!(
+            !saida.is_error,
+            "`git diff HEAD` num repositório com árvore suja tem de funcionar:\n{}",
+            saida.content
+        );
+        assert!(
+            saida.content.contains("alvo-range-valido"),
+            "{}",
+            saida.content
+        );
+    }
+
     #[test]
     fn test_code_review_schema() {
         // We need a provider to create the tool, but we can test the schema statically

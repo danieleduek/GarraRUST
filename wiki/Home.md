@@ -15,6 +15,7 @@ Bem-vindo à wiki pública do **GarraIA** — framework de agentes de IA em Rust
 | Configurar provedores, canais e secrets | [Configuração](Configuracao) |
 | Conectar Telegram, voz, MCP, VS Code, plugins | [Guias de Integração](Guias-de-Integracao) |
 | Entender como funciona por dentro | [Arquitetura e ADRs](Arquitetura-e-ADRs) |
+| Ligar dispositivos fisicos (MQTT, Home Assistant, Arduino, Raspberry Pi) | [docs/hardware.md](https://github.com/michelbr84/GarraRUST/blob/main/docs/hardware.md) |
 | Operar com segurança / reportar vulnerabilidade | [Segurança e Operação](Seguranca-e-Operacao) |
 | Contribuir ou ver o roadmap | [Contribuir, Roadmap e FAQ](Contribuir-Roadmap-e-FAQ) |
 
@@ -22,6 +23,22 @@ Bem-vindo à wiki pública do **GarraIA** — framework de agentes de IA em Rust
 
 ## Novidades
 
+- **[v0.4.5 — Novidades](Novidades-v0.4.5)** · **[What's New in v0.4.5 (English)](Whats-New-v0.4.5)**
+  — `bash` só dentro de sandbox onde não há humano no laço, o "sim" a um
+  pedido de confirmação aprovando em todo canal, `garraia whatsapp allow` e a
+  ponte que se atualiza no boot, e um boot que recusa bind exposto sem
+  credencial.
+- **[v0.4.4 — Novidades](Novidades-v0.4.4)** · **[What's New in v0.4.4 (English)](Whats-New-v0.4.4)**
+  — WhatsApp pessoal funcionando numa instalação nova, perfis de execução
+  `standard` e `isolated-pod` (poder total dentro do pod, nada implícito
+  fora), MCP `filesystem` sem `$HOME` e `tool_program` com gate por passo.
+- **[v0.4.3 — Novidades](Novidades-v0.4.3)** · **[What's New in v0.4.3 (English)](Whats-New-v0.4.3)**
+  — WhatsApp pessoal por dispositivo vinculado (`garra whatsapp` + QR),
+  sandbox por tool `agent.sandbox`, cinco fail-opens do MCP fechados e um
+  LLM padrão só.
+- **[v0.4.2 — Novidades](Novidades-v0.4.2)** · **[What's New in v0.4.2 (English)](Whats-New-v0.4.2)**
+  — o Garra saiu da tela: MQTT, Home Assistant, serial/USB e GPIO sob um
+  modelo de risco R0-R5, streaming no app, e o canal do `/proc` fechado.
 - **[v0.3.9 — Novidades](Novidades-v0.3.9)** · **[What's New in v0.3.9 (English)](Whats-New-v0.3.9)**
   — 48 issues e PRs: terminal que mostra o que o agente faz, memoria
   inspecionavel, e os modos de execucao passando a valer no executor.

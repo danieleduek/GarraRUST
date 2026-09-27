@@ -125,6 +125,151 @@ pub struct ToolPolicy {
     /// Se true, nega todas as ferramentas não listadas em `allowed`
     #[serde(default)]
     pub whitelist_mode: bool,
+    /// #1385: classes permitidas. Com `whitelist_mode`, a ferramenta passa se
+    /// o nome esta em `allowed` OU se ela tem pelo menos uma classe e TODAS
+    /// estao aqui. Sem classe, so por nome (fail-closed).
+    #[serde(default)]
+    pub allowed_capabilities: Vec<crate::capacidades::Capacidade>,
+    /// #1385/#1392: classes negadas. Vence tudo, como `denied` por nome.
+    #[serde(default)]
+    pub denied_capabilities: Vec<crate::capacidades::Capacidade>,
+    /// Nivel `chat` (#1398): nenhuma ferramenta, de nenhuma forma — nem por
+    /// nome, nem por classe. `whitelist_mode` com listas vazias NAO e isto
+    /// (aquilo permite tudo, #1264); isto e a negacao total explicita.
+    #[serde(default)]
+    pub no_tools: bool,
+}
+
+/// O teto de um principal (#1391/#1392): a politica que o modo escolhido pela
+/// sessao **nao pode exceder**. Composto por E com o perfil do turno em
+/// [`ToolGate`]: o modo libera o que o teto tambem libera, e nada alem. O
+/// `nome` e o que a recusa cita (`acesso read do WhatsApp`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TetoDeCapacidades {
+    pub nome: String,
+    pub politica: ToolPolicy,
+}
+
+/// Os niveis de acesso do WhatsApp (#1398), compilados em [`ToolPolicy`] por
+/// [`politica_do_nivel`]. Presets, nao modos: valem como **teto** sobre o
+/// modo que a sessao escolher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Nivel {
+    /// So conversa: nenhuma ferramenta.
+    Chat,
+    /// Leitura: arquivo, web, dispositivo, memoria, inspecao do runtime, MCP
+    /// declarado somente-leitura.
+    Read,
+    /// Tudo que o modo e o perfil de execucao liberarem — e so isso: o teto
+    /// nao acrescenta nada.
+    Full,
+}
+
+impl Nivel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Read => "read",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "chat" => Some(Self::Chat),
+            "read" => Some(Self::Read),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// A politica de um nivel com o `write` ligado ou desligado (#1392): `write`
+/// so mexe em [`crate::capacidades::Capacidade::ESCRITA_DE_ARQUIVO`]; shell,
+/// dispositivo, mensagem e agenda sao controles independentes e ficam como o
+/// nivel os deixa.
+pub fn politica_do_nivel(nivel: Nivel, write: bool) -> ToolPolicy {
+    use crate::capacidades::Capacidade as C;
+    match nivel {
+        Nivel::Chat => ToolPolicy {
+            no_tools: true,
+            ..Default::default()
+        },
+        Nivel::Read => {
+            let mut allowed_capabilities = C::LEITURA.to_vec();
+            let mut denied_capabilities = vec![
+                C::ProcessExecute,
+                C::DeviceExecute,
+                C::MessageSend,
+                C::MemoryWrite,
+                C::Scheduling,
+            ];
+            if write {
+                allowed_capabilities.extend_from_slice(C::ESCRITA_DE_ARQUIVO);
+            } else {
+                denied_capabilities.extend_from_slice(C::ESCRITA_DE_ARQUIVO);
+            }
+            ToolPolicy {
+                whitelist_mode: true,
+                allowed_capabilities,
+                denied_capabilities,
+                ..Default::default()
+            }
+        }
+        // `full` nao acrescenta nada: o modo e o perfil de execucao decidem.
+        // `write off` tira so a escrita de arquivo, nativa e MCP.
+        Nivel::Full => ToolPolicy {
+            denied_capabilities: if write {
+                Vec::new()
+            } else {
+                C::ESCRITA_DE_ARQUIVO.to_vec()
+            },
+            ..Default::default()
+        },
+    }
+}
+
+/// Uma politica deixa esta ferramenta rodar? Nome e classe somam no
+/// `allowed`; `denied` (por nome ou por classe) e `no_tools` vencem tudo;
+/// sem classe, so o nome libera num whitelist (fail-closed).
+fn politica_permite(
+    p: &ToolPolicy,
+    tool_name: &str,
+    capacidades: &[crate::capacidades::Capacidade],
+) -> bool {
+    if p.no_tools {
+        return false;
+    }
+    // `denied` vale sempre, inclusive para MCP — e vence tudo, prefixo
+    // declarado incluso.
+    if p.denied.iter().any(|t| t == tool_name) {
+        return false;
+    }
+    if capacidades
+        .iter()
+        .any(|c| p.denied_capabilities.contains(c))
+    {
+        return false;
+    }
+    if p.whitelist_mode {
+        // Whitelist vazia nao quer dizer "nada permitido" — quer dizer que
+        // o perfil nao restringiu (#1264). Ver o docblock do tipo.
+        if p.allowed.is_empty() && p.allowed_capabilities.is_empty() {
+            return true;
+        }
+        // #1264: ferramenta MCP passa por aqui como qualquer outra.
+        if p.allowed.iter().any(|e| entrada_cobre(e, tool_name)) {
+            return true;
+        }
+        // #1385: pela classe — todas as classes da ferramenta liberadas, e
+        // pelo menos uma. Sem classe, nada a liberar.
+        return !capacidades.is_empty()
+            && capacidades
+                .iter()
+                .all(|c| p.allowed_capabilities.contains(c));
+    }
+    true
 }
 
 /// Configurações de LLM específicas por modo
@@ -246,23 +391,52 @@ pub struct ModeProfile {
 /// aceite da #988 pede que o comportamento padrao nao regrida, e o
 /// comportamento padrao de hoje e nao ter politica.
 ///
-/// # Ferramenta MCP nao e barrada por whitelist
+/// # Ferramenta MCP passa pelo whitelist como qualquer outra (#1264)
 ///
-/// Tool de servidor MCP se chama `{servidor}__{tool}`
-/// (`mcp/tool_bridge.rs`). Os whitelists de `search`, `architect`, `debug`,
-/// `review` e `edit` listam so nomes nativos, entao aplicar `whitelist_mode`
-/// ao pe da letra **derrubaria toda integracao MCP** nesses cinco modos, em
-/// silencio — o usuario veria a ferramenta sumir sem mensagem nenhuma.
+/// Tool de servidor MCP se chama `{servidor}__{tool}` (`mcp/tool_bridge.rs`:
+/// `format!("{nome_servidor}__{nome_original}")`). Ate a #1264 qualquer nome
+/// que contivesse esse separador **passava direto** pelo `whitelist_mode`, sem
+/// a lista `allowed` ser consultada: dava para proibir uma ferramenta MCP pelo
+/// nome (`denied` sempre valeu), nunca para dizer "so estas". Um modo
+/// somente-leitura, portanto, nao restringia codigo de terceiro — que e
+/// exatamente o que um servidor MCP e.
 ///
-/// Entao ferramenta MCP passa pelo whitelist e continua sujeita ao `denied`.
+/// Agora restringe. `whitelist_mode` vale para MCP, e a permissao passa a ser
+/// **declarada**:
 ///
-/// **A consequencia precisa ser dita**: um modo somente-leitura nao restringe
-/// ferramenta MCP. Se o operador conectou um servidor MCP que escreve arquivo,
-/// o modo `search` nao o impede. Isso e um limite conhecido desta versao, nao
-/// um descuido — a alternativa era quebrar MCP para todo mundo hoje. Um
-/// whitelist que entenda servidor MCP precisa ser desenhado com o dono.
+/// | entrada em `allowed`   | cobre                                        |
+/// |------------------------|----------------------------------------------|
+/// | `file_read`            | a ferramenta nativa `file_read`              |
+/// | `servidor__consulta`   | aquela ferramenta MCP, e so ela              |
+/// | `servidor/*`           | todo o servidor `servidor` (prefixo `servidor__`) |
+///
+/// A sintaxe declarada `servidor/*` e traduzida para o prefixo interno
+/// `servidor__` ([`ToolGate::prefixo_de_servidor`]), que e o nome que o
+/// `tool_bridge` monta de verdade. O `/` existe na sintaxe declarada porque a
+/// #1264 o pediu e porque `__` num arquivo de config e facil de errar; o
+/// runtime nunca ve `/` em nome de ferramenta (a API da OpenAI/Anthropic
+/// rejeita: `^[a-zA-Z0-9_-]+$`).
+///
+/// **A consequencia precisa ser dita**: um modo whitelist que nao declare
+/// servidor MCP nenhum esconde as ferramentas MCP do modelo. Era esse o medo
+/// que sustentava a escapatoria — "derrubaria toda integracao MCP nesses cinco
+/// modos, em silencio". O silencio e que era o problema, e nao a restricao:
+/// `runtime::avisar_mcp_fora_da_whitelist` avisa, por turno, quais ferramentas
+/// MCP o modo escondeu e como declara-las.
+///
+/// # Whitelist ligada e vazia continua permitindo tudo
+///
+/// `whitelist_mode = true` com `allowed` vazia significa "o perfil nao
+/// restringiu", e nao "nada permitido" — mudar isso quebraria perfil existente
+/// que depende do comportamento atual, e a escolha e do dono (#1264, opcao
+/// (a)). O que mudou e o silencio: [`Self::whitelist_ligada_mas_vazia`] existe
+/// para quem pode avisar (o runtime, por turno; o `garra config check`, no
+/// perfil).
 #[derive(Debug, Clone)]
 pub struct ToolGate {
+    /// O teto do principal (#1391/#1392), composto por E com o perfil: o
+    /// modo libera o que o teto tambem libera. `None` = sem teto.
+    teto: Option<TetoDeCapacidades>,
     /// O perfil que vale neste turno, se algum vale.
     ///
     /// Guarda o perfil inteiro, e nao so a `ToolPolicy`, porque o mesmo perfil
@@ -279,10 +453,47 @@ pub struct ToolGate {
 /// Separador que o `tool_bridge` usa entre servidor e ferramenta.
 const SEPARADOR_MCP: &str = "__";
 
+/// Sufixo da sintaxe **declarada** de "servidor MCP inteiro" na `allowed`.
+///
+/// `meu-servidor/*` na config vira o prefixo interno `meu-servidor__` — ver
+/// [`ToolGate::prefixo_de_servidor`] e o docblock de [`ToolGate`].
+const CORINGA_DE_SERVIDOR: &str = "/*";
+
+/// Prefixo da terceira forma de entrada da `allowed` (#1384): `*/<operacao>`
+/// cobre `<qualquer servidor>__<operacao>` — a operacao exata, em qualquer
+/// servidor MCP. E o que deixa um modo somente-leitura enxergar
+/// `read_text_file` e `list_directory` do `filesystem` sem liberar o servidor
+/// inteiro (`filesystem/*` traria `write_file` e `move_file` junto).
+const CORINGA_DE_OPERACAO: &str = "*/";
+
+/// As operacoes **somente-leitura** do `@modelcontextprotocol/server-filesystem`
+/// (o servidor que o gateway provisiona), na forma `*/<operacao>` da
+/// `allowed` (#1384).
+///
+/// Lista **fechada**, por nome: e o que mantem o portao fail-closed —
+/// `write_file`, `edit_file`, `create_directory`, `move_file` e qualquer
+/// operacao desconhecida continuam barradas num modo que so lista estas. Um
+/// servidor que chame uma operacao mutante por um destes nomes estaria
+/// mentindo sobre o proprio contrato; a classificacao por capability declarada
+/// (#1385) e o que fecha esse residual, e nao existe ainda.
+pub const LEITURA_MCP_FILESYSTEM: &[&str] = &[
+    "*/read_file",
+    "*/read_text_file",
+    "*/read_media_file",
+    "*/read_multiple_files",
+    "*/list_directory",
+    "*/list_directory_with_sizes",
+    "*/directory_tree",
+    "*/search_files",
+    "*/get_file_info",
+    "*/list_allowed_directories",
+];
+
 impl ToolGate {
     /// O portao aberto: nenhuma politica, tudo permitido.
     pub fn sem_politica() -> Self {
         Self {
+            teto: None,
             profile: None,
             nome: None,
         }
@@ -291,8 +502,45 @@ impl ToolGate {
     /// O portao do perfil de um modo.
     pub fn from_profile(profile: &ModeProfile) -> Self {
         Self {
+            teto: None,
             nome: Some(profile.name.clone()),
             profile: Some(profile.clone()),
+        }
+    }
+    /// O mesmo portao, com o teto do principal por cima (#1391/#1392).
+    pub fn com_teto(mut self, teto: Option<TetoDeCapacidades>) -> Self {
+        self.teto = teto;
+        self
+    }
+    /// A ferramenta pode rodar, dadas as classes dela? (#1385)
+    ///
+    /// E [`Self::permite`] com as classes: nome e classe somam no `allowed`,
+    /// e `denied` (por nome ou por classe) vence tudo. Depois, o teto.
+    pub fn permite_com_capacidades(
+        &self,
+        tool_name: &str,
+        capacidades: &[crate::capacidades::Capacidade],
+    ) -> bool {
+        self.modo_permite(tool_name, capacidades) && self.teto_permite(tool_name, capacidades)
+    }
+    /// Por que a ferramenta foi barrada — o modo, ou o teto do principal.
+    /// O modo e citado primeiro: quem escolheu `/mode` entende; o teto e
+    /// citado quando so ele barrou, porque ai trocar de modo nao resolve.
+    pub fn explica_recusa(
+        &self,
+        tool_name: &str,
+        capacidades: &[crate::capacidades::Capacidade],
+    ) -> String {
+        if !self.modo_permite(tool_name, capacidades) {
+            return Self::recusa(tool_name, self.nome_do_modo().unwrap_or(""));
+        }
+        match self.teto.as_ref() {
+            Some(t) if !politica_permite(&t.politica, tool_name, capacidades) => format!(
+                "A ferramenta `{tool_name}` nao e permitida pela politica de acesso `{}` de quem \
+                 fala nesta conversa. Siga sem ela, ou peca ao administrador do canal.",
+                t.nome
+            ),
+            _ => Self::recusa(tool_name, self.nome_do_modo().unwrap_or("")),
         }
     }
 
@@ -306,6 +554,7 @@ impl ToolGate {
             Some(nome) => Self::for_mode_name(nome),
             None => Self::sem_politica(),
         }
+        .com_teto(exec.teto.clone())
     }
 
     /// O portao do turno: igual ao [`Self::from_exec`], exceto em `auto`.
@@ -331,6 +580,9 @@ impl ToolGate {
     /// antes de chamar e passar esse nome no `ExecContext`; este caminho e o
     /// piso, e vale para a CLI, que monta o proprio runtime.
     pub fn para_o_turno(exec: &crate::exec_context::ExecContext, user_text: &str) -> Self {
+        Self::para_o_turno_sem_teto(exec, user_text).com_teto(exec.teto.clone())
+    }
+    fn para_o_turno_sem_teto(exec: &crate::exec_context::ExecContext, user_text: &str) -> Self {
         // Modo customizado (#986) chega com o perfil pronto de quem tem banco.
         // Vence o nome: o perfil ja e o do `base_mode` com os overrides
         // aplicados, e reinterpretar o nome desfaria a customizacao.
@@ -371,19 +623,72 @@ impl ToolGate {
 
     /// O modo em vigor restringe por whitelist?
     ///
-    /// Serve para o chamador perceber a lacuna do MCP: um modo whitelist se
-    /// anuncia somente-leitura e **nao** cobre ferramenta de servidor MCP (ver
-    /// o docblock do tipo). Quem monta a lista de ferramentas sabe se sobrou
-    /// alguma MCP, e so ele pode avisar.
+    /// Depois da #1264 isso vale para ferramenta MCP tambem, e por isso quem
+    /// monta a lista de ferramentas continua tendo o que dizer: as MCP nao
+    /// declaradas **somem** da lista que o modelo ve, e sumir em silencio era o
+    /// defeito que sustentava a escapatoria antiga. Ver
+    /// `runtime::avisar_mcp_fora_da_whitelist`.
     pub fn restringe_por_whitelist(&self) -> bool {
+        fn restringe(p: &ToolPolicy) -> bool {
+            p.no_tools
+                || (p.whitelist_mode
+                    && (!p.allowed.is_empty() || !p.allowed_capabilities.is_empty()))
+        }
         self.profile
             .as_ref()
-            .is_some_and(|p| p.tool_policy.whitelist_mode && !p.tool_policy.allowed.is_empty())
+            .is_some_and(|p| restringe(&p.tool_policy))
+            || self.teto.as_ref().is_some_and(|t| restringe(&t.politica))
+    }
+
+    /// O perfil ligou `whitelist_mode` e deixou `allowed` vazia?
+    ///
+    /// Isso **permite tudo** (ver o docblock do tipo), que e a opcao (b) da
+    /// #1264: compatibilidade preservada. Ligar o controle e nao ser protegido
+    /// e pior do que nao ligar, porque o operador acredita que ligou — entao
+    /// este predicado existe para que alguem possa avisar. Ele nao muda
+    /// decisao nenhuma.
+    pub fn whitelist_ligada_mas_vazia(&self) -> bool {
+        self.profile.as_ref().is_some_and(|p| {
+            p.tool_policy.whitelist_mode
+                && p.tool_policy.allowed.is_empty()
+                && p.tool_policy.allowed_capabilities.is_empty()
+        })
     }
 
     /// A ferramenta e de servidor MCP?
     pub fn eh_ferramenta_mcp(tool_name: &str) -> bool {
         tool_name.contains(SEPARADOR_MCP)
+    }
+
+    /// A operacao que uma entrada `*/<operacao>` da `allowed` libera em
+    /// qualquer servidor (#1384) — `None` para as outras duas formas e para
+    /// o coringa vazio (`*/` sozinho nao e uma operacao que alguem declarou).
+    ///
+    /// Publica pelo mesmo motivo de [`Self::prefixo_de_servidor`]: a sintaxe
+    /// tem um unico interprete, e documentacao, UI de modo e teste leem daqui.
+    pub fn operacao_em_qualquer_servidor(entrada: &str) -> Option<&str> {
+        entrada
+            .strip_prefix(CORINGA_DE_OPERACAO)
+            .filter(|operacao| !operacao.is_empty())
+    }
+
+    /// A traducao da sintaxe **declarada** para a **interna** (#1264).
+    ///
+    /// `meu-servidor/*` — o que o operador escreve na `allowed` — vira
+    /// `meu-servidor__`, que e o prefixo do nome que o `tool_bridge` monta
+    /// (`format!("{nome_servidor}__{nome_original}")`). Qualquer outra entrada
+    /// devolve `None`: e nome exato, e nao prefixo.
+    ///
+    /// Publica porque a traducao precisa de um unico lugar. Documentacao, UI de
+    /// modo e teste nao podem reinventar o `"__"` cada um por conta.
+    pub fn prefixo_de_servidor(entrada: &str) -> Option<String> {
+        let servidor = entrada.strip_suffix(CORINGA_DE_SERVIDOR)?;
+        if servidor.is_empty() {
+            // `"/*"` nu nao e "todos os servidores": um coringa global chegaria
+            // por engano de digitacao, e nao por decisao de ninguem.
+            return None;
+        }
+        Some(format!("{servidor}{SEPARADOR_MCP}"))
     }
 
     /// O `system_prompt_template` do modo em vigor, se houver (#986).
@@ -431,30 +736,29 @@ impl ToolGate {
         self.nome.as_deref()
     }
 
-    /// A ferramenta pode rodar?
+    /// A ferramenta pode rodar? (So pelo nome: classes vazias.)
     pub fn permite(&self, tool_name: &str) -> bool {
-        let Some(p) = self.profile.as_ref().map(|p| &p.tool_policy) else {
-            return true;
-        };
-
-        // `denied` vale sempre, inclusive para MCP.
-        if p.denied.iter().any(|t| t == tool_name) {
-            return false;
+        self.permite_com_capacidades(tool_name, &[])
+    }
+    fn modo_permite(
+        &self,
+        tool_name: &str,
+        capacidades: &[crate::capacidades::Capacidade],
+    ) -> bool {
+        match self.profile.as_ref() {
+            Some(p) => politica_permite(&p.tool_policy, tool_name, capacidades),
+            None => true,
         }
-
-        if p.whitelist_mode {
-            // Whitelist vazia nao quer dizer "nada permitido" — quer dizer que
-            // o perfil nao restringiu.
-            if p.allowed.is_empty() {
-                return true;
-            }
-            if tool_name.contains(SEPARADOR_MCP) {
-                return true;
-            }
-            return p.allowed.iter().any(|t| t == tool_name);
+    }
+    fn teto_permite(
+        &self,
+        tool_name: &str,
+        capacidades: &[crate::capacidades::Capacidade],
+    ) -> bool {
+        match self.teto.as_ref() {
+            Some(t) => politica_permite(&t.politica, tool_name, capacidades),
+            None => true,
         }
-
-        true
     }
 
     /// A mensagem que o modelo recebe quando pede uma ferramenta barrada.
@@ -471,6 +775,37 @@ impl ToolGate {
             "A ferramenta `{tool_name}` nao e permitida no modo `{modo}`. \
              Siga sem ela, ou peca ao usuario para trocar de modo."
         )
+    }
+}
+
+/// Uma entrada de `allowed` cobre este nome de ferramenta? (#1264, #1384)
+///
+/// Tres formas, e so tres:
+///
+/// - **nome exato** — `file_read` cobre `file_read`; `servidor__consulta` cobre
+///   aquela ferramenta MCP, e nenhuma outra;
+/// - **prefixo de servidor** — `servidor/*` cobre `servidor__<qualquer coisa>`,
+///   pela traducao de [`ToolGate::prefixo_de_servidor`];
+/// - **operacao em qualquer servidor** — `*/<operacao>` cobre
+///   `<servidor>__<operacao>`, com a operacao **exata** (nem prefixo, nem
+///   sufixo) e um servidor nao vazio antes do separador, pela traducao de
+///   [`ToolGate::operacao_em_qualquer_servidor`]. Um nome sem separador
+///   (`read_text_file` nativo) nao e coberto: a forma e de MCP.
+///
+/// O prefixo exige que sobre nome de ferramenta depois dele (`len >`): o nome
+/// nu `servidor__`, sem ferramenta nenhuma, nao e uma ferramenta que alguem
+/// declarou. Servidor cujo nome contenha `__` fica fora da terceira forma
+/// (o `split_once` corta no primeiro separador) — fail-closed, e um nome de
+/// servidor assim nao existe na configuracao provisionada.
+fn entrada_cobre(entrada: &str, tool_name: &str) -> bool {
+    if let Some(operacao) = ToolGate::operacao_em_qualquer_servidor(entrada) {
+        return tool_name
+            .split_once(SEPARADOR_MCP)
+            .is_some_and(|(servidor, op)| !servidor.is_empty() && op == operacao);
+    }
+    match ToolGate::prefixo_de_servidor(entrada) {
+        Some(prefixo) => tool_name.len() > prefixo.len() && tool_name.starts_with(&prefixo),
+        None => entrada == tool_name,
     }
 }
 
@@ -586,22 +921,47 @@ impl ModeProfile {
             name: "search".to_string(),
             description: "Busca e inspeção sem modificar arquivos".to_string(),
             system_prompt_template: Some(
-                "You are a search assistant. Your goal is to find information in the codebase without making any modifications. Use read-only tools like file_search, repo_search, and list_dir. Never use file_write or bash commands that modify files.".to_string(),
+                "You are a search assistant. Your goal is to find information in the codebase without making any modifications. Use read-only tools like file_search, repo_search, list_dir, and the read-only filesystem MCP tools (read_text_file, list_directory, search_files) when they are available. Never use file_write, MCP write/edit/move tools, or bash commands that modify files.".to_string(),
             ),
             tool_policy: ToolPolicy {
-                allowed: vec![
-                    "file_read".to_string(),
-                    "repo_search".to_string(),
-                    "list_dir".to_string(),
-                    "web_search".to_string(),
-                    "web_fetch".to_string(),
-                ],
+                allowed: [
+                    "file_read",
+                    "repo_search",
+                    "list_dir",
+                    "web_search",
+                    "web_fetch",
+                    // #1129: descoberta/leitura de hardware é R0 (auto) — o
+                    // agente pode VER o mundo físico em qualquer modo que vê
+                    // o sistema de arquivos. Executar (R1+) é a linha abaixo.
+                    "device_list",
+                    "device_read",
+                    // #1347: autoinspecao R0 (so le o proprio runtime, sem
+                    // I/O nem rede) — o modelo precisa dela para nao negar
+                    // um canal em que esta conectado.
+                    "garra_status",
+                ]
+                .iter()
+                // #1384: a leitura do MCP `filesystem` (lista fechada de
+                // operacoes, em qualquer servidor). Sem isto o piso do
+                // WhatsApp pessoal escondia um servidor conectado e o modelo
+                // dizia nao ter como ler arquivo — mentira que a #1387
+                // rastreia. Escrita e mudanca ficam fora, e `denied` abaixo
+                // continua vencendo qualquer entrada.
+                .chain(LEITURA_MCP_FILESYSTEM.iter())
+                .map(|s| s.to_string())
+                .collect(),
                 denied: vec![
                     "file_write".to_string(),
                     "bash".to_string(),
+                    // #1129: execução de hardware é PolicyGated ou acima —
+                    // nos modos sem escrita, negada estaticamente. A camada
+                    // de confirmação R3+ vive DENTRO da tool, que só roda
+                    // se passar por aqui.
+                    "device_execute".to_string(),
                 ],
                 required: vec![],
                 whitelist_mode: true,
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.3,
@@ -633,10 +993,23 @@ impl ModeProfile {
                     "list_dir".to_string(),
                     "web_search".to_string(),
                     "web_fetch".to_string(),
+                    // #1129: leitura de hardware é R0 — permitida no modo
+                    // que só desenha e analisa.
+                    "device_list".to_string(),
+                    "device_read".to_string(),
+                    // #1347: autoinspecao R0 (so le o proprio runtime, sem
+                    // I/O nem rede) — o modelo precisa dela para nao negar
+                    // um canal em que esta conectado.
+                    "garra_status".to_string(),
                 ],
-                denied: vec!["file_write".to_string()],
+                // #1129: sem escrita no mundo físico também.
+                denied: vec![
+                    "file_write".to_string(),
+                    "device_execute".to_string(),
+                ],
                 required: vec![],
                 whitelist_mode: true,
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.5,
@@ -666,6 +1039,7 @@ impl ModeProfile {
                 denied: vec![],
                 required: vec![],
                 whitelist_mode: false, // Permite tudo por padrão
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.4,
@@ -697,9 +1071,18 @@ impl ModeProfile {
                 // o arquivo pelo shell (`printf ... > arquivo`) e furava a
                 // promessa deste modo, que o proprio prompt declara ("Prefer
                 // providing text explanations over executing code").
-                denied: vec!["file_write".to_string(), "bash".to_string()],
+                // #1129: execução de hardware entra no mesmo grupo — é o
+                // mundo físico, que um modo de perguntas não toca. Leitura
+                // (`device_read`) fica: é R0 e responde perguntas do tipo
+                // "que horas estão na sala?".
+                denied: vec![
+                    "file_write".to_string(),
+                    "bash".to_string(),
+                    "device_execute".to_string(),
+                ],
                 required: vec![],
                 whitelist_mode: false,
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.7,
@@ -731,10 +1114,22 @@ impl ModeProfile {
                     "list_dir".to_string(),
                     "bash".to_string(),
                     "run_tests".to_string(),
+                    // #1129: ler sensores ajuda a diagnosticar ("a CPU do
+                    // servidor está a quentar?") — executar não.
+                    "device_list".to_string(),
+                    "device_read".to_string(),
+                    // #1347: autoinspecao R0 (so le o proprio runtime, sem
+                    // I/O nem rede) — o modelo precisa dela para nao negar
+                    // um canal em que esta conectado.
+                    "garra_status".to_string(),
                 ],
-                denied: vec!["file_write".to_string()],
+                denied: vec![
+                    "file_write".to_string(),
+                    "device_execute".to_string(),
+                ],
                 required: vec![],
                 whitelist_mode: true,
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.3,
@@ -767,6 +1162,10 @@ impl ModeProfile {
                     "repo_search".to_string(),
                     "web_search".to_string(),
                     "web_fetch".to_string(),
+                    // #1347: autoinspecao R0 (so le o proprio runtime, sem
+                    // I/O nem rede) — o modelo precisa dela para nao negar
+                    // um canal em que esta conectado.
+                    "garra_status".to_string(),
                 ],
                 denied: vec![],
                 required: vec![],
@@ -775,6 +1174,7 @@ impl ModeProfile {
                 // ferramenta e a lista nunca era lida — contrariando o proprio
                 // prompt do modo, que anuncia exatamente essas seis.
                 whitelist_mode: true,
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.5,
@@ -806,13 +1206,22 @@ impl ModeProfile {
                     "repo_search".to_string(),
                     "list_dir".to_string(),
                     "code_review".to_string(),
+                    // #1129: revisão pode ler o mundo físico; nunca mexer.
+                    "device_list".to_string(),
+                    "device_read".to_string(),
+                    // #1347: autoinspecao R0 (so le o proprio runtime, sem
+                    // I/O nem rede) — o modelo precisa dela para nao negar
+                    // um canal em que esta conectado.
+                    "garra_status".to_string(),
                 ],
                 denied: vec![
                     "file_write".to_string(),
                     "bash".to_string(),
+                    "device_execute".to_string(),
                 ],
                 required: vec![],
                 whitelist_mode: true,
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.4,
@@ -843,10 +1252,15 @@ impl ModeProfile {
                     "file_write".to_string(),
                     "search_and_replace".to_string(),
                     "repo_search".to_string(),
+                    // #1347: autoinspecao R0 (so le o proprio runtime, sem
+                    // I/O nem rede) — o modelo precisa dela para nao negar
+                    // um canal em que esta conectado.
+                    "garra_status".to_string(),
                 ],
                 denied: vec![],
                 required: vec![],
                 whitelist_mode: true,
+                ..Default::default()
             },
             llm_config: ModeLlmConfig {
                 temperature: 0.3,
@@ -1183,7 +1597,7 @@ impl ModeContext {
 
 #[cfg(test)]
 mod tests {
-    use super::ToolGate;
+    use super::{AgentMode, ToolGate};
 
     /// A regressao mais provavel do lote, e a razao de `None` existir.
     ///
@@ -1251,6 +1665,56 @@ mod tests {
         assert!(g.permite("repo_search"));
     }
 
+    /// #1129: em TODOS os modos default, onde `file_write` é negado,
+    /// `device_execute` também é. A tabela de risco do ADR 0020 mapeia
+    /// `PolicyGated` para a policy do turno — e os modos sem escrita no
+    /// sistema de arquivos tampouco escrevem no mundo físico.
+    #[test]
+    fn onde_file_write_e_negado_device_execute_tambem_e() {
+        for modo in AgentMode::all_modes() {
+            let g = ToolGate::for_mode_name(modo.as_str());
+            if !g.permite("file_write") {
+                assert!(
+                    !g.permite("device_execute"),
+                    "modo '{}' nega file_write mas permite device_execute (#1129)",
+                    modo
+                );
+            }
+        }
+    }
+
+    /// #1129: leitura e descoberta de hardware (R0, auto pela tabela) ficam
+    /// disponíveis nos modos read-only — o agente pode VER o mundo físico
+    /// em qualquer modo que já vê o sistema de arquivos.
+    #[test]
+    fn modos_read_only_permitem_descoberta_e_leitura_de_hardware() {
+        for modo in ["search", "architect", "debug", "review"] {
+            let g = ToolGate::for_mode_name(modo);
+            assert!(
+                g.permite("device_list"),
+                "{modo} deveria permitir device_list"
+            );
+            assert!(
+                g.permite("device_read"),
+                "{modo} deveria permitir device_read"
+            );
+            assert!(
+                !g.permite("device_execute"),
+                "{modo} deveria negar device_execute"
+            );
+        }
+    }
+
+    /// E o `ask` (blacklist): execução de hardware é negada, leitura fica —
+    /// "que horas estão na sala?" é pergunta, não ação.
+    #[test]
+    fn modo_ask_nega_execucao_de_hardware_e_permite_leitura() {
+        let g = ToolGate::for_mode_name("ask");
+        assert!(!g.permite("device_execute"));
+        assert!(g.permite("device_read"));
+        assert!(g.permite("device_list"));
+    }
+
     /// Modo `code` continua podendo tudo — o criterio de aceite da #988 sobre
     /// nao regredir o caminho de escrita.
     #[test]
@@ -1260,19 +1724,327 @@ mod tests {
         assert!(g.permite("bash"));
     }
 
-    /// Ferramenta MCP passa pelo whitelist.
+    /// **Ferramenta MCP nao declarada e barrada pelo whitelist (#1264).**
     ///
-    /// Os whitelists listam so nomes nativos; aplicar ao pe da letra
-    /// derrubaria toda integracao MCP em cinco dos nove modos, em silencio.
+    /// Este teste afirmava o oposto ate a #1264 — "Ferramenta MCP passa pelo
+    /// whitelist" —, porque `permite` isentava todo nome com `"__"`. A isencao
+    /// era o fail-open: modo somente-leitura nao restringia codigo de terceiro.
+    /// Os cinco modos aqui sao os nativos com `whitelist_mode` e lista de
+    /// leitura, e nenhum declara servidor MCP nenhum.
     #[test]
-    fn ferramenta_mcp_nao_e_barrada_por_whitelist() {
+    fn ferramenta_mcp_nao_declarada_e_barrada_por_whitelist() {
         for modo in ["search", "architect", "debug", "review", "edit"] {
             let g = ToolGate::for_mode_name(modo);
             assert!(
-                g.permite("meu_servidor__consulta"),
-                "{modo} barrou ferramenta MCP"
+                !g.permite("meu_servidor__consulta"),
+                "{modo} deixou passar ferramenta MCP que ninguem declarou"
             );
+            // A whitelist do modo continua valendo para o que ela lista.
+            assert!(g.permite("file_read"), "{modo} barrou a leitura nativa");
         }
+    }
+
+    /// **`search` enxerga a leitura do MCP `filesystem`, e so ela (#1384).**
+    ///
+    /// Na v0.4.5 o modo `search` — o piso de todo remetente do WhatsApp
+    /// pessoal — escondia TODA ferramenta do servidor `filesystem`, inclusive
+    /// `read_text_file` e `list_directory`, porque a whitelist so listava as
+    /// nativas. Resultado: o MCP estava conectado e o modelo dizia que nao
+    /// tinha como ler arquivo nenhum. A regra nova e por NOME DA OPERACAO, em
+    /// qualquer servidor (`*/read_text_file`), com a lista fechada dos verbos
+    /// somente-leitura do `@modelcontextprotocol/server-filesystem`; escrita,
+    /// mudanca e qualquer nome desconhecido continuam fail-closed.
+    #[test]
+    fn search_permite_leitura_do_filesystem_mcp_e_so_leitura() {
+        let g = ToolGate::for_mode_name("search");
+        for leitura in [
+            "filesystem__read_file",
+            "filesystem__read_text_file",
+            "filesystem__read_media_file",
+            "filesystem__read_multiple_files",
+            "filesystem__list_directory",
+            "filesystem__list_directory_with_sizes",
+            "filesystem__directory_tree",
+            "filesystem__search_files",
+            "filesystem__get_file_info",
+            "filesystem__list_allowed_directories",
+            // O nome do servidor nao importa: e a operacao que e de leitura.
+            "arquivos__read_text_file",
+        ] {
+            assert!(g.permite(leitura), "search barrou a leitura MCP {leitura}");
+        }
+        for mutacao in [
+            "filesystem__write_file",
+            "filesystem__edit_file",
+            "filesystem__create_directory",
+            "filesystem__move_file",
+            // Nome desconhecido continua barrado (#1264): a lista e fechada.
+            "filesystem__consulta",
+            "filesystem__read_file_and_delete",
+            // A operacao de leitura NAO libera a ferramenta nativa homonima
+            // nem um nome sem servidor.
+            "read_text_file",
+        ] {
+            assert!(!g.permite(mutacao), "search deixou passar {mutacao}");
+        }
+    }
+
+    /// A terceira forma de entrada da `allowed`: `*/<operacao>` cobre
+    /// `<qualquer servidor>__<operacao>`, e nada alem disso.
+    #[test]
+    fn entrada_com_servidor_coringa_cobre_a_operacao_em_qualquer_servidor() {
+        assert!(entrada_cobre(
+            "*/read_text_file",
+            "filesystem__read_text_file"
+        ));
+        assert!(entrada_cobre("*/read_text_file", "outro__read_text_file"));
+        // Exato na operacao: prefixo e sufixo nao servem.
+        assert!(!entrada_cobre(
+            "*/read_text_file",
+            "filesystem__read_text_file_x"
+        ));
+        assert!(!entrada_cobre(
+            "*/read_text_file",
+            "filesystem__xread_text_file"
+        ));
+        // Sem servidor nao e ferramenta MCP.
+        assert!(!entrada_cobre("*/read_text_file", "read_text_file"));
+        // Coringa vazio nao cobre nada.
+        assert!(!entrada_cobre("*/", "filesystem__read_text_file"));
+        assert!(!entrada_cobre("*/", "filesystem__"));
+        // As duas formas antigas continuam iguais.
+        assert!(entrada_cobre("filesystem/*", "filesystem__write_file"));
+        assert!(entrada_cobre("file_read", "file_read"));
+        assert!(!entrada_cobre("file_read", "file_read_x"));
+    }
+
+    // ─── #1385/#1392: classes de capacidade e teto do principal ──────────
+
+    fn perfil_com(policy: ToolPolicy) -> ModeProfile {
+        let mut perfil = ModeProfile::default_search();
+        perfil.name = "teste".into();
+        perfil.tool_policy = policy;
+        perfil
+    }
+
+    /// Whitelist por CLASSE: uma ferramenta passa pela classe sem entrada
+    /// por nome; classe fora fica fora; sem classe e fail-closed; e a
+    /// entrada por nome continua valendo ao lado.
+    #[test]
+    fn whitelist_por_classe_libera_sem_nome_e_e_fail_closed_sem_classe() {
+        use crate::capacidades::Capacidade as C;
+        let g = ToolGate::from_profile(&perfil_com(ToolPolicy {
+            whitelist_mode: true,
+            allowed: vec!["ferramenta_por_nome".into()],
+            allowed_capabilities: vec![C::FilesystemRead, C::McpRead],
+            ..Default::default()
+        }));
+        assert!(g.permite_com_capacidades("github__search_issues", &[C::McpRead]));
+        assert!(g.permite_com_capacidades("qualquer__read_file", &[C::FilesystemRead]));
+        assert!(!g.permite_com_capacidades("qualquer__write_file", &[C::FilesystemWrite]));
+        // Duas classes: TODAS precisam estar liberadas.
+        assert!(!g.permite_com_capacidades("mista", &[C::FilesystemRead, C::FilesystemWrite]));
+        // Sem classe: so por nome.
+        assert!(
+            !g.permite_com_capacidades("misterio", &[]),
+            "sem classe e fail-closed"
+        );
+        assert!(g.permite_com_capacidades("ferramenta_por_nome", &[]));
+        // A forma antiga (so nome) continua a mesma coisa que classes vazias.
+        assert_eq!(
+            g.permite("misterio"),
+            g.permite_com_capacidades("misterio", &[])
+        );
+    }
+
+    /// `denied_capabilities` vence o nome permitido, como `denied` por nome.
+    #[test]
+    fn classe_negada_vence_o_nome_permitido() {
+        use crate::capacidades::Capacidade as C;
+        let g = ToolGate::from_profile(&perfil_com(ToolPolicy {
+            allowed: vec!["file_write".into()],
+            denied_capabilities: vec![C::FilesystemWrite],
+            ..Default::default()
+        }));
+        assert!(!g.permite_com_capacidades("file_write", &[C::FilesystemWrite]));
+        assert!(g.permite_com_capacidades("file_read", &[C::FilesystemRead]));
+    }
+
+    /// `no_tools` nega tudo — por nome, por classe, com ou sem whitelist.
+    #[test]
+    fn no_tools_nega_tudo() {
+        use crate::capacidades::Capacidade as C;
+        let g = ToolGate::from_profile(&perfil_com(ToolPolicy {
+            no_tools: true,
+            allowed: vec!["file_read".into()],
+            allowed_capabilities: vec![C::FilesystemRead],
+            ..Default::default()
+        }));
+        assert!(!g.permite("file_read"));
+        assert!(!g.permite_com_capacidades("file_read", &[C::FilesystemRead]));
+        assert!(!g.permite_com_capacidades("garra_status", &[C::RuntimeInspect]));
+        assert!(
+            g.restringe_por_whitelist(),
+            "chat e restricao, e o garra_status tem de saber"
+        );
+    }
+
+    /// O teto do principal nega o que o modo liberaria, e a recusa diz que
+    /// foi o teto — nao o modo.
+    #[test]
+    fn teto_do_principal_nega_o_que_o_modo_liberaria_e_explica() {
+        use crate::capacidades::Capacidade as C;
+        let teto = TetoDeCapacidades {
+            nome: "acesso read do WhatsApp".into(),
+            politica: politica_do_nivel(Nivel::Read, false),
+        };
+        let g = ToolGate::for_mode_name("code").com_teto(Some(teto));
+        assert!(g.permite_com_capacidades("file_read", &[C::FilesystemRead]));
+        assert!(!g.permite_com_capacidades("file_write", &[C::FilesystemWrite]));
+        assert!(!g.permite_com_capacidades("bash", &[C::ProcessExecute]));
+        let motivo = g.explica_recusa("file_write", &[C::FilesystemWrite]);
+        assert!(motivo.contains("acesso read do WhatsApp"), "{motivo}");
+        assert!(!motivo.contains("modo `code`"), "{motivo}");
+        // Sem teto, a recusa e a do modo, como antes.
+        let g = ToolGate::for_mode_name("search");
+        let motivo = g.explica_recusa("file_write", &[C::FilesystemWrite]);
+        assert!(motivo.contains("modo `search`"), "{motivo}");
+        // O teto nunca ACRESCENTA: `search` + teto full continua sem escrita.
+        let g = ToolGate::for_mode_name("search").com_teto(Some(TetoDeCapacidades {
+            nome: "full".into(),
+            politica: politica_do_nivel(Nivel::Full, true),
+        }));
+        assert!(!g.permite_com_capacidades("file_write", &[C::FilesystemWrite]));
+    }
+
+    /// Os niveis (#1398) x `write` (#1392), tabela fechada.
+    #[test]
+    fn niveis_chat_read_full_com_write_ligado_e_desligado() {
+        use crate::capacidades::Capacidade as C;
+        // (ferramenta, classes)
+        let file_read = ("file_read", &[C::FilesystemRead][..]);
+        let file_write = ("file_write", &[C::FilesystemWrite][..]);
+        let bash = ("bash", &[C::ProcessExecute][..]);
+        let mcp_read = ("filesystem__read_text_file", &[C::FilesystemRead][..]);
+        let mcp_write = ("filesystem__write_file", &[C::FilesystemWrite][..]);
+        let mcp_misterio = ("github__algo", &[][..]);
+        let status = ("garra_status", &[C::RuntimeInspect][..]);
+        let send = ("telegram_send", &[C::MessageSend][..]);
+        let device_exec = ("device_execute", &[C::DeviceExecute][..]);
+        type Ferramentas<'a> = &'a [(&'a str, &'a [C])];
+        let casos: &[(Nivel, bool, Ferramentas<'_>, Ferramentas<'_>)] = &[
+            // chat: nada
+            (
+                Nivel::Chat,
+                false,
+                &[],
+                &[
+                    file_read,
+                    file_write,
+                    bash,
+                    mcp_read,
+                    mcp_write,
+                    mcp_misterio,
+                    status,
+                    send,
+                    device_exec,
+                ],
+            ),
+            (Nivel::Chat, true, &[], &[file_read, file_write, status]),
+            // read: leitura, status; nada de escrita/shell/envio/dispositivo/misterio
+            (
+                Nivel::Read,
+                false,
+                &[file_read, mcp_read, status],
+                &[file_write, bash, mcp_write, mcp_misterio, send, device_exec],
+            ),
+            // read + write: ganha escrita de arquivo (nativa e MCP), e so ela
+            (
+                Nivel::Read,
+                true,
+                &[file_read, mcp_read, status, file_write, mcp_write],
+                &[bash, mcp_misterio, send, device_exec],
+            ),
+            // full: o teto nao restringe (o modo e o perfil decidem); write off tira so a escrita de arquivo
+            (
+                Nivel::Full,
+                true,
+                &[
+                    file_read,
+                    file_write,
+                    bash,
+                    mcp_read,
+                    mcp_write,
+                    mcp_misterio,
+                    status,
+                    send,
+                    device_exec,
+                ],
+                &[],
+            ),
+            (
+                Nivel::Full,
+                false,
+                &[
+                    file_read,
+                    bash,
+                    mcp_read,
+                    mcp_misterio,
+                    status,
+                    send,
+                    device_exec,
+                ],
+                &[file_write, mcp_write],
+            ),
+        ];
+        for (nivel, write, passam, barram) in casos {
+            let g = ToolGate::sem_politica().com_teto(Some(TetoDeCapacidades {
+                nome: format!("{}/{}", nivel.as_str(), write),
+                politica: politica_do_nivel(*nivel, *write),
+            }));
+            for (nome, caps) in *passam {
+                assert!(
+                    g.permite_com_capacidades(nome, caps),
+                    "{nivel:?} write={write}: {nome} devia passar"
+                );
+            }
+            for (nome, caps) in *barram {
+                assert!(
+                    !g.permite_com_capacidades(nome, caps),
+                    "{nivel:?} write={write}: {nome} devia ser barrada"
+                );
+            }
+        }
+        assert_eq!(Nivel::parse("READ"), Some(Nivel::Read));
+        assert_eq!(Nivel::parse("dono"), None);
+        assert_eq!(
+            serde_json::to_string(&Nivel::Chat).expect("json"),
+            "\"chat\""
+        );
+    }
+
+    /// O teto chega pelo `ExecContext` e vale nos dois construtores do portao.
+    #[test]
+    fn o_teto_do_exec_context_e_composto_pelos_dois_construtores() {
+        use crate::capacidades::Capacidade as C;
+        let mut exec = crate::exec_context::ExecContext::with_mode(Some("code".to_string()));
+        exec.teto = Some(TetoDeCapacidades {
+            nome: "chat".into(),
+            politica: politica_do_nivel(Nivel::Chat, false),
+        });
+        assert!(
+            !ToolGate::from_exec(&exec).permite_com_capacidades("file_read", &[C::FilesystemRead])
+        );
+        assert!(
+            !ToolGate::para_o_turno(&exec, "oi")
+                .permite_com_capacidades("file_read", &[C::FilesystemRead])
+        );
+        // Modo customizado tambem fica sob o teto (o teto e do principal, nao do modo).
+        exec.custom_profile = Some(ModeProfile::default_code());
+        assert!(
+            !ToolGate::para_o_turno(&exec, "oi")
+                .permite_com_capacidades("file_read", &[C::FilesystemRead])
+        );
     }
 
     /// Mas `denied` vale para MCP tambem — a lista explicita ganha.
@@ -1284,6 +2056,7 @@ mod tests {
                 denied: vec!["servidor__perigosa".to_string()],
                 required: vec![],
                 whitelist_mode: true,
+                ..Default::default()
             },
             ..ModeProfile::from_mode(AgentMode::Code)
         });
@@ -1308,6 +2081,7 @@ mod tests {
                 denied: vec![],
                 required: vec![],
                 whitelist_mode: true,
+                ..Default::default()
             },
             ..ModeProfile::from_mode(AgentMode::Code)
         });
@@ -1396,21 +2170,19 @@ mod tests {
         );
     }
 
-    /// O portao sabe dizer quando a lacuna do MCP esta aberta (#979).
+    /// O portao sabe dizer quando restringe por whitelist (#979, #1264).
     ///
-    /// A auditoria apontou que ativar politica para `auto` torna essa lacuna
-    /// materialmente relevante: quem digitou `auto` e escreveu uma pergunta de
-    /// busca passa a acreditar que esta somente-leitura, e ferramenta MCP de
-    /// escrita continua passando. O portao nao consegue fechar a lacuna sem
-    /// derrubar toda integracao MCP nesses modos — mas consegue dizer que ela
-    /// esta aberta, e quem monta a lista de ferramentas avisa.
+    /// O predicado alimenta o aviso do runtime. Ate a #1264 ele anunciava uma
+    /// **lacuna** (MCP passava por cima da lista); agora anuncia o contrario —
+    /// que a lista vale, MCP incluso, e portanto que pode ter escondido
+    /// ferramenta MCP do modelo.
     #[test]
-    fn o_portao_reconhece_a_lacuna_do_mcp() {
+    fn o_portao_reconhece_que_restringe_por_whitelist() {
         let search = ToolGate::for_mode_name("search");
         assert!(search.restringe_por_whitelist());
         assert!(
-            search.permite("servidor__escreve_arquivo"),
-            "a lacuna existe: ferramenta MCP passa pela whitelist"
+            !search.permite("servidor__escreve_arquivo"),
+            "a lacuna do #1264 esta fechada: MCP nao declarada nao passa"
         );
 
         // `denied` continua valendo para MCP — e a alavanca do operador.
@@ -1432,6 +2204,212 @@ mod tests {
 
         assert!(ToolGate::eh_ferramenta_mcp("servidor__tool"));
         assert!(!ToolGate::eh_ferramenta_mcp("file_write"));
+    }
+
+    // ── #1264: o whitelist cobre ferramenta MCP ─────────────────────────────
+
+    /// O perfil de um modo customizado, montado pelo caminho de **producao**.
+    ///
+    /// `ModeProfile::from_custom` e a funcao que o gateway chama para
+    /// transformar o JSON que o operador salvou (`custom_modes.
+    /// tool_policy_overrides`) em perfil — `state.rs` e `api.rs`. O `ExecContext
+    /// { custom_profile }` que sai daqui e o mesmo que chega ao runtime, e
+    /// `ToolGate::para_o_turno` e o construtor que o runtime usa em cada um dos
+    /// tres caminhos de turno (`runtime.rs`). Nada de `ToolPolicy` montada a
+    /// mao: a sintaxe entra como o operador a escreve.
+    fn portao_do_operador(overrides: serde_json::Value) -> ToolGate {
+        let perfil = ModeProfile::from_custom(
+            AgentMode::Search,
+            "so-leitura",
+            None,
+            &overrides,
+            &serde_json::json!({}),
+        );
+        let exec = crate::exec_context::ExecContext {
+            custom_profile: Some(perfil),
+            ..Default::default()
+        };
+        ToolGate::para_o_turno(&exec, "da uma olhada nos arquivos")
+    }
+
+    /// **O fail-open da #1264, criterio 1.** Perfil com `whitelist_mode` e
+    /// `allowed = ["read_file"]` tem de recusar ferramenta de servidor MCP.
+    ///
+    /// Antes da correcao `permite` devolvia `true` para qualquer nome que
+    /// contivesse `"__"`, sem consultar a lista. Este e o teste que a mutacao
+    /// do criterio 5 derruba: apagar a checagem nova deixa a primeira asercao
+    /// vermelha.
+    #[test]
+    fn whitelist_recusa_ferramenta_mcp_nao_declarada() {
+        let g = portao_do_operador(serde_json::json!({ "allow": ["read_file"] }));
+
+        // O nome REAL que o `tool_bridge` monta: `{servidor}__{ferramenta}`.
+        assert!(
+            !g.permite("servidor__qualquer_ferramenta"),
+            "ferramenta MCP nao listada passou pela whitelist (#1264)"
+        );
+        // E a grafia declarada da issue, que nao e nome de ferramenta nenhum no
+        // runtime (a API rejeita `/`) — tambem nao pode virar permissao.
+        assert!(!g.permite("servidor/qualquer_ferramenta"));
+
+        // O que o operador declarou continua valendo.
+        assert!(g.permite("read_file"), "a lista declarada tem de passar");
+        assert!(
+            !g.permite("file_write"),
+            "o que nao esta na lista, nao passa"
+        );
+    }
+
+    /// **Criterio 2.** `allowed = ["meu-servidor/*"]` libera o servidor inteiro
+    /// — e so ele.
+    ///
+    /// A sintaxe declarada usa `/`; o nome que o runtime monta usa `__`. A
+    /// traducao e de [`ToolGate::prefixo_de_servidor`], e esta afirmada aqui nos
+    /// dois lados: a entrada como o operador a escreve, o nome como o
+    /// `tool_bridge` o monta.
+    #[test]
+    fn prefixo_declarado_libera_o_servidor_inteiro() {
+        let g = portao_do_operador(serde_json::json!({ "allow": ["meu-servidor/*"] }));
+
+        assert!(
+            g.permite("meu-servidor__x"),
+            "o prefixo declarado tem de cobrir as ferramentas do servidor"
+        );
+        assert!(g.permite("meu-servidor__escreve_arquivo"));
+        assert!(
+            !g.permite("outro-servidor__y"),
+            "prefixo de um servidor nao pode liberar outro"
+        );
+        assert!(
+            !g.permite("meu-servidor-extra__x"),
+            "o prefixo para no separador: nome de servidor que so COMECA igual \
+             nao e o mesmo servidor"
+        );
+        assert!(
+            !g.permite("meu-servidor__"),
+            "nome nu, sem ferramenta depois do separador, nao e ferramenta"
+        );
+        assert!(
+            !g.permite("file_write"),
+            "declarar um servidor MCP nao abre as nativas"
+        );
+    }
+
+    /// A traducao da sintaxe **declarada** para a **interna**, dita sozinha.
+    #[test]
+    fn traducao_da_sintaxe_declarada_para_o_prefixo_interno() {
+        assert_eq!(
+            ToolGate::prefixo_de_servidor("meu-servidor/*").as_deref(),
+            Some("meu-servidor__"),
+            "`servidor/*` na config vira o prefixo `servidor__` do runtime"
+        );
+
+        // E o prefixo casa o nome que o `mcp/tool_bridge.rs` monta.
+        let nome_do_runtime = format!("{}{}{}", "meu-servidor", SEPARADOR_MCP, "consulta");
+        assert_eq!(nome_do_runtime, "meu-servidor__consulta");
+        assert!(entrada_cobre("meu-servidor/*", &nome_do_runtime));
+
+        // Nome exato nao e prefixo.
+        assert_eq!(ToolGate::prefixo_de_servidor("read_file"), None);
+        assert_eq!(ToolGate::prefixo_de_servidor("servidor__consulta"), None);
+        // E `/*` nu nao e coringa global: viria de erro de digitacao.
+        assert_eq!(ToolGate::prefixo_de_servidor("/*"), None);
+        assert!(!entrada_cobre("/*", "servidor__x"));
+    }
+
+    /// Ferramenta MCP declarada pelo nome completo tambem passa — a permissao
+    /// fina, para quem nao quer o servidor inteiro.
+    #[test]
+    fn nome_completo_de_ferramenta_mcp_pode_ser_declarado() {
+        let g = portao_do_operador(serde_json::json!({
+            "allow": ["read_file", "meu-servidor__consulta"]
+        }));
+        assert!(g.permite("meu-servidor__consulta"));
+        assert!(
+            !g.permite("meu-servidor__escreve"),
+            "declarar UMA ferramenta do servidor nao declara as outras"
+        );
+    }
+
+    /// **#1327, o caminho DECLARADO.** `allowed: ["filesystem/*"]` libera as
+    /// ferramentas do servidor `filesystem` — e e SO assim que uma ferramenta
+    /// MCP chega a um perfil com whitelist. E o que o aviso de drift do canal
+    /// `whatsapp_linked` detecta: um perfil padrao do canal que declare
+    /// `servidor/*` esta, por decisao do operador, expondo aquele servidor a
+    /// remetentes do WhatsApp.
+    #[test]
+    fn servidor_declarado_com_coringa_libera_a_ferramenta_mcp() {
+        let g = portao_do_operador(serde_json::json!({ "allow": ["filesystem/*"] }));
+        assert!(g.permite("filesystem__read_file"));
+        assert!(
+            g.permite("filesystem__write_file"),
+            "o coringa libera o servidor INTEIRO — leitura e escrita"
+        );
+        assert!(
+            !g.permite("outro__read_file"),
+            "e nao libera servidor que nao foi declarado"
+        );
+
+        // Sem a declaracao, o `search` nativo — o piso do canal — so deixa
+        // passar a LEITURA do `filesystem` (#1384, lista fechada de
+        // operacoes); a escrita continua negada pelo nome.
+        let g = ToolGate::for_mode_name("search");
+        assert!(g.permite("filesystem__read_file"));
+        assert!(!g.permite("filesystem__write_file"));
+    }
+
+    /// **Criterio 4, regressao.** `denied` vence tudo, prefixo declarado
+    /// incluso — era a unica protecao que ja funcionava para MCP.
+    #[test]
+    fn denied_vence_o_prefixo_declarado() {
+        let g = portao_do_operador(serde_json::json!({
+            "allow": ["meu-servidor/*"],
+            "deny": ["meu-servidor__perigosa"]
+        }));
+        assert!(
+            !g.permite("meu-servidor__perigosa"),
+            "`denied` tem de vencer o prefixo que libera o servidor"
+        );
+        assert!(
+            g.permite("meu-servidor__inofensiva"),
+            "e o resto do servidor continua liberado"
+        );
+    }
+
+    /// **Criterio 3, metade do portao.** Whitelist ligada e vazia continua
+    /// permitindo tudo (opcao (b): compatibilidade), e passa a se anunciar.
+    ///
+    /// A outra metade do aviso — o TEXTO emitido — vive em
+    /// `runtime::mensagem_whitelist_vazia`, que e o que o runtime usa por turno;
+    /// os modos customizados vivem no banco e nao na config, entao o `garra
+    /// config check` nao os ve.
+    #[test]
+    fn whitelist_vazia_permite_tudo_mas_se_anuncia() {
+        // `deny: []` porque o perfil base (`search`) nega `file_write` pela
+        // **outra** lista, e aqui o que esta em teste e so a whitelist vazia.
+        let g = portao_do_operador(serde_json::json!({ "allow": [], "deny": [] }));
+
+        assert!(
+            g.permite("file_write"),
+            "opcao (b) da #1264: o comportamento nao muda sem decisao do dono"
+        );
+        assert!(g.permite("servidor__qualquer"));
+        assert!(
+            g.whitelist_ligada_mas_vazia(),
+            "o silencio e que acabou: o perfil tem de se anunciar"
+        );
+        assert!(
+            !g.restringe_por_whitelist(),
+            "whitelist vazia nao restringe, e o aviso do runtime nao pode \
+             confundir os dois casos"
+        );
+
+        // Com a lista populada, nada a anunciar.
+        let g = portao_do_operador(serde_json::json!({ "allow": ["read_file"] }));
+        assert!(!g.whitelist_ligada_mas_vazia());
+        assert!(g.restringe_por_whitelist());
+        // E sem politica nenhuma tambem nao ha o que anunciar.
+        assert!(!ToolGate::sem_politica().whitelist_ligada_mas_vazia());
     }
 
     // ── Modos customizados (#986) ───────────────────────────────────────────
@@ -1697,5 +2675,52 @@ mod tests {
         let profile = ModeProfile::from_mode(AgentMode::Search);
         assert_eq!(profile.name, "search");
         assert!(profile.tool_policy.whitelist_mode);
+    }
+
+    /// #1347: `garra_status` (autoinspecao R0) passa em TODO modo nativo
+    /// com whitelist — no piso `search` do WhatsApp o modelo nem recebia a
+    /// tool e negava o canal em que estava conectado. Os modos sem whitelist
+    /// ja a permitiam.
+    #[test]
+    fn garra_status_passa_em_todo_modo_nativo() {
+        let mut com_whitelist = 0;
+        for modo in AgentMode::all_modes() {
+            let perfil = ModeProfile::from_mode(modo);
+            if perfil.tool_policy.whitelist_mode {
+                com_whitelist += 1;
+            }
+            assert!(
+                ToolGate::for_mode_name(modo.as_str()).permite("garra_status"),
+                "modo '{modo}' esconde garra_status (#1347)"
+            );
+        }
+        assert_eq!(
+            com_whitelist, 6,
+            "search, architect, debug, orchestrator, review, edit"
+        );
+    }
+
+    /// `denied` continua vencendo: um modo customizado ainda tira a tool.
+    #[test]
+    fn modo_customizado_ainda_pode_negar_garra_status() {
+        let perfil = ModeProfile::from_custom(
+            AgentMode::Search,
+            "sem-status",
+            None,
+            &serde_json::json!({ "deny": ["garra_status"] }),
+            &serde_json::json!({}),
+        );
+        assert!(!ToolGate::from_profile(&perfil).permite("garra_status"));
+    }
+
+    /// E nada mais entrou na allowlist junto: so `garra_status`.
+    #[test]
+    fn garra_status_nao_libera_outra_tool() {
+        for modo in ["search", "architect", "review"] {
+            let g = ToolGate::for_mode_name(modo);
+            assert!(!g.permite("bash"), "{modo}");
+            assert!(!g.permite("file_write"), "{modo}");
+            assert!(!g.permite("device_execute"), "{modo}");
+        }
     }
 }

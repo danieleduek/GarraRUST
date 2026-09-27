@@ -36,6 +36,12 @@ crates/
                         `TERM=dumb` / `GARRAIA_NO_SPINNER`; nunca esconde o cursor;
                         fallback ASCII; proibido em `ask.rs` e `mcp_server.rs` (teste
                         varre o fonte). `Ctrl+C` cancela o turno, não o processo.
+                        `desktop.rs` (#1181 M1): `garra desktop [--status]
+                        [--no-launch]` localiza e lança o app instalado via
+                        `garraia_desktop_core::locate` — exit 0/69/70
+                        (sysexits). **Zero dependência de Tauri na CLI**
+                        (teste varre o fonte); "já está rodando" fica para o
+                        M2, com canal de instância única na casca.
   garraia-gateway/    — servidor HTTP/WS (Axum 0.8), admin API, MCP registry, router.
                         `webchat.html` (`GET /`) segue o design system Garra Glass
                         (ADR 0009): tokens `--garra-*`, gold `#ffd400` para CTAs, cyan
@@ -48,6 +54,14 @@ crates/
                         (validate + audit + dry-run), `/api/diagnostics` (checks com
                         `next_step`; `voice.tts`/`voice.stt` sondam servidores locais
                         com modo voz ligado).
+                        Perfil de execução (ADR 0024, #1329): `bootstrap::execution`
+                        traduz `execution.profile` (`standard` | `isolated-pod`, env
+                        `GARRAIA_EXECUTION_PROFILE` vence, inválido = boot recusado)
+                        em política pura — raiz do MCP `filesystem` por perfil
+                        (nunca `$HOME`) e anúncio de boot; **nunca** inferir de
+                        `/.dockerenv`/cgroup (testes varrem o fonte). Superfícies:
+                        checks `execution.profile` + `mcp.filesystem_root`, linha
+                        `security.execution_profile`; `docs/execution-profiles.md`.
                         Auth: sem fallback de JWT secret hardcoded — `AppState::
                         jwt_signing_secret() -> Result<SecretString, AuthConfigMissing>`
                         e handlers respondem **503 fail-closed** sem secret (plan 0046).
@@ -102,6 +116,7 @@ crates/
                         secrets seguem env-only via `AuthConfig::from_env`. Invariante
                         de redaction: `config check` (humano + JSON) só reporta presença
                         (`api_key_set: true`), nunca valores.
+                        Boot gate (#1247, `boot_gate`): o mesmo `run_check` roda em todo `start`/`restart`/`start -d`; so `Error` da allowlist fechada `BLOQUEIA_O_BOOT` (hoje: TLS pela metade) recusa (exit 78; escotilha `GARRAIA_ALLOW_INVALID_CONFIG=1`, exatamente `1`).
   garraia-telemetry/  — OpenTelemetry + Prometheus baseline — feature-gated
   garraia-workspace/  — Postgres 16 + pgvector multi-tenant (Fase 3 schema completo).
                         37 tabelas em 33 migrations; 32 sob FORCE RLS e 5 fora (users,
@@ -117,9 +132,20 @@ crates/
                         parcial `expires_in_progress_idx`). Handle PII-safe via
                         skip(config) + Debug redigido. ADRs 0003 e 0004.
   garraia-plugins/    — sandbox WASM inicial (wasmtime) — features adicionais na Fase 2.2
-  garraia-voice/      — STT (Whisper) + TTS (Chatterbox/ElevenLabs/Kokoro)
+  garraia-voice/      — STT (Whisper) + TTS (Chatterbox/Hibiki/LM Studio
+                        OpenAI-compativel). Adaptadores ElevenLabs e Kokoro
+                        vivem em `garraia-channels::voice_channel` (feature
+                        `voice`, que nenhuma crate liga) e nao chegam ao
+                        gateway — `server.rs` so casa `hibiki`/`lmstudio`,
+                        o resto cai no Chatterbox.
   garraia-media/      — processamento de PDF, imagens, mídia
-  garraia-skills/     — registry de skills para o agente
+  garraia-skills/     — registry de skills para o agente. Frontmatter com `kind`
+                        (`instruction` default · `hardware-adapter` ·
+                        `hardware-preset`) + bloco `provides` (#1131): a crate
+                        e de DADOS — ela nao conhece `RiskClass`, para que
+                        conteudo empacotado nao classifique o proprio risco.
+                        Varredura desce em subdiretorios (`hardware/<slug>/
+                        SKILL.md`), ignora symlink e tem teto de profundidade.
   garraia-learning/   — Garra Learning Agent / Self-Improving Operations Manual (ADR
                         0010). 10 módulos: miner, generator, registry, retriever (stub
                         até garraia-embeddings real), evaluator, updater, safety (gate
@@ -129,13 +155,35 @@ crates/
                         (`workspace.memory_items`) ≠ skill (`learning.skills`) ≠ log
                         (`telemetry.traces`) ≠ manual distribuível (crate `garraia-skills`).
                         Nunca copiar código do Hermes Agent — referência só conceitual.
-  garraia-tools/      — tools compartilhadas (file ops, search, web)
-  garraia-runtime/    — runtime helpers
   garraia-common/     — tipos + erros compartilhados
   garraia-glob/       — glob matching utilitário
   garraia-desktop/    — Tauri v2 app: bandeja + overlay do papagaio + Chat Bar
                         (Ctrl+Space); MSI/NSIS no Windows e .deb/AppImage no Linux,
                         CLI como sidecar `binaries/garraia`
+  garraia-desktop-core/ — ADR 0021 (epic #1181, M0): núcleo do Control Center
+                        **sem Tauri**, e por isso dentro dos gates obrigatórios
+                        — a casca `garraia-desktop` roda com `--exclude` em
+                        clippy/build/test e tem zero cobertura. Três módulos:
+                        `state` (ligado/desligado como estado puro, sem relógio
+                        nem I/O, no padrão do `spinner.rs`; `Desired` = o que o
+                        usuário pediu, `Power` = o que de fato acontece, então
+                        queda vira `Failed` sem apagar a intenção), `detect`
+                        (agentes GarraIA/Hermes/OpenClaw/Claude Code/AgentDeck
+                        por leitura de `PATH` + config, **nunca executando** o
+                        binário: nome na PATH não prova identidade — sem
+                        corroboração fica `Ambiguous`, e um teste varre o
+                        próprio fonte atrás de `Command::new`/`.spawn()`) e
+                        `supervise` (launch/restart/kill extraídos do
+                        `gateway.rs` da casca, sem `unwrap` em lock, sem
+                        `sleep` por dentro — `RestartPolicy::backoff` devolve o
+                        intervalo e quem tem o relógio espera — e com o filho
+                        morrendo junto com o supervisor via `Drop`) mais
+                        `locate` (M1, #1181): onde está o aplicativo desktop
+                        instalado — instalador da plataforma > `PATH` >
+                        diretório da própria CLI, com a recusa explícita de
+                        resolver para o próprio executável, que no `.deb` é
+                        irmão do aplicativo. Consumida hoje pela
+                        `garraia-cli` (`garra desktop`); a casca ainda não.
   garraia-embeddings/ — Fase 2.1 (ADR 0002; ADR 0018 Proposed). Só superfície pública:
                         traits `EmbeddingProvider` + `VectorStore` (scoped por `Scope` +
                         `Option<Uuid> group_id`), tipos `Scope`/`EmbeddingVector(768)`/
@@ -149,6 +197,34 @@ crates/
                         compartilhada, HMAC-SHA256 sobre `{key}:{version_id}:{sha256_hex}`
                         via `PutOptions::hmac_secret`, presigned URLs com TTL [30s, 900s].
                         MinIO via endpoint override; testcontainer gated pela feature.
+garraia-hardware/   — ADR 0020 (epic #1124; #1125+#1129): abstração de dispositivos
+                        físicos. `trait Device` (async, `dyn`) + `Capability { name,
+                        risk R0-R5, read_only, args_schema }` com invariante
+                        leitura↔R0 (`leitura()`/`acao()`/`validar()`), `RiskClass`
+                        com tabela fail-closed `decisao()` (R0/R1 auto · R2 policy ·
+                        R3 confirmação humana · R4 aprovação explícita · R5 deny
+                        salvo allowlist), `HardwareGate` (`decide()` consulta a
+                        tabela; R5 via allowlist do operador), `DeviceRegistry`
+                        (`Arc<dyn Device>` por id), `DeviceStateStore` (presença
+                        online/last_seen em SQLite, best-effort) e `MockDevice`
+                        (fixture de teste, default-on). Integração com o runtime:
+                        tools `device_list`/`device_read`/`device_execute` em
+                        `garraia-agents` (duas camadas: `ToolGate` dos modos nega
+                        `device_execute` nos read-only; dentro da tool, `HardwareGate`
+                        usa o fluxo GAR-187 `ToolApproval::Granted(fingerprint)` para
+                        R3/R4 e fail-closed sem canal de confirmação). Registry começa
+                        vazio em produção — adapters (#1126/#1127/#1130) registram
+                        dispositivos e é cada um que traz o teto R2.
+                        Hardware skills (#1131, feature `skills`,
+                        `docs/hardware-skills.md`): `CatalogoDeSkills` le os
+                        manifestos e aplica as duas regras que o manifesto NAO
+                        escolhe — lista fechada de transportes (`mqtt`,
+                        `home_assistant`, `serial`, `gpio`; outro carrega
+                        inerte) e risco efetivo = `max(adapter, skill)`, ou
+                        seja, um skill so SOBE risco. Leitura continua R0
+                        (invariante de `Capability`). Seis skills oficiais em
+                        `skills/hardware/`; Zigbee/Matter como preset sobre o
+                        Home Assistant, nunca stack propria.
 apps/
   garraia-mobile/     — Garra Mobile (Flutter, Riverpod 3, go_router, Dio). v0.4.0
                         (ADR 0016): home "Garra Neon" + `lib/runtime/` (`GarraConnection`:
@@ -164,7 +240,7 @@ benches/
                         resultados versionados em `results/<data>-<host>/`.
 ```
 
-> Sem crates planejados no momento. `benches/database-poc/` foi removido em 2026-08-16;
+> `benches/database-poc/` foi removido em 2026-08-16;
 > seus números seguem citados em ADR 0003 e nas migrations 005/007.
 
 ## Convenções de código
@@ -309,6 +385,7 @@ O projeto utiliza [Superpowers](https://github.com/obra/superpowers) como framew
 
 | Skill | Uso |
 | ------- | ----- |
+| `/max-power` | Ativação do harness em um comando: verifica markers, repara via git se algo falta, oferece o plugin Superpowers, valida o setup, imprime o menu e roteia por goal |
 | `/superpowers-bridge` | Mapeamento skills locais ↔ Superpowers |
 | `/review-pr` | Revisa PR com code-reviewer + security-auditor |
 | `/tdd-loop` | Red-Green-Refactor automático |
@@ -326,15 +403,15 @@ O projeto utiliza [Superpowers](https://github.com/obra/superpowers) como framew
 
 | Agent | Modelo | Papel |
 | ------- | ------ | ------- |
-| `team-coordinator` | tencent/hy4-preview | Orquestração, delegação e decisão de merge. Nao implementa |
-| `repo-analyst` | deepseek/deepseek-v4-flash-0731 | Diagnostico de issues/PRs, causa raiz, duplicadas. Nao escreve codigo |
-| `implementer` | z-ai/glm-5.3-flash | Implementacao Rust/Flutter em worktree isolada |
-| `test-engineer` | deepseek/deepseek-v4-flash-0731 | fmt/check/clippy/test e teste de regressao |
-| `code-reviewer` | openai/gpt-5.6-luna | Revisao independente e gate MERGE_READY |
-| `security-auditor` | openai/gpt-5.6-luna | auth, JWT, crypto, RLS, SSRF, secrets. Convocado em R4 |
-| `doc-writer` | deepseek/deepseek-v4-flash-0731 | README/SETUP/CHANGELOG, docstrings e higiene do repo |
+| `team-coordinator` | anthropic/claude-fable-5.1 | Orquestração, delegação e decisão de merge. Nao implementa |
+| `repo-analyst` | anthropic/claude-opus-5 | Diagnostico de issues/PRs, causa raiz, duplicadas. Nao escreve codigo |
+| `implementer` | anthropic/claude-opus-5 | Implementacao Rust/Flutter em worktree isolada |
+| `test-engineer` | anthropic/claude-opus-5 | fmt/check/clippy/test e teste de regressao |
+| `code-reviewer` | anthropic/claude-opus-5 | Revisao independente e gate MERGE_READY |
+| `security-auditor` | anthropic/claude-opus-5 | auth, JWT, crypto, RLS, SSRF, secrets. Convocado em R4 |
+| `doc-writer` | anthropic/claude-opus-5 | README/SETUP/CHANGELOG, docstrings e higiene do repo |
 
-Modelos diferentes de proposito para Implementer e Reviewer: quem escreve nao julga.
+Roster em Claude desde 2026-09-14 (decisão do dono): Opus 5 nos papéis operacionais, Fable 5.1 no coordinator. A independência entre quem escreve e quem julga vem do **contexto separado** (agentes distintos, prompts distintos, worktrees isoladas), não mais de modelos distintos — o Reviewer nunca lê o relatório do Implementer, só o diff.
 Selecao por risco (R0-R5) em `skills/assemble-team.md`; varredura autonoma em
 `skills/repo-autopilot.md`. R5 (release, secrets, destrutivo) sempre escala ao humano.
 
@@ -385,5 +462,5 @@ python3 -m pytest scripts/quality/tests/
 - @imports `TODO.md` (backlog operacional) e `.garra-estado.md` (handoff local, gitignored) para estado da sessão anterior
 - @imports `ROADMAP.md` — plano AAA em 7 fases, fonte de verdade do planejamento
 - @imports `deep-research-report.md` — base arquitetural da Fase 3 (Group Workspace multi-tenant)
-- @imports `docs/adr/` — decisões arquiteturais: 19 ADRs (0001-0019). As 0001-0017 e a **0019** (confinamento das tools, #1084) estão **Accepted**; a **0018** (crate `garraia-embeddings`, #949) está **Proposed** — a decisão é do dono, e aceitá-la é o gatilho da remoção. Ver `docs/adr/README.md` para o índice.
+- @imports `docs/adr/` — decisões arquiteturais: 24 ADRs (0001-0024). As 0001-0017, a **0019** (confinamento das tools, #1084), a **0020** (crate `garraia-hardware`, epic #1124 — aceita 2026-09-12, opção A) e a **0021** (Desktop Control Center, epic #1181 — aceita 2026-09-14, opção D: crate `garraia-desktop-core` sem Tauri no CI, casca Tauri fina, abas sobre `/api/*`, aba Agents cliente do AgentDeck), a **0022** (identidade do LLM padrão — `z-ai/glm-5.3-flash` via OpenRouter, local como segunda opção, #1180 — aceita 2026-09-13) e a **0024** (perfis de execução `standard` | `isolated-pod`, #1329 — aceita 2026-09-21: poder total dentro do pod, nada implícito fora; perfil explícito, nunca inferido de container; `docs/execution-profiles.md`) estão **Accepted**; a **0018** (crate `garraia-embeddings`, #949) está **Proposed** — a decisão é do dono, e aceitá-la é o gatilho da remoção. Ver `docs/adr/README.md` para o índice.
 - Tracking: tracker interno (o Linear foi descontinuado em 2026-08-18 — não criar/consultar issues lá; IDs `GAR-xxx` permanecem como registro histórico de entregas)

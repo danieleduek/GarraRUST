@@ -1,3 +1,4 @@
+pub mod capacidades;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
@@ -10,20 +11,29 @@ pub mod echo;
 pub mod embeddings;
 pub mod exec_context;
 pub mod execution_budget;
+/// #1272 S3: argv e env endurecidos do `git` das tools de leitura.
+mod git_endurecido;
 pub mod llama_cpp;
 pub mod memory_extractor;
 pub mod memory_noise;
 pub mod memory_reindex;
 pub mod modes;
 pub mod multi_agent;
+/// #1438: observabilidade local de confiabilidade (ferramentas, MCP, canal).
+pub mod observabilidade;
 pub mod ollama;
 pub mod openai;
 pub mod orchestrator;
 pub mod persona;
 pub mod provider_resilience;
 pub mod providers;
+pub mod quantization;
 pub mod runtime;
+pub mod sandbox;
+/// #1225 S2: spawn das tools de programa pela `SandboxPolicy`.
+pub(crate) mod sandbox_spawn;
 pub mod tools;
+pub use sandbox::{SandboxBackend, SandboxMode, SandboxPolicy};
 pub mod turn_events;
 pub mod turn_stats;
 
@@ -45,8 +55,8 @@ pub use modes::{
     AgentMode, ModeContext, ModeEngine, ModeLimits, ModeLlmConfig, ModeProfile, ToolPolicy,
 };
 pub use multi_agent::{
-    AgentCoordinator, AgentHandle, AgentProgress, AgentResult, AgentStatus, MultiAgentSummary,
-    SubAgentConfig,
+    AgentCoordinator, AgentHandle, AgentProgress, AgentResult, AgentStatus, DbRunLedger,
+    MultiAgentSummary, NoopLedger, RunLedger, SubAgentConfig,
 };
 pub use ollama::{OllamaProvider, PullProgress, normalize_ollama_tag};
 pub use openai::OpenAiProvider;
@@ -61,15 +71,24 @@ pub use persona::{
 pub use provider_resilience::{CircuitBreaker, FallbackConfig, ResilienceManager, RetryPolicy};
 pub use providers::{
     ChatMessage, ChatRole, ContentBlock, LlmProvider, LlmRequest, LlmResponse, MessagePart,
-    StreamEvent, ToolDefinition,
+    StreamEvent, ToolDefinition, ValidacaoDeModelo,
 };
-pub use runtime::{AgentRuntime, resolve_provider_from_model};
+pub use quantization::{ModelQuant, auto_select_quant, detect_vram_bytes};
+pub use runtime::{
+    AgentRuntime, NOTA_GARRA_STATUS_EN, NOTA_GARRA_STATUS_PT, resolve_provider_from_model,
+};
 pub use tools::{
-    BashTool, CodeReviewTool, EventTrigger, EventType, FileReadTool, FileWriteTool, ListDirTool,
+    BashTool, CodeReviewTool, DeviceExecuteTool, DeviceListTool, DeviceReadTool, DeviceToolsConfig,
+    EventTrigger, EventType, FileJail, FileJailDenial, FileReadTool, FileWriteTool, ListDirTool,
     RepoSearchTool, RunTestsTool, ScheduleHeartbeat, ScheduleRecurring, ScheduledTask, TaskStatus,
     Tool, ToolContext, ToolOutput, TriggerRegistry, WebFetchTool, WebSearchTool, WebhookTrigger,
 };
 pub use turn_events::{TurnEvent, TurnSink, summarize_tool_input, summarize_tool_output};
+// #1343: o escopo de aprovacao entre turnos, para os canais aderirem.
+pub use tools::pending_approval::ApprovalScope;
 
+pub use capacidades::Capacidade;
+#[cfg(feature = "mcp")]
+pub use mcp::{McpFailureCause, McpServerState, McpServerStatus};
 #[cfg(feature = "mcp")]
 pub use mcp::{McpManager, McpPromptInfo, McpResourceInfo, McpToolInfo};

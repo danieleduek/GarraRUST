@@ -99,7 +99,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 |-----------------|---------|----------|--------------------|------------------------------------------------------|
 | `message`       | string  | yes      | —                  | Max 64 KiB. Trimmed; empty rejected.                 |
 | `provider`      | string  | no       | `openrouter`       | Enum: `ollama`/`anthropic`/`openai`/`openrouter`.    |
-| `model`         | string  | no       | `openrouter/free`  | Pass `openrouter/auto` explicitly for complex tasks. |
+| `model`         | string  | no       | `z-ai/glm-5.3-flash` | The project default (issue #1180). Pass a pricier model such as `openrouter/auto` explicitly for complex tasks. |
 | `timeout_secs`  | integer | no       | `60`               | Range `[1, 600]`. Excedes → `error.kind: "timeout"`. |
 | `system_prompt` | string  | no       | minimal default    | Max 8 KiB.                                           |
 
@@ -117,7 +117,7 @@ envelope. Success:
   "content": [
     {
       "type": "text",
-      "text": "{\"schema\":\"garra.ask.v1\",\"ok\":true,\"answer\":\"...\",\"provider\":\"openrouter\",\"model\":\"openrouter/free\",\"latency_ms\":1234}"
+      "text": "{\"schema\":\"garra.ask.v1\",\"ok\":true,\"answer\":\"...\",\"provider\":\"openrouter\",\"model\":\"z-ai/glm-5.3-flash\",\"latency_ms\":1234}"
     }
   ],
   "isError": false
@@ -141,17 +141,22 @@ Error:
 This shape gives Claude direct visibility into `provider`, `model`,
 `latency_ms`, and `error.kind` without parsing free-form text.
 
-## Cost policy (`openrouter/free` vs `openrouter/auto`)
+## Cost policy (the default is a spend guardrail)
 
-- **`openrouter/free`** is the **default**. Use for general
-  conversation, smoke tests, CI, automation, and anything where cost
-  matters.
-- **`openrouter/auto`** is **opt-in only** — the caller MUST pass
-  `model: "openrouter/auto"` explicitly. There is no automatic
-  `free → auto` upgrade.
+- **`z-ai/glm-5.3-flash`** is the **default** (issue #1180), and the
+  choice is deliberately a cost guardrail: an MCP host can call
+  `garra_ask` in a loop, unattended, so the default has to be a model
+  that cannot run up a bill. This slot used to hold `openrouter/free`
+  for exactly that reason; the flash-tier model keeps the property while
+  actually being good enough for real work.
+- **Anything pricier is opt-in only** — `openrouter/auto` in particular,
+  which the caller MUST pass as `model: "openrouter/auto"`. There is no
+  automatic upgrade to a costlier model.
+- **`openrouter/free`** still works, as an explicit
+  `model: "openrouter/free"`. It is simply no longer anyone's default.
 
 This mirrors the [`garra ask`](cli-ask.md) policy locked-in by user
-2026-05-11.
+2026-05-11 and amended by issue #1180.
 
 ## Operator limits (env vars, opt-in)
 
@@ -162,10 +167,10 @@ at startup via env vars, read once when `garra mcp-server` boots:
 
 | Env var | Effect |
 |---------|--------|
-| `GARRAIA_MCP_MODEL_ALLOWLIST` | Comma-separated model names. When set, a call whose (explicit or defaulted) `model` is not in the list is rejected with `invalid_params`. The operator's way to keep `openrouter/auto` unreachable: `GARRAIA_MCP_MODEL_ALLOWLIST=openrouter/free`. Applies to BOTH tools. |
+| `GARRAIA_MCP_MODEL_ALLOWLIST` | Comma-separated model names. When set, a call whose (explicit or defaulted) `model` is not in the list is rejected with `invalid_params`. The operator's way to keep `openrouter/auto` unreachable: `GARRAIA_MCP_MODEL_ALLOWLIST=z-ai/glm-5.3-flash`. Applies to BOTH tools. |
 | `GARRAIA_MCP_MAX_TIMEOUT_SECS` | Cap on `timeout_secs` (clamped to each tool's schema max: 600 for `garra_ask`, 1800 for `garra_agent`). Calls above the cap are rejected; a call omitting `timeout_secs` gets `min(schema_default, cap)` — 60 for `garra_ask`, 300 for `garra_agent`. |
 | `GARRAIA_MCP_ENABLE_TOOLS` | Opt-in for the full-agent tool. Truthy values: `1`, `true`, `yes` (case-insensitive). When unset, `garra_agent` is not advertised in `tools/list` and calls come back as `unknown tool` — the surface is byte-identical to the pre-agent server. |
-| `GARRAIA_MCP_ALLOWED_DIRS` | Optional comma-separated directory allowlist for `garra_agent`'s file tools (`file_read`/`file_write` relative paths). Falls back to the server's CWD. **UX belt only, not a boundary** — unrestricted `bash` can read anywhere the process can. |
+| `GARRAIA_MCP_ALLOWED_DIRS` | Comma-separated roots for `garra_agent`'s file tools (`file_read`/`file_write`). Without it: `agent.file_roots` plus the server's CWD. Since #1244 this is a **real boundary for the file tools** and it is fail-closed — no root resolves means every path is denied — and it also bounds the `working_dir` the model may ask for. It is **not** a boundary for the process: `bash` is registered unsandboxed on this path, and a plain `cat /etc/shadow` or `echo x > /tmp/y` runs with no confirmation (measured — see threat-model §5.72). Treat the two as separate questions. |
 
 The `provider` enum advertised in the JSON schema
 (`ollama|anthropic|openai|openrouter`) is enforced at runtime — plus any
@@ -186,10 +191,10 @@ Mirrors the gateway bootstrap exactly (`garraia-gateway/src/bootstrap/`):
 
 | Tool | Notes |
 |------|-------|
-| `bash` | No confirmation channel (a stateless MCP call has no history to approve in). Two gates apply, both fail-closed: the `safety_gate` DENY_LIST hard-blocks destructive patterns, and the **risky tier BLOCKS** sensitive commands outright (#1075 R1) — exfiltration-capable programs (`curl`, `wget`, `ssh`, `env`, `printenv`, wrapper-resolved like `sudo curl`, ...), mutating subcommands (`git push`, `systemctl restart`, ...), env-dump interpolation (`$(env)`, backticks), pipe-to-shell (`\|bash` even without a space), procfs environ reads (`cat /proc/$PPID/environ`), destructive `rm` variants (`rm -fr /`), `find -delete`, `dd of=`, inline code (`bash -c '...'` is unwrapped and re-gated; `python3 -c` gated) and the legacy CONFIRM patterns. On unix the child shell inherits only `PATH/HOME/LANG/LC_ALL/TERM/USER` (#1075 R3) — the env-inheritance channel for parent secrets is closed; direct same-UID procfs reads are gated by the `environ` risk pattern, but only a real sandbox closes them fully. |
-| `file_read` / `file_write` | Relative paths resolve against `working_dir` (or the server CWD). `GARRAIA_MCP_ALLOWED_DIRS` narrows them. |
+| `bash` | **Only when #1272 allows it** (see [Bash exposure](#bash-exposure-1272) below): inside a valid `docker`/`podman` sandbox, or on the host of an explicit `execution.profile = isolated-pod`. In `standard` without a usable sandbox it is **not registered at all**. When present: no confirmation channel (a stateless MCP call has no history to approve in). Two gates apply, both fail-closed: the `safety_gate` DENY_LIST hard-blocks destructive patterns, and the **risky tier BLOCKS** sensitive commands outright (#1075 R1) — exfiltration-capable programs (`curl`, `wget`, `ssh`, `env`, `printenv`, wrapper-resolved like `sudo curl`, ...), mutating subcommands (`git push`, `systemctl restart`, ...), env-dump interpolation (`$(env)`, backticks), pipe-to-shell (`\|bash` even without a space), procfs environ reads (`cat /proc/$PPID/environ`), destructive `rm` variants (`rm -fr /`), `find -delete`, `dd of=`, inline code (`bash -c '...'` is unwrapped and re-gated; `python3 -c` gated) and the legacy CONFIRM patterns. On unix the child shell inherits only `PATH/HOME/LANG/LC_ALL/TERM/USER` (#1075 R3) — the env-inheritance channel for parent secrets is closed; direct same-UID procfs reads are gated by the `environ` risk pattern, but only a real sandbox closes them fully. |
+| `file_read` / `file_write` | Jailed since #1244. The roots are `GARRAIA_MCP_ALLOWED_DIRS` (comma-separated) or, without it, `agent.file_roots` plus the server's CWD; relative paths resolve against `working_dir`, which must itself be inside those roots. **No root resolves ⇒ every path is denied**, not every path allowed. Every refusal returns the same sentence, without the path or the root, so the tool is not an existence oracle. |
 | `web_fetch` | No blocked-domain list by default. |
-| `git_diff` | Read-only git inspection. |
+| `git_diff` | Read-only git inspection. Since #1272 git runs with `core.fsmonitor=false`, `safe.bareRepository=explicit`, `core.hooksPath=/dev/null`, `--no-textconv`, every configured `filter.<driver>` blanked, no submodule recursion (`--ignore-submodules=all`, `diff.submodule=short`, `submodule.recurse=false`) and `GIT_CONFIG_NOSYSTEM=1`, so a planted `.git/config` cannot make it run a program on the host. |
 | `web_search` | Only when a Brave key exists (`config.yml llm.brave.api_key` or `BRAVE_API_KEY` env). |
 
 ### Tool schema (`garra_agent`)
@@ -198,10 +203,10 @@ Mirrors the gateway bootstrap exactly (`garraia-gateway/src/bootstrap/`):
 |-----------------|---------|----------|--------------------|-------|
 | `message`       | string  | yes      | —                  | Max 64 KiB. The task for the agent. |
 | `provider`      | string  | no       | `openrouter`       | Same enum as `garra_ask`. |
-| `model`         | string  | no       | `openrouter/free`  | Pass `openrouter/auto` for complex tasks. |
+| `model`         | string  | no       | `z-ai/glm-5.3-flash` | Same default as `garra_ask`. Pass `openrouter/auto` for complex tasks. |
 | `timeout_secs`  | integer | no       | `300`              | Range `[5, 1800]`. **Wall-clock cap for the ENTIRE agent loop** — every LLM round-trip plus every tool execution. |
 | `system_prompt` | string  | no       | generated          | Max 8 KiB. The default prompt names every registered tool and instructs the model to investigate instead of describing. |
-| `working_dir`   | string  | no       | —                  | Directory for file-tool relative paths. Since #1075 R3 the **bash child also runs in it** (`current_dir`). Validated for existence only — not against `GARRAIA_MCP_ALLOWED_DIRS` — and bash is unsandboxed: absolute paths reach anywhere. Must exist and be a directory. |
+| `working_dir`   | string  | no       | —                  | Directory for file-tool relative paths. Since #1075 R3 the **bash child also runs in it** (`current_dir`). Must exist, be a directory, **and sit inside the server's file-tool roots** — it is chosen by the model, and inside the jail it counts as a root, so it may *narrow* the file tools' reach but never widen it (#1244); a `working_dir` outside the roots comes back as `invalid_params`. When bash is registered inside the sandbox, this directory (canonicalized) is the only host path the container sees. |
 
 ### Response shape (`garra.agent.v1`)
 
@@ -258,8 +263,10 @@ before dying.
   environment (its startup depends on it). The allowlist can also
   starve a child expecting an inherited variable (e.g. a cloud CLI
   reading env credentials).
-- **`allowed_dirs` is UX, not a boundary** — unrestricted bash reaches
-  the whole filesystem.
+- **Bash is contained by process isolation, never by a command blacklist
+  (#1272).** In `standard` it only exists inside a docker/podman sandbox;
+  in `isolated-pod` the pod is the boundary. `file_write` refuses any path
+  with a `.git` component.
 - **No per-caller authentication or rate limiting** (same as
   `garra_ask`); concurrent calls from the host run concurrently.
 - **Config write access**: the file tools can edit `~/.garraia/config.yml`
@@ -270,6 +277,43 @@ Implementation note: the agent handler lives in
 `mcp_server.rs` deliberately do NOT scan (they scan only their own
 file). `mcp_server.rs` remains a pure dispatcher — it names no runtime
 tool constructor and spawns no process.
+
+### Bash exposure (#1272)
+
+`garraia mcp-server` has no human in the loop, so bash is decided once per
+call from `execution.profile` and `agent.sandbox`:
+
+| Profile | `agent.sandbox` | Bash |
+|---|---|---|
+| `standard` (default) | `mode: off` (default), `backend: ssh`, `bash` in `elevated`, `allowlist` without `bash`, no backend, or `docker`/`podman` binary missing | **not registered** |
+| `standard` | `mode: all` (or `allowlist` with `bash`) + `backend: docker` or `podman`, binary present | registered; every command runs in the container (`--cap-drop ALL`, `--pids-limit`, `--user <uid>:<gid>` / `--userns=keep-id`, `--network none`, only the call's `working_dir` mounted — never `/`, `$HOME` or the server's cwd; without `working_dir` the command is refused). No host fallback: a stopped daemon is a refused command |
+| `isolated-pod` (explicit, file or `GARRAIA_EXECUTION_PROFILE`) | `mode: off`, or `bash` not required to be sandboxed (`elevated`, `allowlist` without it) | registered; runs on the pod host. Denylist and risky tier still apply |
+| `isolated-pod` | `mode: all` (or `allowlist` with `bash`) + usable `docker`/`podman` | registered; runs in the sandbox |
+| `isolated-pod` | sandbox required for `bash` but unusable (`ssh`, no backend, binary missing) | **not registered** (every command would be refused or sent to another machine) |
+
+The profile is never inferred from container markers. With bash absent the
+model is told there is no shell, and the boot log carries one `warn!` naming
+the fix.
+
+**Migration.** Existing installs keep booting; the only change is that bash
+disappears in `standard` without a sandbox. To get it back, either contain it:
+
+```yaml
+agent:
+  sandbox:
+    mode: all
+    backend: docker   # or podman; the binary must be installed
+```
+
+or, only if the process really runs in a disposable pod:
+
+```yaml
+execution:
+  profile: isolated-pod
+```
+
+`garraia chat` is unchanged: there a human confirms risky commands in the
+terminal and is the principal.
 
 ## Stdio invariants
 
@@ -320,8 +364,9 @@ If `--help` works but the tool doesn't show up in Claude:
 
 ### Tool calls timeout immediately
 
-The default `timeout_secs` is 60. If the LLM takes longer (rare for
-`openrouter/free`), pass a larger value:
+The default `timeout_secs` is 60. If the LLM takes longer (rare for a
+flash-tier model like the default `z-ai/glm-5.3-flash`), pass a larger
+value:
 
 ```json
 {"name": "garra_ask", "arguments": {"message": "...", "timeout_secs": 120}}
@@ -477,7 +522,7 @@ working under a fully filtered environment:
   flag remains open).
 - Streaming partial responses via MCP.
 - `RedactingWriter` extension for provider error payloads.
-- Automatic `openrouter/free → openrouter/auto` fallback.
+- Automatic upgrade from the default model to a pricier one.
 - Per-user authentication / permissions.
 - MCP server telemetry / Prometheus counters.
 - Bash env allowlist for `garra_agent` (`GARRAIA_MCP_BASH_ENV_ALLOWLIST`)

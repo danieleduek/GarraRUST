@@ -79,8 +79,9 @@ cargo build --release -p garraia
 # Iniciar
 ./target/release/garra start
 
-# Conversa rápida não-interativa (GAR-579) — ideal para Claude Code, CI, scripts
-./target/release/garra ask --provider openrouter --model openrouter/free \
+# Conversa rápida não-interativa (GAR-579) — ideal para Claude Code, CI, scripts.
+# Sem `--model` resolve o padrão do projeto: `z-ai/glm-5.3-flash` (issue #1180).
+./target/release/garra ask --provider openrouter \
   --json --timeout-secs 30 "Responda apenas: GAR-ASK-OK"
 
 # MCP server stdio (GAR-583) — expõe `garra_ask` para Claude Desktop / Claude Code
@@ -132,6 +133,11 @@ Desde plan 0127 (PR-B, 2026-05-14) o instalador encadeia automaticamente:
 2. `garraia init </dev/tty` (o wizard do plan 0126 — detecção de GPU/Ollama, prompts opcionais para instalar Qwen3-14B GGUF, geração de `config.yml` server-friendly),
 3. `garraia start </dev/tty` em foreground.
 
+O instalador deixa dois nomes no PATH: `garraia` (o asset da release) e o alias
+`garra` (symlink relativo para ele) — os comandos `garra …` deste README e os
+hints da própria CLI funcionam como estão; o build do fonte produz `garra`
+direto.
+
 **Toggles** (env vars, todos opt-out):
 - `GARRAIA_SKIP_INIT=1` — pula o wizard.
 - `GARRAIA_SKIP_START=1` — pula o `garraia start` final.
@@ -169,7 +175,8 @@ irm https://garraia.org/install.ps1 | iex
 
 Irmão Windows do `install.sh`, em paridade de comportamento: detecta a
 plataforma, resolve a última release, verifica o download contra o `SHA256SUMS`,
-instala `garraia.exe` em `%LOCALAPPDATA%\Programs\GarraIA`, registra no PATH do
+instala `garraia.exe` em `%LOCALAPPDATA%\Programs\GarraIA` junto com o shim
+`garra.cmd` (para `garra` também funcionar), registra o diretório no PATH do
 usuário e encadeia `init` + `start`. Não exige privilégio de administrador.
 
 > Mesmos canais alternativos do `install.sh`:
@@ -341,7 +348,7 @@ cenário — corrigimos a tabela, não o resultado.
 - **Telegram** - respostas streaming, MarkdownV2, comandos do bot, indicadores de digitação, lista de permissões de usuários com códigos de pareamento
 - **Discord** - comandos slash, tratamento de mensagens orientado a eventos, gerenciamento de sessões
 - **Slack** - Socket Mode, respostas streaming, lista de permissões/pareamento
-- **WhatsApp** - webhooks da Meta Cloud API, lista de permissões/pareamento
+- **WhatsApp** - webhooks da Meta Cloud API, lista de permissões/pareamento; e, desde a v0.4.3, **WhatsApp pessoal por dispositivo vinculado**: `garra whatsapp` lê um QR code, guarda a sessão cifrada em disco e roda uma ponte Node/Baileys por stdio — precisa de Node.js 20+ e npm só nesse caminho ([docs/whatsapp.md](docs/whatsapp.md), [ADR 0023](docs/adr/0023-whatsapp-dispositivo-vinculado.md))
 - **iMessage** - nativo macOS via polling de chat.db, grupos de chat, envio via AppleScript ([guia de configuração](docs/src/channels/imessage.md))
 - **VS Code** - via API OpenAI-compatible, integrado ao mesmo histórico de conversas
 - **Claude Code** - via shim Anthropic-compatible `POST /v1/messages` ([ADR 0014](docs/adr/0014-anthropic-messages-shim.md)); `garra agents setup|status|link|rollback|web` provisiona GarraIA, OpenClaw, Hermes e Claude Code com um mesmo provedor+modelo via AgentDeck
@@ -657,7 +664,7 @@ Consulte a [documentação completa de integração com Continue](docs/src/conti
 ### TLS/HTTPS (builds de fonte)
 
 - **Suporte TLS** - compile com `cargo build -p garraia --features garraia-gateway/tls` (a feature vive no crate do gateway; o binário ainda não tem passthrough `tls`) e aponte `tls_cert_path`/`tls_key_path` para seus certificados (ex.: emitidos via certbot/Let's Encrypt). Não há cliente ACME embutido. Caveats honestos: os binários release atuais **não** incluem a feature TLS, e com certs configurados mas sem a feature o gateway loga warning e serve HTTP puro — ambos itens de hardening no roadmap. Para produção, recomenda-se reverse proxy com TLS na frente do bind loopback.
-- **Binding seguro** - `127.0.0.1` por padrao, `0.0.0.0` com TLS para producao
+- **Binding seguro** - `127.0.0.1` por padrao; desde a v0.4.5 um bind nao-loopback so sobe com credencial de gateway (`gateway.api_key` ou `GARRAIA_GATEWAY_API_KEY`) — TLS sozinho nao basta (#1261)
 
 ### Health Checks Centralizados
 
@@ -799,6 +806,32 @@ O GarraIA foi desenvolvido para os requisitos de segurança de agentes de IA que
 - **Sandbox WASM** - Plugin opcional em sandbox via runtime WebAssembly com acesso controlado ao host (compile com `--features plugins`).
 - **Binding apenas em localhost** - Gateway faz bind em `127.0.0.1` por padrão, não em `0.0.0.0`.
 
+### Perfis de execução
+
+Tudo acima é o perfil `standard` — a postura para máquina compartilhada.
+Para um **pod descartável** (RunPod, Docker) que existe justamente para dar
+autonomia plena ao agente, declare isso — o perfil nunca é inferido de
+marcadores de container, e valor inválido recusa o boot:
+
+```yaml
+execution:
+  profile: isolated-pod      # ou GARRAIA_EXECUTION_PROFILE=isolated-pod (vence)
+  pod_root: /workspace       # opcional, absoluto; raiz do MCP filesystem
+channels:
+  whatsapp_linked:
+    type: whatsapp_linked
+    enabled: true
+    owners: ["5511999998888"]   # só dono declarado, só em conversa 1:1
+```
+
+**Poder total dentro do pod isolado; nenhum acesso implícito fora do pod.**
+O dono do WhatsApp recebe o piso `code` (`bash`, `file_write`, tools MCP);
+grupo e contato só pareado nunca herdam; o gate de comando arriscado do
+`bash` e o jail de arquivos continuam ligados; volume do host, socket do
+Docker e segredos do host **não** são isolados pelo perfil. Guia:
+[docs/execution-profiles.md](docs/execution-profiles.md),
+[ADR 0024](docs/adr/0024-perfis-de-execucao-isolated-pod.md).
+
 ### Arquitetura Local e Sob Controle do Usuário
 
 O GarraIA foi projetado para funcionar 100% no seu computador:
@@ -825,8 +858,8 @@ O GarraIA procura `config.yml` no diretório de config, resolvido como `$GARRAIA
 
 ```yaml
 gateway:
-  host: "127.0.0.1"
-  port: 3888
+  # O bind vem de --host/HOST e --port/PORT (default 127.0.0.1:3888);
+  # gateway.host/gateway.port estao deprecados e nunca foram lidos (#1261).
   # GAR-202: tokens de sessão — TTL, idle timeout e exigência de autenticação
   session_ttl_secs: 86400       # validade do token (1 dia). Padrão: 86400
   session_idle_secs: 3600       # timeout por inatividade (1h). Padrão: 3600
@@ -961,8 +994,6 @@ crates/
 ├── garraia-agents/     # Provedores de LLM, ferramentas, cliente MCP, runtime do agente
 ├── garraia-auth/       # ✅ verify path real + extractor + endpoints + RLS matrix (GAR-391a/b/c + GAR-392) — IdentityProvider trait, InternalProvider, LoginPool/SignupPool BYPASSRLS newtypes, JWT HS256 (15min) + refresh HMAC, Argon2id+PBKDF2 dual-verify, Role/Action enums + fn can() (110-case test), Principal extractor + RequirePermission, RedactedStorageError. Migration 008/010 (login/signup roles). GAR-392 RLS matrix ✅ (plan 0013 path C, 81 cenários × 3 dedicated roles × 10 FORCE RLS tables). GAR-391d (matriz cross-group via HTTP, plan 0014) entregue em `crates/garraia-gateway/tests/authz_http_matrix.rs` (50 cenários); epic GAR-391 fechado em 2026-04-15.
 ├── garraia-voice/      # Pipeline de voz: Whisper STT → LLM → Chatterbox/Hibiki TTS
-├── garraia-tools/      # Trait Tool + ToolRegistry, execução com timeout
-├── garraia-runtime/    # Executor com máquina de estados, meta-controller, gerenciador de turn
 ├── garraia-db/         # Memória SQLite, busca vetorial (sqlite-vec), sessões
 ├── garraia-glob/       # Glob pattern matching (picomatch + bash extglob), .garraignore, scanner de arquivos
 ├── garraia-plugins/    # Sandbox de plugins WASM (wasmtime)
@@ -975,6 +1006,8 @@ crates/
 ├── garraia-embeddings/ # Traits EmbeddingProvider/VectorStore + DeterministicProvider (Fase 2.1)
 ├── garraia-learning/   # Garra Learning Agent — miner/generator/safety gate/versioning (Fase 1.4)
 ├── garraia-storage/    # ObjectStore: LocalFs + S3 (SSE-S3, HMAC integrity, presigned URLs)
+├── garraia-hardware/   # Dispositivos físicos: trait Device, gate de risco R0-R5, adapters MQTT/Home Assistant/serial/GPIO (ADR 0020)
+├── garraia-desktop-core/ # Núcleo sem Tauri do Desktop Control Center: state, detect, supervise, locate (ADR 0021)
 └── garraia-desktop/    # Assistente desktop Clippy-style (Tauri v2) — overlay do papagaio (Alt+G), Chat Bar (Ctrl+Space), bandeja; MSI/NSIS no Windows e .deb/AppImage no Linux (v0.3.5)
 ```
 
@@ -1004,7 +1037,7 @@ apps/
 
 ### Fluxo de Execução do Runtime
 
-O [`garraia-runtime`](crates/garraia-runtime/src/lib.rs) gerencia o ciclo de vida completo da execução do agente:
+O [`AgentRuntime`](crates/garraia-agents/src/runtime.rs) do `garraia-agents` gerencia o ciclo de vida completo da execução do agente:
 
 ```text
 ┌─────────────────────────────────────────────────────────────────┐

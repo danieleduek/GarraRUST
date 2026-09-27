@@ -3,6 +3,7 @@ name = "garraia"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "GarraIA CLI - Personal AI assistant platform"
 
 [[bin]]
@@ -13,10 +14,22 @@ path = "src/main.rs"
 garraia-common = { workspace = true }
 garraia-config = { workspace = true }
 garraia-gateway = { workspace = true }
-garraia-channels = { workspace = true }
+# `whatsapp-linked` (#1238, ADR 0023): `garra whatsapp` e o unico consumidor
+# do modulo, e ele e default-on aqui porque o comando precisa existir em toda
+# instalacao — Node so e exigido no momento em que o usuario escolhe a opcao 1.
+garraia-channels = { workspace = true, features = ["whatsapp-linked"] }
 garraia-agents = { workspace = true, features = ["mcp"] }
+# ADR 0020 (epic #1124): registry vazio que alimenta as device tools do
+# `garra chat` — o CLI é interativo, sempre com canal de confirmação.
+# #1250: feature `skills` — o boot de hardware carrega o catálogo e injeta
+# o elevador de risco + a fonte de aliases no `garra chat` também.
+garraia-hardware = { workspace = true, features = ["skills"] }
 garraia-auth = { workspace = true }
 garraia-db = { workspace = true }
+# #1181 (M1): resolucao do caminho do aplicativo desktop. Esta crate e o nucleo
+# SEM Tauri — depender dela nao arrasta GUI para a CLI, e e por isso que a
+# resolucao mora la e nao aqui. Ver ADR 0021, driver #5.
+garraia-desktop-core = { workspace = true }
 garraia-plugins = { workspace = true, optional = true }
 garraia-security = { workspace = true }
 garraia-skills = { workspace = true }
@@ -33,9 +46,12 @@ reqwest = { workspace = true }
 # dependência direta não adiciona nenhuma entrada nova ao Cargo.lock.
 console = "0.16"
 dialoguer = "0.12"
+# #1297: editor de linha do REPL (`chat_input.rs`). So entra em jogo quando
+# stdin, stdout e stderr sao terminal; pipe e CI seguem no `read_line` cru.
+rustyline = { workspace = true }
 serde_yaml = { workspace = true }
 serde = { workspace = true }
-dirs = "6"
+dirs = "7"
 uuid = { workspace = true }
 regex = { workspace = true }
 ring = { workspace = true }
@@ -73,9 +89,18 @@ dev-echo-provider = [
 # with HTTP MCP client support (`transport: http` in mcp config was
 # silently skipped). Default OFF — release binaries stay stdio-only.
 mcp-http = ["garraia-gateway/mcp-http", "garraia-agents/mcp-http"]
+# Forwards the TLS server feature (axum-server + rustls) down the chain so
+# the `garra` binary can serve HTTPS when `tls_cert_path`/`tls_key_path` are
+# configured. Without this passthrough the gateway logs a warning and falls
+# back to plain HTTP even with certs present. Default OFF — release builds
+# keep loopback-only HTTP unless explicitly built with `--features tls`.
+tls = ["garraia-gateway/tls"]
 
 [dev-dependencies]
 tempfile = "3"
+# #1343 — o teste do `garraia chat` implementa um `LlmProvider` e uma `Tool`
+# de roteiro (traits `#[async_trait]`).
+async-trait = { workspace = true }
 testcontainers = "0.27"
 # #936 — os testes do indicador de atividade usam tempo virtual
 # (`start_paused`) para a janela de aparição de ~270ms ser determinística.
@@ -86,10 +111,17 @@ sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chr
 # GAR-603 — env-var precedence test for `garra start --port` mutates
 # process env, so it must serialize against any future env-mutating tests.
 serial_test = { workspace = true }
+# Endpoint HTTP falso dos testes de roteamento de provider (base_url + credencial
+# da mesma entrada `llm:`). Mesmo pin do `garraia-gateway`, sem crate nova no lock.
+wiremock = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["process"] }
+# `term` (#1297): o vigia de SIGINT em `chat.rs` fotografa os atributos do
+# terminal antes do REPL e os devolve antes do `exit(130)`, para um `kill -INT`
+# recebido com o editor de linha em raw mode nao deixar o shell mudo. O
+# rustyline ja liga essa feature no `nix`, entao nao entra crate nova.
+nix = { version = "0.31", features = ["process", "term"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

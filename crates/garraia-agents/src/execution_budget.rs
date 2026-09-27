@@ -23,6 +23,55 @@ fn calcular_hash_args(payload: &Value) -> u64 {
     hasher.finish()
 }
 
+/// O trecho do input repetido que entra no erro de loop (#1295).
+///
+/// **Nao** e o payload serializado. O erro vira `error_snippet` no ledger
+/// de runs (`finish_agent_run`), cartao de erro na CLI e linha de log —
+/// despejar o JSON inteiro confiando so no `redact_secrets` vazaria
+/// exatamente o que o regex nao reconhece: `{"password": "hunter2"}` nao
+/// tem prefixo nem forma de chave de API, e passaria inteiro para os tres.
+/// A regra e a mesma do `summarize_tool_input` (#937), e pela mesma razao:
+/// so o campo allow-listed da ferramenta, ja redigido e truncado; ferramenta
+/// sem caso proprio nao mostra valor nenhum, ate alguem dizer qual campo
+/// dela e o interessante.
+///
+/// Quando a ferramenta nao tem caso, o que ainda diz **o que** repetiu sem
+/// despejar valor sao os nomes das chaves e o tamanho serializado:
+/// `objeto com chaves [password, query] (41 bytes)` deixa claro que a mesma
+/// consulta voltou tres vezes, e nao mostra a consulta. As chaves saem em
+/// ordem lexica para a mensagem nao depender de `preserve_order` do
+/// `serde_json`, e passam pelo mesmo `sanear` — chave e nome de campo do
+/// schema, mas o JSON vem do modelo, e custa nada fechar o canto.
+fn resumo_do_input(tool_name: &str, payload: &Value) -> String {
+    let resumo = crate::turn_events::summarize_tool_input(tool_name, payload);
+    if !resumo.is_empty() {
+        return resumo;
+    }
+    let tamanho = payload.to_string().len();
+    match payload {
+        Value::Object(mapa) => {
+            let mut chaves: Vec<&str> = mapa.keys().map(String::as_str).collect();
+            chaves.sort_unstable();
+            let lista = crate::turn_events::sanear(&chaves.join(", "));
+            format!("objeto com chaves [{lista}] ({tamanho} bytes)")
+        }
+        outro => format!("{} ({tamanho} bytes)", tipo_json(outro)),
+    }
+}
+
+/// Nome do tipo JSON, para o fallback de [`resumo_do_input`] quando o input
+/// nem objeto e — o modelo pode mandar uma string ou um array como input.
+fn tipo_json(valor: &Value) -> &'static str {
+    match valor {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// Orçamento de execução para controlar chamadas de ferramentas no runtime do agente.
 /// Evita loops infinitos, mas permite tarefas legítimas de longa duração.
 ///
@@ -44,6 +93,36 @@ pub struct ExecutionBudget {
     current_task_calls: usize,
     /// Janela deslizante com assinaturas recentes para detecção de loop
     historico_assinaturas: VecDeque<AssinaturaFerramenta>,
+    /// #1295 item 1: a tarefa ja recebeu o seu unico aviso de loop.
+    ///
+    /// Escopo de TAREFA, de proposito: so [`Self::resetar_tarefa`] o
+    /// desliga. O [`Self::resetar_turno`] roda cada vez que o teto por turno
+    /// e atingido, e se ele rearmasse o aviso o modelo ganharia um aviso novo
+    /// a cada 10 chamadas — um jeito de cultivar avisos em vez de parar.
+    aviso_de_loop_dado: bool,
+    /// #1295 (revisao da onda A): a assinatura que recebeu o aviso.
+    ///
+    /// Sem ela, uma chamada diferente no meio (`X, X, X` avisado, `Y`, `X`)
+    /// esvaziava a janela de tres e a chamada avisada voltava a rodar mais
+    /// duas vezes antes do corte. Com ela, a proxima ocorrencia da mesma
+    /// assinatura na tarefa aborta, em sequencia ou nao. Mesmo escopo do
+    /// `aviso_de_loop_dado`: so [`Self::resetar_tarefa`] a limpa — nem o
+    /// [`Self::resetar_turno`], que esvazia a janela no meio da tarefa.
+    assinatura_avisada: Option<AssinaturaFerramenta>,
+}
+
+/// O que fazer com uma chamada que fechou a janela de loop (#1295 item 1).
+///
+/// Nos dois casos a chamada **nao** e executada — a deteccao roda antes da
+/// execucao, como sempre. A diferenca e o que acontece com o turno.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VereditoDeLoop {
+    /// Primeira deteccao da tarefa: o modelo recebe, no lugar do resultado,
+    /// esta observacao corretiva, e o turno segue. Custa no maximo UMA volta
+    /// a mais de LLM por tarefa.
+    Avisar(String),
+    /// Ja houve aviso nesta tarefa: o turno aborta com a mensagem do #1318.
+    Abortar(String),
 }
 
 /// Timeout por execução de ferramenta, em segundos, quando nada é
@@ -134,6 +213,8 @@ impl ExecutionBudget {
             current_turn_calls: 0,
             current_task_calls: 0,
             historico_assinaturas: VecDeque::with_capacity(JANELA_LOOP),
+            aviso_de_loop_dado: false,
+            assinatura_avisada: None,
         }
     }
 
@@ -199,12 +280,35 @@ impl ExecutionBudget {
         self.current_turn_calls < self.max_per_turn && self.current_task_calls < self.max_per_task
     }
 
+    /// Conta uma chamada contra o orcamento do turno e da tarefa **sem**
+    /// entrar na janela de deteccao de loop (#1226, achado de revisao).
+    ///
+    /// Existe para o envelope `tool_program`: ele gasta orcamento como
+    /// qualquer chamada, mas cada passo dele volta pelo despacho e registra a
+    /// propria assinatura. Se o envelope tambem entrasse na janela, um modelo
+    /// preso repetindo `tool_program{steps:[X]}` a cada volta deixaria a
+    /// janela alternando `[tp, X, tp]` / `[X, tp, X]`, e o corte de
+    /// [`JANELA_LOOP`] chamadas identicas nunca dispararia — sobraria so o
+    /// teto da tarefa, ~25 repeticoes em vez de 3. Fora da janela, os passos
+    /// ficam colados um no outro e a terceira repeticao de X corta como corta
+    /// fora do programa.
+    pub fn registrar_contagem(&mut self) {
+        self.current_turn_calls += 1;
+        self.current_task_calls += 1;
+    }
+
     /// Registra uma chamada de ferramenta com seu payload,
     /// para controle de orçamento e detecção de loop por assinatura.
     pub fn registrar_chamada(&mut self, tool_name: &str, payload: &Value) {
-        self.current_turn_calls += 1;
-        self.current_task_calls += 1;
+        self.registrar_contagem();
+        self.registrar_assinatura(tool_name, payload);
+    }
 
+    /// So a metade de assinatura de [`Self::registrar_chamada`]: entra na
+    /// janela de loop sem contar contra o orcamento (#1226, revisao do
+    /// #1337). Usado quando um `tool_program` ja contado pelo envelope nao
+    /// despachou passo nenhum — o orcamento segue 1 + N.
+    pub fn registrar_assinatura(&mut self, tool_name: &str, payload: &Value) {
         let assinatura = AssinaturaFerramenta {
             nome: tool_name.to_string(),
             hash_args: calcular_hash_args(payload),
@@ -238,6 +342,72 @@ impl ExecutionBudget {
             .all(|sig| sig.nome == primeira.nome && sig.hash_args == primeira.hash_args)
     }
 
+    /// #1295: mensagem de erro diagnosticável para o loop detectado — nome
+    /// da ferramenta, contagem da janela e o trecho do input repetido que
+    /// [`resumo_do_input`] deixa sair (campo allow-listed da ferramenta, ou
+    /// so a forma do objeto quando ela nao tem caso).
+    ///
+    /// Pré-condição: `detectar_loop_ferramenta()` acabou de devolver `true`
+    /// para a chamada `input_atual`. A janela está cheia de assinaturas
+    /// idênticas por construção, então o input da chamada atual **é** o
+    /// input repetido — e o tamanho da janela é o número de chamadas iguais
+    /// em sequência que disparou o corte.
+    pub fn mensagem_de_loop(&self, tool_name: &str, input_atual: &Value) -> String {
+        format!(
+            "tool loop detected: {} ({} chamadas identicas em sequencia); input repetido: {}",
+            tool_name,
+            self.historico_assinaturas.len(),
+            resumo_do_input(tool_name, input_atual),
+        )
+    }
+
+    /// #1295 item 1: o veredito para a chamada que acabou de ser registrada.
+    ///
+    /// `None` quando a janela nao fechou em loop. Na primeira deteccao da
+    /// tarefa devolve [`VereditoDeLoop::Avisar`] com a observacao corretiva
+    /// e marca a tarefa; toda deteccao seguinte, da mesma assinatura ou de
+    /// outro loop, devolve [`VereditoDeLoop::Abortar`] com a mensagem de
+    /// [`Self::mensagem_de_loop`]. Depois do aviso, a assinatura avisada
+    /// aborta na proxima ocorrencia mesmo sem fechar a janela (outra
+    /// chamada no meio nao a libera). A chamada ja foi contada no orcamento
+    /// (`registrar_chamada`), entao `max_per_turn`/`max_per_task` seguem
+    /// valendo por cima.
+    pub fn veredito_de_loop(
+        &mut self,
+        tool_name: &str,
+        input_atual: &Value,
+    ) -> Option<VereditoDeLoop> {
+        if !self.detectar_loop_ferramenta() {
+            // A janela nao fechou, mas a chamada avisada voltou: aborta.
+            // A chamada atual ja foi registrada, entao ela e o fim da janela.
+            let voltou_a_avisada = self
+                .assinatura_avisada
+                .as_ref()
+                .is_some_and(|avisada| self.historico_assinaturas.back() == Some(avisada));
+            if voltou_a_avisada {
+                return Some(VereditoDeLoop::Abortar(format!(
+                    "tool loop detected: {} (repetida depois do aviso de loop); \
+                     input repetido: {}",
+                    tool_name,
+                    resumo_do_input(tool_name, input_atual),
+                )));
+            }
+            return None;
+        }
+        let mensagem = self.mensagem_de_loop(tool_name, input_atual);
+        if self.aviso_de_loop_dado {
+            return Some(VereditoDeLoop::Abortar(mensagem));
+        }
+        self.aviso_de_loop_dado = true;
+        self.assinatura_avisada = self.historico_assinaturas.back().cloned();
+        Some(VereditoDeLoop::Avisar(format!(
+            "{mensagem}. Esta chamada NAO foi executada: as ultimas {n} chamadas \
+             foram identicas. Leia o resultado ou o erro anterior e mude de \
+             abordagem; repetir a mesma chamada encerra o turno.",
+            n = self.historico_assinaturas.len(),
+        )))
+    }
+
     /// Retorna a duração de timeout configurada para execução de ferramentas.
     pub fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.tool_timeout_secs)
@@ -254,6 +424,8 @@ impl ExecutionBudget {
         self.current_turn_calls = 0;
         self.current_task_calls = 0;
         self.historico_assinaturas.clear();
+        self.aviso_de_loop_dado = false;
+        self.assinatura_avisada = None;
     }
 
     /// Retorna o status atual do orçamento em formato textual.
@@ -394,6 +566,39 @@ mod tests {
         assert_eq!(budget.current_task_calls, 1);
     }
 
+    /// #1226 (achado de revisao): `registrar_contagem` gasta orcamento mas
+    /// nao entra na janela — tres X intercalados com contagens puras ainda
+    /// sao tres X colados, e o detector dispara.
+    #[test]
+    fn registrar_assinatura_entra_na_janela_sem_gastar_orcamento() {
+        // #1226 (revisao do #1337): o `tool_program` que nao despacha passo
+        // nenhum entra na janela so pela assinatura — o envelope ja foi
+        // contado, e o orcamento continua 1 + N.
+        let mut b = ExecutionBudget::padrao();
+        let x = serde_json::json!({ "steps": "mal formado" });
+        for _ in 0..JANELA_LOOP {
+            b.registrar_assinatura("tool_program", &x);
+        }
+        assert_eq!(b.chamadas_na_tarefa(), 0, "assinatura nao conta chamada");
+        assert!(b.detectar_loop_ferramenta(), "mas a janela enche e corta");
+    }
+
+    #[test]
+    fn registrar_contagem_gasta_orcamento_sem_entrar_na_janela() {
+        let mut budget = ExecutionBudget::padrao();
+        let x = json!({"command": "cargo check"});
+        for _ in 0..3 {
+            budget.registrar_contagem();
+            budget.registrar_chamada("bash", &x);
+        }
+        assert_eq!(budget.current_turn_calls, 6, "o envelope conta no turno");
+        assert_eq!(budget.current_task_calls, 6, "e na tarefa");
+        assert!(
+            budget.detectar_loop_ferramenta(),
+            "a contagem pura nao pode separar as tres assinaturas iguais"
+        );
+    }
+
     #[test]
     fn test_no_loop_different_args() {
         let mut budget = ExecutionBudget::padrao();
@@ -520,5 +725,301 @@ mod tests {
 
         // Janela agora é [ls, ls, ls] — loop detectado
         assert!(budget.detectar_loop_ferramenta());
+    }
+
+    // ─── #1295: o erro de loop tem de ser diagnosticavel ─────────────────
+
+    /// A mensagem leva o que quem le precisa para corrigir: qual tool, quantas
+    /// voltas identicas e O QUE estava repetindo — para ferramenta com caso
+    /// no `summarize_tool_input`, o campo allow-listed dela (o `path` do
+    /// `file_read`, que a #937 mostra inteiro de proposito).
+    #[test]
+    fn mensagem_de_loop_traz_nome_contagem_e_input() {
+        let mut budget = ExecutionBudget::padrao();
+        let input = json!({"path": "/tmp/alvo-repetido"});
+        for _ in 0..3 {
+            budget.registrar_chamada("file_read", &input);
+        }
+        assert!(budget.detectar_loop_ferramenta(), "pre-condicao do teste");
+
+        let msg = budget.mensagem_de_loop("file_read", &input);
+        assert!(msg.starts_with("tool loop detected: file_read"), "{msg}");
+        assert!(msg.contains("3 chamadas identicas em sequencia"), "{msg}");
+        assert!(msg.contains("input repetido: /tmp/alvo-repetido"), "{msg}");
+    }
+
+    /// Achado de revisao: despejar o input inteiro confiando so no regex
+    /// vazaria segredo sem formato. `{"password": "hunter2"}` nao tem
+    /// prefixo de chave de API e passaria inteiro para o ledger de runs, o
+    /// cartao da CLI e o log — onde na base o erro era so o nome da tool.
+    /// Ferramenta sem caso proprio mostra a FORMA do input (chaves + tamanho)
+    /// e nenhum valor.
+    #[test]
+    fn mensagem_de_loop_nao_despeja_input_de_tool_sem_resumo() {
+        let mut budget = ExecutionBudget::padrao();
+        let input = json!({"password": "hunter2", "query": "select 1"});
+        for _ in 0..3 {
+            budget.registrar_chamada("db_query", &input);
+        }
+
+        let msg = budget.mensagem_de_loop("db_query", &input);
+        assert!(!msg.contains("hunter2"), "senha sem formato vazou: {msg}");
+        assert!(!msg.contains("select 1"), "valor de campo vazou: {msg}");
+        assert!(
+            msg.contains("objeto com chaves [password, query]"),
+            "a forma do input tem de aparecer, para dizer O QUE repetiu: {msg}"
+        );
+        let tamanho = input.to_string().len();
+        assert!(msg.contains(&format!("({tamanho} bytes)")), "{msg}");
+
+        // Ferramenta conhecida, campo nao allow-listed: o `url` do
+        // `web_fetch` sai, o `password` ao lado nao.
+        let input = json!({"url": "https://x", "password": "hunter2"});
+        let msg = budget.mensagem_de_loop("web_fetch", &input);
+        assert!(msg.contains("https://x"), "{msg}");
+        assert!(
+            !msg.contains("hunter2"),
+            "campo fora da allow-list vazou: {msg}"
+        );
+    }
+
+    /// Input que nem objeto e (string, array) tambem nao sai: so o tipo e o
+    /// tamanho.
+    #[test]
+    fn resumo_do_input_sem_objeto_mostra_so_tipo_e_tamanho() {
+        assert_eq!(
+            super::resumo_do_input("eco", &json!("segredo em texto puro")),
+            "string (23 bytes)"
+        );
+        assert_eq!(
+            super::resumo_do_input("eco", &json!(["a", "b"])),
+            "array (9 bytes)"
+        );
+        assert_eq!(
+            super::resumo_do_input("eco", &json!({})),
+            "objeto com chaves [] (2 bytes)"
+        );
+    }
+
+    /// Input grande nao vira dump: o campo allow-listed sai pelo `sanear` do
+    /// `turn_events`, que trunca em 72 chars sem partir UTF-8 ao meio.
+    #[test]
+    fn resumo_do_input_trunca_o_campo_allow_listed() {
+        let longo = json!({"command": "x".repeat(500)});
+        let resumo = super::resumo_do_input("bash", &longo);
+        assert!(resumo.ends_with('…'), "{resumo}");
+        assert!(resumo.chars().count() <= 72, "{}", resumo.chars().count());
+
+        let multibyte = json!({"command": "ção".repeat(200)});
+        let resumo = super::resumo_do_input("bash", &multibyte);
+        assert!(resumo.chars().count() <= 72, "{}", resumo.chars().count());
+        assert!(resumo.starts_with("ção"), "{resumo}");
+    }
+
+    /// O erro vai para o log, o ledger e a CLI: segredo COM formato no campo
+    /// allow-listed sai redigido, e a redacao vem antes do corte — o corte
+    /// nao pode deixar um prefixo de chave passar pelo regex.
+    #[test]
+    fn mensagem_de_loop_redige_segredo_do_input() {
+        let chave = format!("sk-ant-api03-{}", "a".repeat(40));
+        let mut budget = ExecutionBudget::padrao();
+        let input =
+            json!({"command": format!("curl -H 'Authorization: Bearer {chave}' https://x")});
+        for _ in 0..3 {
+            budget.registrar_chamada("bash", &input);
+        }
+
+        let msg = budget.mensagem_de_loop("bash", &input);
+        assert!(!msg.contains(&chave), "segredo sobreviveu: {msg}");
+        assert!(msg.contains("[REDACTED]"), "{msg}");
+
+        // Mesmo com a chave comecando antes do corte de 72 e terminando
+        // depois: truncar primeiro deixaria 50 chars dela passarem crus.
+        let input = json!({"command": format!("{} {chave}", "p".repeat(20))});
+        let msg = budget.mensagem_de_loop("bash", &input);
+        assert!(!msg.contains(&chave[..30]), "prefixo da chave vazou: {msg}");
+        assert!(msg.contains("[REDACTED]"), "{msg}");
+    }
+
+    // ── #1295 item 1: um aviso corretivo, depois aborta ──────────────────
+
+    fn tres_iguais(budget: &mut ExecutionBudget, input: &serde_json::Value) {
+        for _ in 0..3 {
+            budget.registrar_chamada("file_read", input);
+        }
+    }
+
+    #[test]
+    fn primeira_deteccao_avisa_com_tool_e_input_redigido() {
+        let mut budget = ExecutionBudget::padrao();
+        let input = json!({"path": "/tmp/alvo"});
+        budget.registrar_chamada("file_read", &input);
+        assert_eq!(budget.veredito_de_loop("file_read", &input), None);
+        budget.registrar_chamada("file_read", &input);
+        assert_eq!(budget.veredito_de_loop("file_read", &input), None);
+        budget.registrar_chamada("file_read", &input);
+        let Some(super::VereditoDeLoop::Avisar(msg)) = budget.veredito_de_loop("file_read", &input)
+        else {
+            panic!("a primeira deteccao avisa");
+        };
+        assert!(msg.contains("file_read"), "{msg}");
+        assert!(msg.contains("input repetido: /tmp/alvo"), "{msg}");
+        assert!(msg.contains("NAO foi executada"), "{msg}");
+        assert!(msg.contains("mude de abordagem"), "{msg}");
+    }
+
+    #[test]
+    fn repeticao_depois_do_aviso_aborta() {
+        let mut budget = ExecutionBudget::padrao();
+        let input = json!({"path": "/tmp/alvo"});
+        tres_iguais(&mut budget, &input);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &input),
+            Some(super::VereditoDeLoop::Avisar(_))
+        ));
+        budget.registrar_chamada("file_read", &input);
+        let Some(super::VereditoDeLoop::Abortar(msg)) =
+            budget.veredito_de_loop("file_read", &input)
+        else {
+            panic!("a repeticao depois do aviso aborta");
+        };
+        assert!(msg.starts_with("tool loop detected: file_read"), "{msg}");
+        assert!(msg.contains("3 chamadas identicas"), "{msg}");
+    }
+
+    /// Um aviso por tarefa: um loop DIFERENTE depois do aviso tambem aborta.
+    #[test]
+    fn outro_loop_depois_do_aviso_aborta() {
+        let mut budget = ExecutionBudget::padrao();
+        let a = json!({"path": "/a"});
+        tres_iguais(&mut budget, &a);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &a),
+            Some(super::VereditoDeLoop::Avisar(_))
+        ));
+        let b = json!({"path": "/b"});
+        for _ in 0..2 {
+            budget.registrar_chamada("file_read", &b);
+            assert_eq!(budget.veredito_de_loop("file_read", &b), None);
+        }
+        budget.registrar_chamada("file_read", &b);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &b),
+            Some(super::VereditoDeLoop::Abortar(_))
+        ));
+    }
+
+    /// Revisao da onda A: uma chamada diferente no meio nao libera a
+    /// chamada avisada. `X, X, X` (aviso), `Y`, `X` aborta no segundo `X`
+    /// depois do aviso, sem esperar a janela fechar de novo.
+    #[test]
+    fn chamada_avisada_aborta_mesmo_com_outra_chamada_no_meio() {
+        let mut budget = ExecutionBudget::padrao();
+        let x = json!({"path": "/x"});
+        let y = json!({"path": "/y"});
+        tres_iguais(&mut budget, &x);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &x),
+            Some(super::VereditoDeLoop::Avisar(_))
+        ));
+        budget.registrar_chamada("file_read", &y);
+        assert_eq!(budget.veredito_de_loop("file_read", &y), None);
+        budget.registrar_chamada("file_read", &x);
+        let Some(super::VereditoDeLoop::Abortar(msg)) = budget.veredito_de_loop("file_read", &x)
+        else {
+            panic!("a chamada avisada aborta mesmo com outra no meio");
+        };
+        assert!(msg.starts_with("tool loop detected: file_read"), "{msg}");
+        assert!(msg.contains("depois do aviso"), "{msg}");
+        assert!(msg.contains("input repetido: /x"), "{msg}");
+    }
+
+    /// Nem o reset do teto por turno libera a chamada avisada; so a tarefa
+    /// nova. A mesma ferramenta com OUTRO input segue livre.
+    #[test]
+    fn assinatura_avisada_sobrevive_ao_reset_de_turno_e_so_ela_aborta() {
+        let mut budget = ExecutionBudget::padrao();
+        let x = json!({"path": "/x"});
+        tres_iguais(&mut budget, &x);
+        let _ = budget.veredito_de_loop("file_read", &x);
+        budget.resetar_turno();
+        budget.registrar_chamada("file_read", &json!({"path": "/outro"}));
+        assert_eq!(
+            budget.veredito_de_loop("file_read", &json!({"path": "/outro"})),
+            None
+        );
+        budget.registrar_chamada("file_read", &x);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &x),
+            Some(super::VereditoDeLoop::Abortar(_))
+        ));
+
+        budget.resetar_tarefa();
+        budget.registrar_chamada("file_read", &x);
+        assert_eq!(budget.veredito_de_loop("file_read", &x), None);
+    }
+
+    /// O reset do teto por turno NAO rearma o aviso; nova tarefa rearma.
+    #[test]
+    fn resetar_turno_nao_rearma_o_aviso_resetar_tarefa_rearma() {
+        let mut budget = ExecutionBudget::padrao();
+        let input = json!({"path": "/tmp/alvo"});
+        tres_iguais(&mut budget, &input);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &input),
+            Some(super::VereditoDeLoop::Avisar(_))
+        ));
+        budget.resetar_turno();
+        tres_iguais(&mut budget, &input);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &input),
+            Some(super::VereditoDeLoop::Abortar(_))
+        ));
+
+        budget.resetar_tarefa();
+        tres_iguais(&mut budget, &input);
+        assert!(matches!(
+            budget.veredito_de_loop("file_read", &input),
+            Some(super::VereditoDeLoop::Avisar(_))
+        ));
+    }
+
+    /// A chamada avisada conta no orcamento: nao e uma volta de graca.
+    #[test]
+    fn chamada_avisada_conta_no_orcamento() {
+        let mut budget = ExecutionBudget::padrao();
+        let input = json!({"path": "/tmp/alvo"});
+        tres_iguais(&mut budget, &input);
+        let _ = budget.veredito_de_loop("file_read", &input);
+        assert_eq!(budget.chamadas_na_tarefa(), 3);
+    }
+
+    /// O aviso tambem nao despeja segredo nem input cru.
+    #[test]
+    fn aviso_redige_segredo_e_nao_despeja_input_sem_resumo() {
+        let chave = format!("sk-ant-api03-{}", "a".repeat(40));
+        let mut budget = ExecutionBudget::padrao();
+        let input =
+            json!({"command": format!("curl -H 'Authorization: Bearer {chave}' https://x")});
+        for _ in 0..3 {
+            budget.registrar_chamada("bash", &input);
+        }
+        let Some(super::VereditoDeLoop::Avisar(msg)) = budget.veredito_de_loop("bash", &input)
+        else {
+            panic!("avisa");
+        };
+        assert!(!msg.contains(&chave), "{msg}");
+
+        let mut budget = ExecutionBudget::padrao();
+        let input = json!({"password": "hunter2", "query": "x"});
+        for _ in 0..3 {
+            budget.registrar_chamada("sem_resumo", &input);
+        }
+        let Some(super::VereditoDeLoop::Avisar(msg)) =
+            budget.veredito_de_loop("sem_resumo", &input)
+        else {
+            panic!("avisa");
+        };
+        assert!(!msg.contains("hunter2"), "{msg}");
     }
 }

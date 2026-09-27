@@ -13,15 +13,77 @@ Monte uma equipe coordenada de agentes para uma tarefa no GarraRUST.
 
 | Papel | Agent | Modelo | Função |
 |-------|-------|--------|--------|
-| Coordinator | `team-coordinator` | tencent/hy4-preview | planeja, delega, arbitra, decide |
-| Analyst | `repo-analyst` | deepseek/deepseek-v4-flash-0731 | diagnóstico e plano |
-| Implementer | `implementer` | z-ai/glm-5.3-flash | escreve o código |
-| Tester | `test-engineer` | deepseek/deepseek-v4-flash-0731 | prova que funciona |
-| Reviewer | `code-reviewer` | openai/gpt-5.6-luna | julgamento independente |
-| Security | `security-auditor` | openai/gpt-5.6-luna | superfície sensível |
-| DocWriter | `doc-writer` | deepseek/deepseek-v4-flash-0731 | docs e higiene |
+| Coordinator | `team-coordinator` | anthropic/claude-fable-5.1 | planeja, delega, arbitra, decide |
+| Analyst | `repo-analyst` | anthropic/claude-opus-5 | diagnóstico e plano |
+| Implementer | `implementer` | anthropic/claude-opus-5 | escreve o código |
+| Tester | `test-engineer` | anthropic/claude-opus-5 | prova que funciona |
+| Reviewer | `code-reviewer` | anthropic/claude-opus-5 | julgamento independente |
+| Security | `security-auditor` | anthropic/claude-opus-5 | superfície sensível |
+| DocWriter | `doc-writer` | anthropic/claude-opus-5 | docs e higiene |
 
-O Implementer e o Reviewer usam modelos diferentes de propósito: quem escreve não julga.
+Roster em Claude desde 2026-09-14 (decisão do dono). Quem escreve não julga: a independência entre Implementer e Reviewer vem do contexto separado (agente, prompt e worktree distintos; o Reviewer lê o diff, nunca o relatório do Implementer), não de modelos distintos.
+
+## Pré-requisitos e modo degradado
+
+Este pipeline **depende de uma ferramenta de spawn de subagente**. Sem ela, a
+sessão só consegue falar com agentes que já existem (`SendMessage`), e a
+independência de julgamento que o roster inteiro pressupõe deixa de existir:
+ela vem de **contexto separado** — agente, prompt e worktree distintos, com o
+Reviewer lendo o diff e nunca o relatório do Implementer.
+
+Verifique antes de prometer um time. Se não houver spawn:
+
+- **R0–R1** seguem normalmente: são trabalho que uma sessão só faz e assina.
+- **R2–R3** seguem com ressalva escrita no PR dizendo que a revisão foi feita
+  pela mesma sessão que implementou.
+- **R4+ não é mergeável por construção.** Não implemente. Diagnostique,
+  documente com file:line, abra a issue e **escale ao humano**. Auto-revisão em
+  superfície sensível é proibida pelo `CLAUDE.md`, e "eu reli com cuidado" não
+  substitui contexto separado.
+
+Descobrir isso no meio da rodada custa a rodada inteira — foi o atrito nº 1 do
+dogfood registrado na #1228.
+
+### Outros pré-requisitos que já morderam
+
+- **`cargo` sem `CARGO_TARGET_DIR` exportado cria uma árvore de build inteira
+  dentro do worktree.** A variável **não persiste entre chamadas de shell**:
+  reexporte em *cada* comando. Numa rodada real isso produziu um `target/` de
+  4,5 GB dentro de um worktree e levou o disco a 100%, travando todos os
+  agentes ao mesmo tempo.
+- **Um `target/` compartilhado entre worktrees mistura o código de uma com o
+  da outra.** O cargo gera o hash dos membros do workspace pelo caminho
+  *relativo* à raiz, então toda worktree deste repo escreve o mesmo
+  `libgarraia_agents-<hash>.rlib`, e o frescor é decidido por mtime: se a
+  worktree B compilou `garraia-agents` depois da última edição da A, a A linka
+  o artefato da B sem recompilar. Na onda C da v0.4.5 isso apareceu como erro
+  fantasma (`cannot find function turno_restrito`, `E0061` com o número de
+  argumentos de outro branch); o caso pior é o silencioso — teste verde contra
+  o código errado. Só o crate que a própria worktree editou é recompilado com
+  certeza. Regra: **um `CARGO_TARGET_DIR` por worktree** (ou, sem disco, um
+  perfil próprio: `--config 'profile.<nome>.inherits="dev"' --profile
+  <nome>`, que separa a saída em `<target>/<nome>/`). Resultado de gate num
+  target compartilhado é indicativo; a prova é o trem integrado num target
+  exclusivo mais o CI em runner limpo.
+- **Não responda a um agente de workflow que já terminou.** O `SendMessage`
+  para o `agentId` dele o retoma como uma cópia fora do workflow, com o mesmo
+  id; na v0.4.5 a cópia e a instância do workflow escreveram na mesma
+  worktree, e o `TaskStop` pelo id parou a instância errada. Antes de
+  responder, confira no `journal.jsonl` do workflow se ele já tem `result`; se
+  tiver, assuma a worktree você mesmo.
+- **O `utoipa-swagger-ui` não precisa mais de rede**: desde o #1228 o gateway
+  usa a feature `vendored` e o build script lê o zip embutido. O antigo
+  `SWAGGER_UI_DOWNLOAD_URL=file://...` é ignorado. Ver a skill `steward`.
+- **Worktree de Workflow começa na `main`, não no seu `HEAD`.** Um agente
+  disparado por script de Workflow recebe uma worktree nova a partir da
+  `main`; se o trabalho é empilhado sobre outra branch, ele implementa sobre a
+  base errada sem avisar. Passe o SHA base no brief, mande o agente fazer
+  `git checkout -b <branch> <sha>` explícito e confira o `merge-base` antes do
+  trem de merge.
+- **Em R4 o reviewer muta o controle.** Para aprovar uma guarda de segurança,
+  o `code-reviewer` remove (ou inverte) o controle na própria worktree e prova
+  que o teste fica vermelho. Teste que continua verde sem o controle não
+  protege nada.
 
 ## Seleção por risco
 
@@ -32,6 +94,21 @@ O Implementer e o Reviewer usam modelos diferentes de propósito: quem escreve n
 | R2 | lógica interna, refactor, teste novo | + Reviewer |
 | R3 | API pública, schema, migration, dependência, CI | + revisão reforçada |
 | R4 | auth, JWT, crypto, RLS, secrets, SSRF, upload | + **Security obrigatório** |
+
+**Em R4 o Security pede o controle e o Reviewer muta o controle.** Não basta o
+`security-auditor` exigir a correção e o Implementer aplicá-la: o
+`code-reviewer` remove o controle e prova que algum teste fica **vermelho**.
+
+Sem esse segundo passo, "o fix foi aplicado" é uma *alegação*, não uma
+evidência — que é exatamente o que o `team-coordinator` já é instruído a não
+aceitar.
+
+Caso real, medido: numa auditoria R4 o Security exigiu `env_clear()` no spawn
+do processo filho e uma allowlist de ambiente. Os dois foram aplicados. O
+Reviewer depois apagou o `env_clear()` e **93 de 93 testes seguiram verdes** —
+o teste afirmava o conteúdo de duas constantes, nunca que o ambiente era de
+fato limpo. O controle que a auditoria exigiu não restringia o comportamento
+que dizia restringir. Ninguém tinha pedido o pino.
 | R5 | release, secrets de CI, destrutivo, `install.sh`/`install.ps1` | **pare e escale ao humano** |
 
 ## Pipeline

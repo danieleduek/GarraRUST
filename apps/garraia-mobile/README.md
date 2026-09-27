@@ -92,12 +92,19 @@ lib/
 ├── services/                 # api_service (cloud), offline_queue, sync, biometric, notifications
 ├── theme/                    # garra_tokens (cores/raios) + garra_theme (ThemeData, garraText)
 └── widgets/                  # brand/ (WolfMark, NightRidge), home/ (tiles, cards), bottom nav
+tool/
+└── gen_launcher_icons.py     # icones Android (adaptive + legado) a partir do WolfMark
 ```
 
 ## Convenções
 
 - Nunca `withOpacity()` — `withValues(alpha:)`.
 - Cor nova entra em `theme/garra_tokens.dart`, não hard-coded no widget.
+- Texto de UI nunca é literal no widget: chave em `lib/l10n/app_en.arb` **e**
+  `app_pt.arb`, lida via `context.l10n.<chave>` (sem `BuildContext`,
+  `savedLocalizations()`). `flutter pub get` regenera `lib/l10n/generated/`
+  (commitado); `test/l10n_hardcoded_strings_test.dart` falha em string
+  hard-coded nova.
 - Endpoint novo entra em `GarraConnection` (interface) **e** em `GatewayConnection`;
   o Cloud herda o que não sobrescreve.
 - Feature nova de tile: constante em `GarraFeature` **e** no `feature_flags` do gateway

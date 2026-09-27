@@ -21,7 +21,13 @@ gateway:
   session_ttl_secs: 86400      # validade do token de sessão (1 dia)
   session_idle_secs: 3600      # corte por inatividade (1h)
 
-  # CORS: vazio = allow-all (dev). Em produção, liste as origens.
+  # CORS + ancora anti-CSRF (#1182): vazio = nenhuma origem cross-origin
+  # (default seguro). O Web Console e servido pelo proprio gateway e e
+  # same-origin, entao por IP ou localhost ele nao precisa desta lista. Se o
+  # console e alcancado por NOME DNS (reverse proxy com dominio proprio, mDNS
+  # `.local`, Tailscale, nome de servico Docker, ingress), liste a origem aqui
+  # com o esquema que o navegador ve — sem isso, POST/PATCH/DELETE e o
+  # WebSocket do chat vindos do navegador voltam 403. `*` nao e aceito.
   allowed_origins: []
 
   rate_limit:
@@ -34,6 +40,12 @@ gateway:
   # tls_key_path: "/etc/garraia/key.pem"
 
 llm:
+  # NOTA: este perfil ENDURECIDO desvia do padrao do projeto de proposito.
+  # O padrao oficial (issue #1180) e nuvem: OpenRouter + `z-ai/glm-5.3-flash`,
+  # com o local como segunda opcao. Aqui a ordem se inverte porque o objetivo
+  # e uma maquina que nao fala com nenhum servico externo. Se voce quer o
+  # padrao do projeto, use `garra init` ou `garra config set-routing`.
+  #
   # Provider local sem chave (troque pelo seu; chaves de cloud provider:
   # prefira o cofre via `garra init` + GARRAIA_VAULT_PASSPHRASE).
   ollama-local:
@@ -42,6 +54,7 @@ llm:
     base_url: "http://localhost:11434"
 
 agent:
+  # Deliberadamente local — ver a nota em `llm:` acima.
   default_provider: ollama-local
   # Tier "arriscado" do safety_gate passa a exigir confirmação humana
   # (o tier "perigoso" é bloqueado SEMPRE, com ou sem esta flag):
@@ -63,7 +76,57 @@ agent:
   bash_allowlist:
     - "hermes send *"
     - "git status"
+  # #1225: sandbox por tool. Camada ADICIONAL — roda depois da denylist, do
+  # tier arriscado e do modo read-only, nunca no lugar deles. A seção inteira
+  # é opcional: ausente = `mode: off` = o comportamento de sempre (host).
+  #
+  # Leia `docs/security/threat-model.md` §5.13 antes de ligar. Em resumo:
+  #   - Hoje SÓ a tool `bash` é envolvida. `run_tests`, `git_diff`,
+  #     `code_review` e `repo_search` continuam nascendo no host mesmo com
+  #     `mode: all`. Tracking na #1225 (slices S2/S3).
+  #   - `backend: ssh` NÃO é sandbox: é execução remota. Ele isola o host
+  #     local e nada mais, e NÃO consegue honrar `network_disabled` nem
+  #     `mount_workdir` — por isso, com `ssh`, as duas PRECISAM estar em
+  #     `false` explícito (o default é `true`), senão todo comando é recusado
+  #     fail-closed (#1225 S3). O `false` é o seu reconhecimento de que não há
+  #     isolamento de rede nem de mount ali.
+  #   - Na prática é unix. No Windows o bash tool usa `powershell -Command`,
+  #     que não reparseia o quoting POSIX do wrap.
+  #   - `elevated` é escape hatch: a tool listada roda NO HOST. Só é
+  #     duplamente gated com `tool_confirmation_enabled: true`.
+  # `garra config check` reporta Error para `mode != off` sem `backend`, para
+  # `backend: ssh` sem `ssh_host` e para `backend: ssh` com `network_disabled`
+  # ou `mount_workdir` em `true` — mas ele e um relatorio que voce roda, nao um
+  # gate de boot: o gateway sobe mesmo assim (e a recusa real acontece na hora
+  # de montar a policy e no wrap de cada comando, as duas fail-closed).
+  sandbox:
+    mode: all              # off (default) | all | allowlist
+    backend: podman        # docker | podman | ssh — rootless é o preferido
+    image: debian:bookworm-slim
+    network_disabled: true # com `backend: ssh` PRECISA ser false (senão recusa)
+    mount_workdir: true    # com `backend: ssh` PRECISA ser false (senão recusa)
+    # ssh_host: bastiao.interno   # obrigatório quando backend: ssh
+    # sandboxed_tools: ["bash"]   # usado só quando mode: allowlist
+    elevated: []           # tools que ESCAPAM do sandbox e rodam no host
   max_tool_calls: 50
+  # #1244: raízes que as file tools (`file_read`, `file_write`, `list_dir`)
+  # podem tocar, ALÉM do `working_dir` da sessão.
+  #
+  # Lista vazia (o padrão) NÃO é "tudo liberado": é "só o diretório da
+  # sessão", e uma sessão sem `working_dir` não lê nem escreve nada. Esse
+  # fail-closed é o padrão recomendado — deixe a chave de fora se você não
+  # tem um caso concreto.
+  #
+  # NUNCA coloque `/` nem o seu `$HOME` aqui: os dois devolvem `~/.ssh`,
+  # `~/.aws`, qualquer `.env` e este próprio arquivo ao alcance de um prompt
+  # que chegou pelo Telegram. `garra config check` avisa nos dois casos.
+  # A env `GARRAIA_FILE_ROOTS` (formato de PATH) soma às raízes daqui — e
+  # vale a mesma regra: `GARRAIA_FILE_ROOTS=/` desliga o jail tão bem quanto
+  # `file_roots: ["/"]`. O `config check` também valida a env, e o gateway
+  # nomeia as raízes no boot e emite `warn!` para cada uma que seja `/` ou o
+  # `$HOME`.
+  # file_roots:
+  #   - /srv/projetos/notas
 
 # Servidores MCP com política (escopo mínimo + limites + allowlist).
 # Receitas completas: docs/integrations/mcp-capacidades.md

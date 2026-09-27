@@ -15,11 +15,10 @@ Complementa (não substitui): [docs/security.md](security.md),
 
 ### Perfil A — loopback (default, recomendado)
 
-```yaml
-gateway:
-  host: "127.0.0.1"   # default do binário — só a própria máquina alcança
-  port: 3888
-```
+O bind vem da linha de comando: `--host`/`HOST` e `--port`/`PORT`, senao
+`127.0.0.1:3888` — so a propria maquina alcanca. `gateway.host` e
+`gateway.port` no arquivo estao **deprecados** e nunca foram lidos pelo
+`garraia start` (#1261); nao os escreva.
 
 Com bind em loopback, a superfície de rede é zero para terceiros. Os
 canais de mensageria (Telegram/Discord/…) continuam funcionando — eles
@@ -27,29 +26,38 @@ fazem *egress* para as APIs dos provedores; ninguém precisa alcançar a
 sua porta 3888. **Se você não tem um motivo concreto para expor o
 gateway, este perfil encerra o assunto.**
 
-Atenção: a env var `HOST` sobrescreve o bind (runtimes de container
-costumam setar `HOST=0.0.0.0`). Se o seu gateway apareceu em `0.0.0.0`
-sem você pedir, procure por essa variável no ambiente.
+Atenção: a env var `HOST` define o bind (runtimes de container
+costumam setar `HOST=0.0.0.0`). Desde a v0.4.5 um bind nao-loopback **sem
+credencial de gateway recusa o boot** (#1261) — se o `garraia start` saiu
+com `refusing to start`, procure por essa variavel no ambiente.
 
 ### Perfil B — exposto na rede (`0.0.0.0`) — requisitos mínimos
 
 Um gateway exposto sem autenticação é **execução remota de comandos
-aberta**: qualquer um que alcance a porta usa o tool `bash`. Se precisa
-expor, TODOS os itens abaixo são obrigatórios, não opcionais:
+aberta**: qualquer um que alcance a porta usa o tool `bash`. Por isso,
+desde a v0.4.5, o `garraia start` **recusa** um bind nao-loopback sem
+credencial (#1261; exit 78, com a mensagem de como corrigir). Suba com
+`HOST=0.0.0.0 garraia start` (ou `--host 0.0.0.0`) e TODOS os itens abaixo:
 
 ```yaml
 gateway:
-  host: "0.0.0.0"
-  port: 3888
-  # Valor LITERAL no arquivo (não há interpolação de env no config —
-  # gere com `openssl rand -hex 32` e proteja o arquivo com chmod 0600):
+  # Valor LITERAL no arquivo — ou, sem editar o arquivo, a env
+  # GARRAIA_GATEWAY_API_KEY, que vence o arquivo e nunca e gravada nele.
+  # Gere com `openssl rand -hex 32` e proteja o arquivo com chmod 0600:
   api_key: "<token-forte-aqui>"
   # NÃO adicione `session_tokens_required: true`: o flag NÃO está implementado
   # (nenhuma rota HTTP valida token de sessão hoje) e o gateway RECUSA subir
   # com ele ligado, em vez de fingir proteção. Ver "Limitações conhecidas" §2.
   session_ttl_secs: 86400         # validade do token (1 dia)
   session_idle_secs: 3600         # corte por inatividade (1h)
-  allowed_origins:                # vazio = allow-all; liste explicitamente
+  # vazio = nenhuma origem cross-origin (default seguro desde #1182). Se o
+  # console é alcançado por NOME DNS — reverse proxy com domínio próprio,
+  # mDNS `.local`, Tailscale, nome de serviço Docker, ingress —, liste a
+  # origem aqui; sem isso, POST/PATCH/DELETE e o WebSocket do chat vindos do
+  # navegador contra esse nome são recusados com 403 pela guarda anti-CSRF
+  # (`origin_guard`), e a resposta não carrega `Access-Control-Allow-Origin`.
+  # Por IP ou localhost nada é necessário. `*` não é aceito.
+  allowed_origins:
     - "https://seu-dominio.exemplo"
   rate_limit:
     per_second: 1
@@ -61,11 +69,34 @@ gateway:
   suportado hoje é um **reverse proxy com TLS** (Caddy/nginx/Traefik) na
   frente do gateway em loopback — ou seja, muitas vezes o Perfil A + um
   proxy exposto resolve melhor que `0.0.0.0` direto.
+  **Interação com a guarda anti-CSRF (#1182), quebra conhecida e deliberada**:
+  a guarda ancora o anti-DNS-rebinding em "IP literal, `localhost` ou nome
+  declarado em `allowed_origins`" — então **qualquer acesso ao console por
+  nome DNS** exige o nome na lista: reverse proxy com domínio próprio, mas
+  também mDNS (`http://nas.local:3888`), Tailscale MagicDNS, nome de serviço
+  Docker/Compose e ingress do Kubernetes. No reverse proxy há um agravante: o
+  navegador manda `Origin: https://seu-dominio.exemplo`, o proxy repassa
+  `Host: seu-dominio.exemplo`, mas o gateway por baixo fala `http` — a
+  comparação de esquema recusa antes mesmo da âncora. **A correção é listar
+  a origem em `allowed_origins`**, com o esquema que o navegador vê: uma
+  origem declarada ali é aceita como tal e destrava CORS, guarda e o
+  handshake do WebSocket do chat (`/ws`) de uma vez. Sem isso,
+  `POST`/`PATCH`/`DELETE` do navegador voltam 403 e o chat do console não
+  conecta — e note que `gateway.api_key` **não** substitui a lista: a guarda
+  roda igual com a chave configurada, de propósito (um bearer válido não
+  dispensa a origem certa, senão o CSRF voltaria contra um dono autenticado).
+  É o preço de fechar o CSRF do perfil default (loopback, sem chave), que é a
+  instalação da esmagadora maioria. As receitas de proxy do
+  `docs/src/production-runbook.md` §2 já trazem a linha.
 - **Métricas**: mantenha `GARRAIA_METRICS_BIND=127.0.0.1:9464` e use
   `GARRAIA_METRICS_TOKEN`/`GARRAIA_METRICS_ALLOW` se precisar raspar de
   fora (ver `.env.example`).
-- Verifique com `garra config check` após editar — ele valida o schema e
-  reporta a precedência efetiva.
+- Verifique com `garraia config check` após editar — ele valida o schema e
+  reporta a precedência efetiva. Desde a v0.4.5 o mesmo check roda em todo
+  `garraia start`/`restart`/`start -d` (#1247): os achados vão para o log,
+  e TLS configurado pela metade (só `tls_cert_path` ou só `tls_key_path`)
+  **recusa o boot** com exit 78 em vez de servir HTTP puro em silêncio.
+  Escotilha consciente: `GARRAIA_ALLOW_INVALID_CONFIG=1` (exatamente `1`).
 
 ## 2. Confirmação humana para comandos arriscados
 
@@ -87,10 +118,33 @@ agent:
   max_tool_calls: 50   # teto de chamadas de tool por tarefa
 ```
 
+**Como o "sim" e retomado (#1343).** Antes da v0.4.5 a pausa era terminal
+em todo canal de producao: o historico e guardado como texto, o pedido
+pausado nao voltava no turno seguinte e o "sim" nunca aprovava. Agora o
+gateway guarda o pedido em memoria e o "sim" (a mensagem inteira) da
+mensagem seguinte roda o pedido **uma vez**, dentro de 5 minutos, e so se
+vier do **mesmo remetente**, na **mesma sessao** e no **mesmo canal**:
+
+| Caminho | Quem pode aprovar |
+|---|---|
+| Web Console (`/ws`) e desktop (`/ws/parrot`) | a mesma conexao WebSocket — reconectou (ou retomou a sessao em outra aba), pergunta de novo |
+| `/v1/chat/completions` | o dono da allowlist **com o mesmo** `Authorization` **e a mesma** `X-Session-Id` nos dois requests — sem `X-Session-Id` cada request e uma sessao nova e o "sim" nao retoma; sem dono reivindicado, a pausa e terminal. Vale igual com e sem `"stream": true`. A `X-Session-Id` so alcanca sessao das superficies locais do operador (`api`, `vscode`, `web`, `parrot`): o id de uma sessao de canal ou do mobile responde `404` e nao e tocado (#1462) |
+| App mobile (`POST /chat`) | o `sub` do JWT |
+| Telegram, Discord, Slack, WhatsApp Cloud, Matrix, IRC, Signal, LINE, Teams, Google Chat, iMessage, WhatsApp pessoal | o id do usuario na plataforma; em grupo, o "sim" de outro membro nao aprova e encerra o pedido |
+| `garraia chat` | o proprio terminal, na mesma sessao |
+
+Continuam **sem** retomada, e ali a pausa e terminal de proposito: A2A,
+OpenClaw, `POST /api/sessions/{id}/messages`, a resposta do agente no chat
+do workspace (`rest_v1`), as tarefas agendadas (`process_heartbeat`),
+`garraia ask` e o `garra_agent` do `garraia mcp-server` — ou quem fala e
+outro agente, ou nao ha remetente que o servidor possa provar. Qualquer mensagem no meio encerra o pedido, e
+reiniciar o gateway cancela todos. Detalhes em
+[`security/threat-model.md`](security/threat-model.md) §5.16.
+
 ## 3. Restringir tools por contexto: modos (ToolPolicy)
 
 Cada modo de execução carrega uma allow/deny-list de tools
-(`crates/garraia-runtime/src/mode.rs`) — este é o mecanismo legítimo
+(`crates/garraia-agents/src/modes.rs`) — este é o mecanismo legítimo
 para "menos poder por padrão":
 
 | Modo | Tools permitidas |
@@ -151,11 +205,19 @@ Arquivo completo comentado, validado com `garra config check`:
 
 ## Limitações conhecidas (honestas)
 
-1. `gateway.api_key` só aceita valor literal no arquivo — não há
-   interpolação de env no config (a linha `GARRAIA_API_KEY` do
-   `.env.example` é aspiracional; suportá-la de verdade é follow-up).
-2. Auth do gateway local: com `gateway.api_key` definido, o gate cobre o
-   WebSocket `/ws` **e** o REST `/api/*` (#1045). Sem a chave definida,
+1. `gateway.api_key` não tem interpolação de env no arquivo, mas desde a
+   v0.4.5 a env `GARRAIA_GATEWAY_API_KEY` entrega a credencial sem editar o
+   arquivo (vence o arquivo, nunca é gravada nele; #1261). O `.env.example`
+   traz a linha `GARRAIA_GATEWAY_API_KEY=` vazia de proposito (placeholder
+   seria chave conhecida por todos; vazia conta como ausente e o container
+   recusa subir): preencha com `openssl rand -hex 32` antes do primeiro
+   `docker compose up`.
+   Deploy aberto de proposito atras de proxy que autentica:
+   `gateway.allow_unauthenticated_network_bind: true` (so no arquivo, sem
+   env nem flag; aviso alto em todo boot).
+2. Auth do gateway local: com `gateway.api_key` definido, o gate cobre os
+   WebSockets `/ws` e `/ws/parrot` **e** o REST `/api/*` (#1045; o
+   `/ws/parrot` desde a auditoria R4 do PR #1251). Sem a chave definida,
    nada é exigido — é o comportamento de sempre, e é o adequado para um
    gateway em loopback.
 
@@ -165,15 +227,72 @@ Arquivo completo comentado, validado com `garra config check`:
    `/api/auth-check`, que é como o console web descobre que precisa
    pedi-la. As três são secret-free.
 
-   **Ainda sem gate por api_key:** `/v1/chat/completions`, `/v1/messages`
-   e `/a2a/*` — proteja-as por topologia (loopback, firewall, reverse
-   proxy). As rotas `/v1/*` do workspace têm autenticação JWT própria, e
-   `/admin/*` tem cookie de sessão.
+   **Desde a #1240 o gate também cobre o plano de conversa e o A2A:**
+   `POST /v1/chat/completions`, `POST /v1/messages`,
+   `POST /v1/messages/count_tokens` e todo o `/a2a/*` (por prefixo). Eram
+   a lacuna mais cara que existia: montadas no mesmo router cru que
+   `/api/*`, sem resolução de identidade nenhuma, e é por elas que o
+   runtime executa as tools do GarraIA na máquina do dono. Quem
+   configurava a chave acreditava tê-las fechado.
 
-   A chave vai **só** no header `Authorization: Bearer` no REST. Na query
-   string ela é aceita apenas pelo `/ws`, porque o handshake WebSocket de
-   um navegador não permite header; no REST, chave em query acabaria em
-   log de acesso e no span de tracing.
+   **E o socket do papagaio (`/ws/parrot`), desde a auditoria R4 do PR
+   #1251.** Ele roda um turno completo do agente — com as tools e a chave
+   de LLM do dono — sobre a sessão persistente do desktop, e até então a
+   única guarda da rota era o anti-CSRF da #1182, que passa **de
+   propósito** quando não há header `Origin`: cliente não-navegador (app,
+   CLI, `curl`) não manda um. Com a chave configurada e o gateway em
+   `0.0.0.0` — o cenário do §2 —, um `websocat ws://host:3888/ws/parrot`
+   conectava sem credencial nenhuma e dirigia o agente. O irmão `/ws`,
+   montado na linha de cima do `router.rs`, já checava a chave.
+
+   A checagem do `/ws/parrot` mora **dentro do handler**, e não na lista
+   de caminhos do middleware, por um motivo que não é óbvio: o middleware
+   só lê header, e a webview Tauri abre o overlay com
+   `new WebSocket(...)`, que não consegue mandar header nenhum. Gatear a
+   rota no middleware fecharia o Garra Desktop em vez de autenticá-lo.
+   Como no `/ws`, a chave é aceita por `?token=` / `?api_key=` — e também
+   por `Authorization: Bearer`, para o cliente de CLI que consegue
+   mandá-lo.
+
+   Continuam abertas, por serem descoberta e não execução: `/v1/models` e
+   `/.well-known/agent.json`, além de `/health` e `/ping`. As rotas
+   `/v1/*` do workspace (`rest_v1`) e o `/v1/auth/*` seguem **fora** deste
+   eixo — têm autenticação JWT própria, e `/admin/*` tem cookie de
+   sessão.
+
+   **Sessão por id — duas leituras, duas credenciais (#1462).** Um id de
+   sessão que o cliente escolhe (`X-Session-Id`, o `{id}` de
+   `/api/sessions/{id}/*`, o `resume` sem token do `/ws`) só alcança sessão
+   das superfícies locais do operador (`api`, `vscode`, `web`, `parrot`);
+   sessão de canal (WhatsApp, Telegram, Discord…) ou do mobile responde o
+   mesmo `404` de id inexistente — na leitura e na escrita, em memória e no
+   `sessions.db` — e `GET /api/sessions` só lista as locais. Quem precisa
+   ler qualquer sessão (o Export do Web Console, por exemplo) usa
+   `GET /admin/api/sessions/{id}/history`, com o cookie de sessão do
+   `/admin` e a permissão `manage_sessions` (`admin` e `operator`; `viewer`
+   recebe 403), que lê sem hidratar e deixa registro na auditoria. A chave
+   de `gateway.api_key` continua sendo a fronteira de rede do `/api/*`, mas
+   não substitui esta regra: é uma chave única compartilhada por toda a
+   LAN, e os ids de canal são adivinháveis por construção.
+   A politica de acesso do WhatsApp pessoal segue o mesmo desenho: `GET|POST
+   /admin/api/whatsapp/access` e `GET /admin/api/whatsapp/access/audit` (cookie +
+   CSRF; leitura `Channels/Read`, mutacao `Channels/Update`), pelo mesmo motor e
+   com o mesmo audit da CLI (ADR 0025). A API nunca revela identidade. O
+   `GET /admin/api/whatsapp/doctor` (#1420, `Channels/Read`) roda o motor do
+   `garraia doctor whatsapp` em processo e devolve so contagens, origens e
+   nomes — nunca chave de sessao, chave de API, numero ou LID.
+
+   **A #1240 não fechou nada por default.** Sem a chave configurada, todas
+   essas rotas respondem exatamente como antes.
+
+   A chave vai **só** no header `Authorization: Bearer` no REST — com uma
+   alternativa nas duas rotas compat Anthropic (`/v1/messages`,
+   `/v1/messages/count_tokens`), que aceitam também `x-api-key`, porque o
+   Claude Code e o SDK da Anthropic nunca mandam bearer. Na query string
+   ela é aceita apenas pelos dois handshakes de WebSocket (`/ws` e
+   `/ws/parrot`), porque o handshake WebSocket de um navegador não
+   permite header; no REST, chave em query acabaria em log de acesso e no
+   span de tracing.
 
    `session_tokens_required` **não está implementado**: o middleware nunca
    foi ligado ao router, e desde a investigação da issue #930 o gateway

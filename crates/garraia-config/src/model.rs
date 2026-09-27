@@ -1,3 +1,4 @@
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -48,6 +49,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub fs: FsConfig,
 
+    /// #1227 (slice 5): retencao do ledger de runs de agente
+    /// (`agent_runs`). Secao de topo, e nao `agents.runs_retention_days`:
+    /// `agents` e um mapa de agentes nomeados, e a chave viraria um agente.
+    #[serde(default)]
+    pub runs: RunsConfig,
+
     /// GAR-379 slice 2 (plan 0042) — typed overrides for the mobile
     /// chat stack. Currently carries only the assistant persona; future
     /// slices will fold in more mobile-specific runtime knobs.
@@ -65,6 +72,19 @@ pub struct AppConfig {
     /// (plan 0046 §5.1) — see [`crate::AuthConfig`] for the env contract.
     #[serde(default)]
     pub auth: AuthSection,
+
+    /// ADR 0020 / #1126 — transporte de hardware (adapter MQTT). `None`
+    /// (o default) = nenhum transporte compilado/configurado; o registry
+    /// de dispositivos segue vazio (fail-closed).
+    #[serde(default)]
+    pub hardware: HardwareConfig,
+
+    /// ADR 0024 / #1329 — perfil de execucao (`standard` | `isolated-pod`).
+    /// Secao ausente = `standard` = comportamento de hoje. A env
+    /// `GARRAIA_EXECUTION_PROFILE` vence o arquivo e e aplicada pelo
+    /// `ConfigLoader`, nunca por `Default`. Ver [`crate::execution`].
+    #[serde(default)]
+    pub execution: crate::execution::ExecutionConfig,
 }
 
 impl Default for AppConfig {
@@ -83,11 +103,98 @@ impl Default for AppConfig {
             voice: VoiceConfig::default(),
             timeouts: TimeoutConfig::default(),
             fs: FsConfig::default(),
+            runs: RunsConfig::default(),
             mobile: MobileConfig::default(),
             storage: StorageConfig::default(),
             auth: AuthSection::default(),
+            hardware: HardwareConfig::default(),
+            execution: crate::execution::ExecutionConfig::default(),
         }
     }
+}
+
+/// ADR 0020 / #1126 — configuração do transporte de hardware.
+///
+/// Hoje os adapters MQTT e Home Assistant; adapters futuros (#1130
+/// Serial/GPIO) entram como campos aditivos desta seção.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HardwareConfig {
+    /// Adapter MQTT (rumqttc). `None` = sem MQTT — o gateway não sobe o
+    /// loop de descoberta e o registry fica vazio (fail-closed).
+    #[serde(default)]
+    pub mqtt: Option<MqttConfig>,
+    /// Adapter Home Assistant (REST + WebSocket). `None` = sem HA — o
+    /// registry não ganha as entidades do hub (fail-closed).
+    #[serde(default)]
+    pub home_assistant: Option<HaConfig>,
+    /// Motor de automações (#1128). `None` = sem automações — o motor não
+    /// sobe e nenhum arquivo de regra é lido (fail-closed).
+    #[serde(default)]
+    pub automations: Option<AutomationsConfig>,
+}
+
+/// ADR 0020 / #1128 — configuração do motor de automações.
+///
+/// As regras são arquivos declarativos TOML/JSON versionáveis no `dir`; o
+/// teto de risco (`risk_ceiling`) é a policy do que uma automação pode
+/// pedir — o análogo dos modos do runtime para quem não está no chat. R3 e
+/// acima **não é configurável**: automação roda desacompanhada, não há quem
+/// confirme (approval que ninguém pode dar não é approval).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationsConfig {
+    /// Diretório com os arquivos de regras (`*.toml`/`*.json`). Caminho
+    /// relativo resolve contra o data dir efetivo (ver
+    /// [`AppConfig::automations_dir`]).
+    pub dir: String,
+    /// Teto de risco das execuções: `"r0"`, `"r1"` ou `"r2"`. Default
+    /// `"r1"` — power/brightness/temperature sem confirmação; covers só
+    /// com o teto explicitamente em `"r2"`.
+    #[serde(default = "default_risk_ceiling")]
+    pub risk_ceiling: String,
+}
+
+fn default_risk_ceiling() -> String {
+    "r1".to_string()
+}
+
+/// Conexão com o broker MQTT (#1126). Credencial de senha é **write-only**:
+/// config carrega o nome da env var, nunca o valor — mesma disciplina do
+/// settings registry ("secrets are write-only — value never echoed back").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MqttConfig {
+    /// Endereço do broker, `host:port` (ex.: `"127.0.0.1:1883"`).
+    pub broker: String,
+    /// Usuário do broker, quando o broker exige autenticação.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Nome da env var que guarda a senha. `None` = conexão anônima
+    /// (aceitável em brokers locais sem ACL).
+    #[serde(default)]
+    pub password_env: Option<String>,
+    /// Prefixo do client id MQTT (o pid completa a unicidade). Default
+    /// `"garra"`.
+    #[serde(default = "default_mqtt_client_prefix")]
+    pub client_id_prefix: String,
+}
+
+fn default_mqtt_client_prefix() -> String {
+    "garra".to_string()
+}
+
+/// Conexão com o Home Assistant (#1127). O `token_env` é **obrigatório** —
+/// a API do HA não tem modo anônimo e o long-lived access token é
+/// credencial de admin do hub. Write-only como o resto: config carrega o
+/// nome da env, o boot resolve o valor e **nunca loga**.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaConfig {
+    /// URL base do HA, com esquema e porta (`"http://homeassistant.local:8123"`).
+    /// A chamada REST passa pelo guard de SSRF (`vet_url` + `pinned_client`
+    /// com `IpScope::AllowPrivate` — o HA é alvo legítimo da LAN, e o guard
+    /// ainda bloqueia link-local/CGNAT/multicast).
+    pub url: String,
+    /// Nome da env var que guarda o long-lived access token. Obrigatório
+    /// e não vazio — sem token, o adapter nem sobe.
+    pub token_env: String,
 }
 
 /// Non-secret auth knobs (plan 0046 / GAR-379 slice 3).
@@ -313,8 +420,21 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub session_tokens_required: bool,
 
-    /// Allowed CORS origins. Empty = allow all (dev mode).
-    /// Example: ["https://app.garraia.org", "http://localhost:3888"]
+    /// Allowed CORS origins. Vazio = nenhuma origem cross-origin
+    /// (same-origin apenas, default seguro desde #1182). O Web Console e
+    /// servido pelo proprio gateway (`GET /`) e e same-origin, entao por IP
+    /// ou `localhost` ele **nao** precisa desta lista.
+    ///
+    /// A lista tem dois efeitos: o `Access-Control-Allow-Origin` do CORS e a
+    /// ancora anti-DNS-rebinding da guarda anti-CSRF
+    /// (`garraia_gateway::origin_guard`) — um **nome DNS** so atravessa a
+    /// ancora se estiver aqui. Isso vale para qualquer nome pelo qual o
+    /// console seja alcancado: reverse proxy com dominio proprio, mDNS
+    /// (`nas.local`), Tailscale, nome de servico Docker, ingress. Sem a
+    /// entrada, POST/PATCH/DELETE e o WebSocket do chat vindos do navegador
+    /// contra esse nome voltam 403. Entrada `*` e ignorada com aviso.
+    ///
+    /// Example: ["https://app.garraia.org", "http://nas.local:3888"]
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 
@@ -325,6 +445,64 @@ pub struct GatewayConfig {
     /// Path to TLS private key file (PEM).
     #[serde(default)]
     pub tls_key_path: Option<String>,
+
+    /// #1261: opt-out explicito da recusa de boot em bind nao-loopback sem
+    /// credencial de gateway. Para a implantacao que e aberta **de
+    /// proposito**, atras de um proxy que autentica ou de um firewall.
+    ///
+    /// So existe no arquivo, de proposito: nao ha env nem flag, para que a
+    /// mesma injecao de `HOST` que expoe o bind nao consiga tambem desligar a
+    /// guarda. Cada boot com ele ligado sai com aviso alto, e o
+    /// `garraia config check` sempre o reporta como Warning.
+    #[serde(default)]
+    pub allow_unauthenticated_network_bind: bool,
+
+    /// #1261: a credencial vinda de `GARRAIA_GATEWAY_API_KEY`, aplicada por
+    /// [`crate::ConfigLoader::load`].
+    ///
+    /// Campo a parte, e nao escrita por cima de [`Self::api_key`], por um
+    /// motivo concreto: o `load()` alimenta caminhos que **salvam** a config
+    /// de volta (`ConfigLoader::set_channel_enabled`, o wizard, o console). Um
+    /// segredo de env copiado para `api_key` iria parar no `config.yml` na
+    /// primeira dessas escritas. `serde(skip)` garante que ele nunca e lido
+    /// do arquivo nem escrito nele, e o `SecretString` o esconde do `Debug`.
+    #[serde(skip)]
+    pub api_key_env: Option<SecretString>,
+}
+
+impl GatewayConfig {
+    /// A credencial de gateway **normalizada**: `None` quando o campo esta
+    /// ausente, vazio ou so com espaco em branco.
+    ///
+    /// Fonte unica da regra "ha gate de `/api/*` e de `/ws`?" (#1241). Antes
+    /// dela, tres superficies respondiam coisas diferentes para o mesmo
+    /// `api_key: "  "`: o gate (`garraia_gateway::gateway_auth::ApiKeyGate`)
+    /// ficava desligado, enquanto `garra config check` e o
+    /// `GET /api/settings/effective` do Web Console diziam `configured:
+    /// true` — falsa garantia justamente para quem foi consultar o
+    /// diagnostico. Qualquer consumidor novo deve chamar isto em vez de
+    /// `api_key.is_some()`.
+    ///
+    /// #1261: `GARRAIA_GATEWAY_API_KEY` (em [`Self::api_key_env`]) vence o
+    /// arquivo, na mesma precedencia env-sobre-arquivo dos outros segredos.
+    pub fn api_key_normalizada(&self) -> Option<&str> {
+        let do_env = self
+            .api_key_env
+            .as_ref()
+            .map(|s| s.expose_secret().trim())
+            .filter(|k| !k.is_empty());
+        do_env.or_else(|| {
+            self.api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+        })
+    }
+
+    /// Acucar para [`Self::api_key_normalizada`] quando so a presenca importa.
+    pub fn api_key_configurada(&self) -> bool {
+        self.api_key_normalizada().is_some()
+    }
 }
 
 fn default_session_ttl_secs() -> i64 {
@@ -347,6 +525,8 @@ impl Default for GatewayConfig {
             allowed_origins: Vec::new(),
             tls_cert_path: None,
             tls_key_path: None,
+            allow_unauthenticated_network_bind: false,
+            api_key_env: None,
         }
     }
 }
@@ -436,6 +616,48 @@ impl AppConfig {
     pub fn memory_db_path(&self) -> std::path::PathBuf {
         self.resolved_data_dir().join("memory.db")
     }
+
+    /// Caminho do banco de estado de hardware (presenca online/offline dos
+    /// dispositivos, #1126).
+    ///
+    /// Fonte **unica**, mesmo contrato do `memory_db_path`: gateway e CLI
+    /// precisam abrir o mesmo arquivo, senao a CLI listaria offline um
+    /// dispositivo que o gateway acabou de ver online — e cada processo
+    /// reconectado do adapter reescreveria so a sua copia.
+    pub fn hardware_db_path(&self) -> std::path::PathBuf {
+        self.resolved_data_dir().join("hardware.db")
+    }
+
+    /// Caminho do banco de automações (#1128) — retrato das regras no ar e
+    /// auditoria de execuções. Mesmo contrato do `hardware_db_path`: fonte
+    /// única, a CLI e o gateway abrem o mesmo arquivo.
+    pub fn automations_db_path(&self) -> std::path::PathBuf {
+        self.resolved_data_dir().join("automations.db")
+    }
+
+    /// O diretório das regras de automação (#1128), já resolvido: caminho
+    /// absoluto vence; relativo resolve contra o data dir efetivo. `None`
+    /// quando a seção `hardware.automations` não existe — sem seção, o
+    /// motor não sobe.
+    pub fn automations_dir(&self) -> Option<std::path::PathBuf> {
+        self.hardware.automations.as_ref().map(|a| {
+            let caminho = std::path::Path::new(&a.dir);
+            if caminho.is_absolute() {
+                caminho.to_path_buf()
+            } else {
+                self.resolved_data_dir().join(caminho)
+            }
+        })
+    }
+
+    /// O teto de risco declarado, já validado pela forma canônica. `None`
+    /// quando a seção não existe.
+    pub fn automations_risk_ceiling(&self) -> Option<&str> {
+        self.hardware
+            .automations
+            .as_ref()
+            .map(|a| a.risk_ceiling.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +677,24 @@ pub struct MemoryConfig {
     /// O que merece vetor na ingestao (#952).
     #[serde(default)]
     pub ingestion: IngestionConfig,
+
+    /// Auto-learning de fatos: liga/desliga a chamada LLM **extra** que roda
+    /// a cada turno do usuário para extrair `[FACT]`s para o `memory.db`
+    /// (`MemoryExtractor::extract_facts`). Default `true` — preserva o
+    /// comportamento atual; `false` economiza uma chamada por turno sem
+    /// desligar a memória semântica inteira. (TODO 2026-09-02.)
+    #[serde(default = "default_memory_auto_extract")]
+    pub auto_extract: bool,
+
+    /// Teto de fatos gravados **por turno** (após o filtro de confiança
+    /// minima de 0.80), mantendo os de maior confidence. `None` = sem teto
+    /// (comportamento histórico).
+    #[serde(default)]
+    pub max_facts: Option<u32>,
+}
+
+fn default_memory_auto_extract() -> bool {
+    true
 }
 
 impl Default for MemoryConfig {
@@ -465,6 +705,8 @@ impl Default for MemoryConfig {
             shared_continuity: false,
             retention: RetentionConfig::default(),
             ingestion: IngestionConfig::default(),
+            auto_extract: default_memory_auto_extract(),
+            max_facts: None,
         }
     }
 }
@@ -582,6 +824,27 @@ fn default_retention_interval_hours() -> u32 {
     24
 }
 
+/// #1227 (slice 5): politica de retencao do ledger `agent_runs`.
+///
+/// **`retention_days: 0` (o default) = nunca apaga.** O ledger e auditoria;
+/// ligar uma varredura por default numa atualizacao apagaria historico de
+/// quem so quis atualizar a versao — o mesmo raciocinio da
+/// `memory.retention`. Com 0 o gateway avisa uma vez no boot quantos runs
+/// existem e como ligar. Run `running` nunca e apagado, qualquer que seja a
+/// idade.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunsConfig {
+    /// Idade (em dias, contada do fim do run) a partir da qual um run
+    /// terminal sai do ledger. `0` = desligado. Faixa aceita: `0` ou
+    /// `1..=`[`RUNS_RETENTION_MAX_DAYS`], cobrada pelo `garraia config check`.
+    #[serde(default)]
+    pub retention_days: u32,
+}
+
+/// Teto de `runs.retention_days`. Acima de 10 anos o numero deixa de ser
+/// politica e vira "nunca", que se escreve com `0`.
+pub const RUNS_RETENTION_MAX_DAYS: u32 = 3650;
+
 /// Plan 0250 (GAR-771): default voice Garra uses when no `system_prompt` is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -635,6 +898,19 @@ pub struct AgentConfig {
     /// command, which is the risky tier switched off — not a pattern.
     #[serde(default)]
     pub bash_allowlist: Vec<String>,
+    /// #1244: raizes adicionais que as file tools (`file_read`, `file_write`,
+    /// `list_dir`) podem tocar, alem do `working_dir` da sessao.
+    ///
+    /// Lista vazia (o default) **nao** significa "tudo liberado": significa que
+    /// so o diretorio da sessao autoriza alguma coisa, e uma sessao sem
+    /// `working_dir` nao le nem escreve nada. Fail-closed de proposito — sem
+    /// raiz conhecida nao ha como afirmar que um caminho e seguro.
+    ///
+    /// Caminho que nao existe e descartado com `warn!` no boot. `garra config
+    /// check` avisa quando a lista inclui `/` ou o proprio `$HOME`, que
+    /// devolvem `~/.ssh` e `.env` ao alcance do modelo.
+    #[serde(default)]
+    pub file_roots: Vec<String>,
     /// GAR-227: When true, a short LLM call classifies the user's intent into an agent mode
     /// (code/debug/review/search/architect/ask) when the keyword heuristic is ambiguous.
     /// Requires a working LLM provider. Default: false (opt-in).
@@ -669,6 +945,14 @@ pub struct AgentConfig {
     /// Brave resolve (`llm.brave.api_key`, cofre ou `BRAVE_API_KEY`).
     #[serde(default)]
     pub web_search: WebSearchConfig,
+    /// #1225: secao `agent.sandbox` — a chave que faltava para o sandbox por
+    /// tool entregue na #1222 ser alcancavel. Ate aqui `SandboxPolicy` so era
+    /// construida pelo `default()` (= `off`) nos tres pontos de producao, e
+    /// `set_sandbox_policy` so era chamado pelos proprios testes: a
+    /// funcionalidade existia, era testada, e nenhum operador conseguia
+    /// liga-la. Ausente => `mode = off` => comportamento identico ao de antes.
+    #[serde(default)]
+    pub sandbox: crate::sandbox::SandboxConfig,
 }
 
 /// Backend da tool `web_search` (#1034).
@@ -954,6 +1238,17 @@ fn default_transport() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// Shell command to run (stdio transport).
+    ///
+    /// #1274: `default` — an HTTP/SSE entry of `mcp.json` has no `command`
+    /// and is legitimate. Requiring it here made `load_mcp_json` silently
+    /// drop such entries, so the operator's `allowed_tools` never reached
+    /// the declared merge the admin restart reads, and a restart reconnected
+    /// the server with every tool exposed. A stdio entry without a command
+    /// is still refused — now explicitly, at the merge boundary (the loader)
+    /// and at the boot arm (bootstrap) — because a defaulted `String` can no
+    /// longer carry that guarantee by type.
+    #[serde(default)]
     pub command: String,
 
     #[serde(default)]
@@ -972,6 +1267,14 @@ pub struct McpServerConfig {
     pub enabled: Option<bool>,
 
     /// Connection timeout in seconds (default: 30)
+    ///
+    /// #1273: deliberately NO `alias = "timeoutSecs"` here. The gateway's
+    /// registry writer emits `timeoutSecs` on every entry with its own
+    /// default (30) even when the operator never chose a timeout; aliasing
+    /// it would silently override `timeouts.mcp.default_secs` at boot for
+    /// exactly those servers. The tuning fields below are only written when
+    /// explicitly set (`skip_serializing_if`), so aliasing them is pure
+    /// round-trip fidelity.
     pub timeout: Option<u64>,
 
     /// GAR-190: Tool allowlist — only these tool names are registered into the agent runtime.
@@ -990,22 +1293,73 @@ pub struct McpServerConfig {
     /// GAR-293: Maximum virtual-memory limit for the child process (Unix only).
     /// Applied via `setrlimit(RLIMIT_AS)` before exec. No effect on Windows.
     /// Default: `None` (no limit).
+    ///
+    /// `alias = "memoryLimitMb"` (#1273): the gateway's registry writer
+    /// spells this field in camelCase; accepting both spellings is what
+    /// keeps an admin-written file's tuning values alive across a boot.
+    #[serde(alias = "memoryLimitMb")]
     pub memory_limit_mb: Option<u64>,
 
     /// GAR-293: Maximum number of automatic restart attempts after a crash.
     /// When exceeded, the server stays offline until manually restarted via the admin API.
     /// Default: `5`.
+    #[serde(alias = "maxRestarts")]
     pub max_restarts: Option<u32>,
 
     /// GAR-293: Base delay in seconds before the first restart attempt.
     /// Each subsequent attempt doubles the delay (exponential backoff), capped at 300s.
     /// Default: `5`.
+    #[serde(alias = "restartDelaySecs")]
     pub restart_delay_secs: Option<u64>,
+
+    /// #1075 (continuação): válvula de escape para o isolamento de ambiente.
+    ///
+    /// Por padrão (`false`) o processo do servidor MCP é iniciado com o
+    /// ambiente construído do zero — allowlist mínima do gateway (`PATH`,
+    /// `HOME`, locale, temp) mais o mapa `env` deste servidor. Segredos do
+    /// gateway (`GARRAIA_JWT_SECRET`, chaves de provider, passphrase do
+    /// cofre) **não** chegam ao filho.
+    ///
+    /// `true` restaura o comportamento antigo e entrega ao filho o ambiente
+    /// inteiro do gateway, segredos inclusive. Existe apenas para destravar
+    /// um servidor legado enquanto o operador migra as variáveis para `env`,
+    /// e é registrado com `warn!` a cada conexão.
+    ///
+    /// ```yaml
+    /// mcp:
+    ///   meu-servidor:
+    ///     env:
+    ///       GITHUB_TOKEN: ghp_...
+    ///     inherit_env: false   # default
+    /// ```
+    #[serde(default)]
+    pub inherit_env: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::AppConfig;
+
+    /// TODO 2026-09-02: knobs do auto-learning. O default preserva o
+    /// comportamento histórico (extração ligada, sem teto) e o YAML aceita
+    /// os dois campos.
+    #[test]
+    fn memory_auto_extract_defaults_on_and_parses_from_yaml() {
+        let padrao = super::MemoryConfig::default();
+        assert!(padrao.auto_extract);
+        assert_eq!(padrao.max_facts, None);
+
+        let config: AppConfig =
+            serde_yaml::from_str("memory:\n  auto_extract: false\n  max_facts: 3\n")
+                .expect("yaml should parse");
+        assert!(!config.memory.auto_extract);
+        assert_eq!(config.memory.max_facts, Some(3));
+
+        // Seção ausente => defaults (não panic nem inverta o default).
+        let config: AppConfig = serde_yaml::from_str("agent: {}\n").expect("yaml should parse");
+        assert!(config.memory.auto_extract);
+        assert_eq!(config.memory.max_facts, None);
+    }
 
     /// #962: o timeout de embeddings tem default proprio (30s) e NAO herda
     /// o do LLM (120s) — herdar era exatamente o bug, porque uma chamada que
@@ -1029,6 +1383,47 @@ mod tests {
         assert!(config.memory.enabled);
         assert!(!config.memory.shared_continuity);
         assert!(config.embeddings.is_empty());
+    }
+
+    /// #1126: os dois bancos de estado vivem sob o mesmo data_dir resolvido,
+    /// e cada um tem o nome que a doc declara — `memory.db` para a memoria
+    /// semantica, `hardware.db` para a presenca dos dispositivos. A CLI e o
+    /// gateway leem destes metodos, nunca montam o caminho na mao.
+    #[test]
+    fn db_paths_live_under_the_resolved_data_dir() {
+        let config = AppConfig::default();
+        let dir = config.resolved_data_dir();
+        assert_eq!(config.memory_db_path(), dir.join("memory.db"));
+        assert_eq!(config.hardware_db_path(), dir.join("hardware.db"));
+
+        // E o data_dir explicito vence — a resolucao e a mesma para os dois.
+        let custom = AppConfig {
+            data_dir: Some(std::path::PathBuf::from("/tmp/garra-data")),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            custom.hardware_db_path(),
+            std::path::PathBuf::from("/tmp/garra-data/hardware.db")
+        );
+    }
+
+    /// #1128: o banco de automações segue o mesmo contrato — `automations.db`
+    /// sob o data_dir resolvido, fonte única para gateway e CLI.
+    #[test]
+    fn automations_db_path_lives_under_the_resolved_data_dir() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.automations_db_path(),
+            config.resolved_data_dir().join("automations.db")
+        );
+        let custom = AppConfig {
+            data_dir: Some(std::path::PathBuf::from("/tmp/garra-data")),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            custom.automations_db_path(),
+            std::path::PathBuf::from("/tmp/garra-data/automations.db")
+        );
     }
 
     #[test]
@@ -1090,5 +1485,101 @@ embeddings:
         assert_eq!(cohere.provider, "cohere");
         assert_eq!(cohere.model.as_deref(), Some("embed-english-v3.0"));
         assert_eq!(cohere.dimensions, Some(1024));
+    }
+
+    // ── ADR 0020 / #1126: seção `hardware:` (transporte MQTT) ──
+
+    #[test]
+    fn hardware_mqtt_parses_broker_username_and_password_env() {
+        let raw = r#"
+hardware:
+  mqtt:
+    broker: "127.0.0.1:1883"
+    username: garra
+    password_env: GARRA_MQTT_PASS
+"#;
+        let config: AppConfig = serde_yaml::from_str(raw).expect("yaml should parse");
+        let mqtt = config.hardware.mqtt.expect("hardware.mqtt should be Some");
+        assert_eq!(mqtt.broker, "127.0.0.1:1883");
+        assert_eq!(mqtt.username.as_deref(), Some("garra"));
+        assert_eq!(mqtt.password_env.as_deref(), Some("GARRA_MQTT_PASS"));
+        assert_eq!(mqtt.client_id_prefix, "garra");
+    }
+
+    // ── ADR 0020 / #1128: seção `hardware.automations:` (motor de regras) ──
+
+    #[test]
+    fn hardware_automations_parses_dir_e_risk_ceiling() {
+        let raw = r#"
+hardware:
+  automations:
+    dir: "rules/automations"
+    risk_ceiling: "r2"
+"#;
+        let config: AppConfig = serde_yaml::from_str(raw).expect("yaml should parse");
+        let automacoes = config
+            .hardware
+            .automations
+            .as_ref()
+            .expect("automations should be Some");
+        assert_eq!(automacoes.dir, "rules/automations");
+        assert_eq!(automacoes.risk_ceiling, "r2");
+        // E os helpers de resolucao.
+        assert_eq!(
+            config.automations_dir(),
+            Some(config.resolved_data_dir().join("rules/automations"))
+        );
+        assert_eq!(config.automations_risk_ceiling(), Some("r2"));
+    }
+
+    #[test]
+    fn hardware_automations_risk_ceiling_default_e_r1() {
+        let raw = r#"
+hardware:
+  automations:
+    dir: "rules"
+"#;
+        let config: AppConfig = serde_yaml::from_str(raw).expect("yaml should parse");
+        let automacoes = config.hardware.automations.expect("automations");
+        assert_eq!(automacoes.risk_ceiling, "r1", "teto default é r1");
+    }
+
+    #[test]
+    fn hardware_sem_automations_e_none_e_dir_none() {
+        let config = AppConfig::default();
+        assert!(config.hardware.automations.is_none());
+        assert!(config.automations_dir().is_none());
+        assert!(config.automations_risk_ceiling().is_none());
+    }
+
+    #[test]
+    fn hardware_automations_dir_absoluto_vence() {
+        let raw = r#"
+hardware:
+  automations:
+    dir: "/etc/garraia/regras"
+"#;
+        let config: AppConfig = serde_yaml::from_str(raw).expect("yaml should parse");
+        assert_eq!(
+            config.automations_dir(),
+            Some(std::path::PathBuf::from("/etc/garraia/regras"))
+        );
+    }
+
+    #[test]
+    fn hardware_default_has_no_mqtt() {
+        let config = AppConfig::default();
+        assert!(config.hardware.mqtt.is_none(), "sem seção, sem transporte");
+    }
+
+    #[test]
+    fn hardware_mqtt_write_only_password_never_carries_value() {
+        // Disciplina write-only do settings registry: config carrega o NOME
+        // da env var; o valor só existe no ambiente.
+        let raw = "hardware:\n  mqtt:\n    broker: '127.0.0.1:1883'\n";
+        let config: AppConfig = serde_yaml::from_str(raw).expect("yaml should parse");
+        let mqtt = config.hardware.mqtt.expect("mqtt");
+        assert!(mqtt.password_env.is_none());
+        assert!(mqtt.username.is_none());
     }
 }

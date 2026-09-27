@@ -2,11 +2,18 @@ mod admin_cmd;
 mod agents;
 mod ask;
 mod banner;
+mod binario;
+mod bind_gate;
+mod boot_gate_cli;
 mod capability_prompt;
 mod chat;
+mod chat_input;
 mod cli_args;
 mod config_cmd;
+mod defaults;
+mod desktop;
 mod doctor;
+mod doctor_whatsapp;
 mod glob_cmd;
 mod logs_cmd;
 mod max_power;
@@ -15,13 +22,18 @@ mod mcp_server;
 mod memory_cmd;
 mod migrate;
 mod migrate_workspace;
+mod provider_binding;
 mod repo_workflow;
+mod runs_cmd;
+#[cfg(unix)]
+mod sigpipe;
 mod team;
 mod tracing_setup;
 mod ui;
 mod update;
 mod update_scan;
 mod verify;
+mod whatsapp;
 mod wizard;
 
 use std::path::PathBuf;
@@ -107,12 +119,13 @@ enum Commands {
 
     /// Restart the daemon (stop if running, then start)
     Restart {
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Host to bind to. Reads `HOST` env var like `start` (#1261: without
+        /// it, restarting a RunPod/`HOST` daemon rebound it to loopback).
+        #[arg(long, env = "HOST", default_value = "127.0.0.1")]
         host: String,
 
-        /// Port to listen on
-        #[arg(long, default_value = "3888")]
+        /// Port to listen on. Reads `PORT` env var like `start`.
+        #[arg(long, env = "PORT", default_value = "3888")]
         port: u16,
 
         /// Run as a background daemon
@@ -148,12 +161,16 @@ enum Commands {
     /// Diagnose the installation (platform, dirs, config, providers, daemon)
     Doctor {
         /// Emit a machine-readable JSON report instead of human output
-        #[arg(long)]
+        #[arg(long, global = true)]
         json: bool,
 
         /// Treat config warnings as errors (exit 2)
-        #[arg(long)]
+        #[arg(long, global = true)]
         strict: bool,
+
+        /// One area end to end instead of the whole installation
+        #[command(subcommand)]
+        area: Option<DoctorArea>,
     },
 
     /// Run the onboarding wizard
@@ -217,7 +234,9 @@ enum Commands {
 
     /// Interactive AI chat (local-first REPL)
     Chat {
-        /// Override provider (ollama, anthropic, openai)
+        /// Override provider: ollama, llamacpp, anthropic, openai, openrouter, or
+        /// the name of an `llm:` entry in config.yml. The endpoint and the key
+        /// both come from that entry (`llm.<name>.base_url` / `.api_key`).
         #[arg(long, short = 'p')]
         provider: Option<String>,
 
@@ -245,14 +264,21 @@ enum Commands {
         /// `<data_dir>/sessions.db` and the session id is printed on start,
         /// so `--resume` can pick the conversation up later. Off by
         /// default: without it nothing is written, and no database is even
-        /// opened (#1088).
+        /// opened (#1088). The REPL's line history (arrow keys) follows the
+        /// same switch: written to `<garraia_dir>/history` only in this
+        /// mode, kept in memory otherwise (#1297).
         #[arg(long)]
         persist: bool,
 
         /// Reopen a persisted session, loading its history before the first
         /// turn. Implies persistence for the turns that follow, so the
         /// resumed conversation keeps growing in the same session (#1088).
-        #[arg(long, value_name = "SESSION_ID")]
+        ///
+        /// With no value (or the value `latest`), picks the session with the
+        /// most recent activity on this CLI instead of requiring the id —
+        /// after a crash/timeout, the interrupted turn IS the target
+        /// (#1300).
+        #[arg(long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "latest")]
         resume: Option<String>,
     },
 
@@ -262,7 +288,9 @@ enum Commands {
         /// Message to send. If absent, reads from stdin (64 KiB cap).
         message: Option<String>,
 
-        /// Override provider (ollama, anthropic, openai, openrouter)
+        /// Override provider: ollama, llamacpp, anthropic, openai, openrouter, or
+        /// the name of an `llm:` entry in config.yml. The endpoint and the key
+        /// both come from that entry (`llm.<name>.base_url` / `.api_key`).
         #[arg(long, short = 'p')]
         provider: Option<String>,
 
@@ -303,6 +331,17 @@ enum Commands {
         action: MemoryCommands,
     },
 
+    /// Read the durable ledger of agent runs (#1227).
+    ///
+    /// Opens the same `sessions.db` the gateway writes to, without talking to
+    /// it — so it answers "what was in flight?" precisely when the gateway is
+    /// down. Read-only: converting leftover `running` rows into `interrupted`
+    /// belongs to the boot hook, not to a listing.
+    Runs {
+        #[command(subcommand)]
+        action: RunsCommands,
+    },
+
     /// Inspect, validate, and diagnose the effective configuration
     Config {
         #[command(subcommand)]
@@ -318,11 +357,13 @@ enum Commands {
     /// Activate GarraMaxPower agent-pipeline mode (GAR-494 / GAR-492 epic).
     ///
     /// Without --goal: prints banner + numbered pipeline menu.
-    /// With --goal: detects the best entry point by keyword matching and
-    /// prints the selected route + rationale.
+    /// With --goal: detects the best entry point by keyword matching, prints
+    /// the selected route + rationale, then runs the agent team over the goal
+    /// (brainstorm → spec → plan → execute → review → merge).
     ///
-    /// Full state-machine execution (brainstorm → spec → plan → execute →
-    /// review → merge) lands in GAR-495..GAR-501.
+    /// Execution is provider-backed when a default LLM provider resolves (the
+    /// same chain as `chat`, one call per pipeline stage), and deterministic
+    /// (offline) otherwise; the output line `execution:` says which one ran.
     MaxPower {
         /// Goal or task description for automatic pipeline routing.
         /// Omit to see the interactive menu.
@@ -343,6 +384,40 @@ enum Commands {
     Agents {
         #[command(subcommand)]
         action: AgentsCommands,
+    },
+
+    /// Locate and launch the installed GarraIA Desktop app (#1181, M1).
+    ///
+    /// The CLI never embeds a GUI and gains no Tauri dependency: it resolves
+    /// the installed executable (platform install dir -> PATH -> next to this
+    /// binary) and spawns it. Exit codes (sysexits): 0 ok, 69 not installed,
+    /// 70 found but failed to launch.
+    Desktop {
+        /// Report whether the app is installed and where, without launching.
+        #[arg(long)]
+        status: bool,
+
+        /// Print the resolved path and exit, without launching (scriptable).
+        #[arg(long)]
+        no_launch: bool,
+    },
+
+    /// Conecta o WhatsApp ao GarraIA: numero pessoal por QR, ou WhatsApp
+    /// Business pela Cloud API da Meta (#1238, ADR 0023).
+    ///
+    /// Sem subcomando, mostra o menu de duas opcoes. Sem TTY, imprime as duas
+    /// opcoes com o comando de cada uma e sai 0 — mesma postura do `garraia
+    /// init`. Exit codes (sysexits): 0 ok, 1 cancelado, 69 falta Node / nao ha
+    /// sessao, 70 erro interno.
+    //
+    // `name` explicito porque o clap deriva kebab-case do nome da variante, e
+    // `WhatsApp` viraria `whats-app` — um comando que ninguem digitaria. O
+    // teste `whatsapp_smoke` e quem pega isso. Comentario comum (`//`), e nao
+    // doc comment: o clap publica o doc comment inteiro no `--help`.
+    #[command(name = "whatsapp")]
+    WhatsApp {
+        #[command(subcommand)]
+        action: Option<WhatsAppCommands>,
     },
 
     /// Run the local validation pipeline: fmt check, clippy, test, flutter
@@ -370,6 +445,267 @@ enum Commands {
         #[arg(long, value_name = "DIR")]
         workspace: Option<std::path::PathBuf>,
     },
+}
+
+/// Subcomandos de `garra whatsapp`.
+#[derive(Subcommand)]
+enum WhatsAppCommands {
+    /// Vincula o WhatsApp pessoal lendo um QR code (precisa de Node 20+).
+    ///
+    /// Depois do QR pergunta quem pode falar com o GarraIA (#1345).
+    /// `--allow`/`--owner` pre-respondem essa pergunta, mas o comando continua
+    /// exigindo terminal: o QR se le daqui.
+    Link {
+        /// Numero autorizado, com + e codigo do pais (ex.: +55 11 99999-8888).
+        #[arg(long, value_name = "NUMERO")]
+        allow: Option<String>,
+        /// Registra o numero como dono (so em `execution.profile = isolated-pod`).
+        #[arg(long)]
+        owner: bool,
+    },
+    /// Configura um WhatsApp Business pela Cloud API oficial da Meta.
+    Cloud,
+    /// Mostra se ha WhatsApp pessoal vinculado e onde a sessao esta.
+    Status,
+    /// Desvincula e apaga a sessao deste aparelho.
+    Logout,
+    /// Traz de volta a sessao arquivada por um re-vinculo que nao terminou.
+    Restore,
+    /// Autoriza um numero a falar com o GarraIA pelo WhatsApp pessoal (#1345).
+    ///
+    /// Funciona sem terminal. Acrescenta a `channels.whatsapp_linked.allow`
+    /// (ou `owners`, com `--owner`) sem mudar outro valor da config e sem
+    /// ligar o canal; o arquivo e reescrito, entao comentarios nao ficam.
+    /// Exit codes: 0 ok, 1 cancelado, 64 `--owner` fora de `isolated-pod` ou
+    /// sem terminal e sem `--yes`, 65 numero invalido, 70 config ilegivel.
+    /// Revogar e `garra whatsapp remove <numero>`.
+    Allow {
+        /// Numero com + e codigo do pais (ex.: +55 11 99999-8888), ou um
+        /// LID `<id>@lid`.
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        /// Registra como dono (so em `execution.profile = isolated-pod`).
+        #[arg(long)]
+        owner: bool,
+        /// Confirma o `--owner` sem perguntar (obrigatorio fora de terminal).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Lista quem pode falar com o GarraIA por este WhatsApp (#1393).
+    ///
+    /// So le. Mostra o papel (`allow` ou `owners`) e os QUATRO ULTIMOS
+    /// digitos de cada identidade — nunca o numero inteiro, que fica so no
+    /// `config.yml` (0600). `--json` imprime o mesmo em JSON, para script.
+    /// Exit codes: 0 ok, 70 config ilegivel.
+    Users {
+        /// Saida em JSON (`{enabled, authorized, owners, users[]}`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Politica de acesso v2 (ADR 0025): quem entra e ate onde cada um vai.
+    ///
+    /// Sem subcomando imprime a politica EFETIVA (admissao, default do
+    /// desconhecido, grupos e cada principal com piso, nivel e o que pode de
+    /// fato, pelo mesmo motor do turno). Identidades so por `...1234`;
+    /// `--reveal` mostra os valores da config, localmente. Exit codes: 0 ok,
+    /// 70 config ilegivel.
+    Access {
+        #[command(subcommand)]
+        cmd: Option<AccessCommands>,
+        /// Saida em JSON (so sem subcomando).
+        #[arg(long)]
+        json: bool,
+        /// Mostra as identidades inteiras (valores da config), nao so `...1234`.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Nivel de acesso de um numero: chat | read | full (#1398).
+    ///
+    /// O nivel e um TETO composto com o modo da sessao: so tira, nunca poe.
+    /// `--dry-run` mostra o impacto sem gravar. Exit codes: 0 ok, 65 numero
+    /// ou combinacao invalida (nivel no dono: use `unowner`), 70 config,
+    /// 73 gravou mas o audit falhou.
+    Level {
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        #[arg(value_name = "NIVEL", value_parser = ["chat", "read", "full"])]
+        nivel: String,
+        /// So mostra o impacto; nao grava nem audita.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Escrita de arquivo (nativa e MCP) de um numero: on | off (#1397).
+    ///
+    /// Mexe SO em escrita de arquivo: nao liga `bash`, nao desliga sandbox,
+    /// jail nem confirmacao. Exit codes como `level` (65 tambem para quem
+    /// nao esta autorizado ou esta em `chat`).
+    Write {
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        #[arg(value_name = "ESTADO", value_parser = ["on", "off"])]
+        estado: String,
+        /// So mostra o impacto; nao grava nem audita.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Bloqueia um numero: vence `open`, `allow` e pareamento. Vale na
+    /// mensagem seguinte, sem restart.
+    Block {
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Desbloqueia um numero (volta ao que a config diz dele).
+    Unblock {
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove um numero da lista de autorizados (#1394).
+    ///
+    /// O espelho do `allow`: tira de `channels.whatsapp_linked.allow` e de
+    /// `owners`, sem mexer em outro valor e sem desligar o canal; o arquivo e
+    /// reescrito, entao comentarios nao ficam. Remover um DONO exige
+    /// confirmacao — `--yes` fora de terminal. Exit codes: 0 ok (inclusive
+    /// quem nao estava na lista), 1 cancelado, 64 dono sem terminal e sem
+    /// `--yes`, 65 numero invalido, 70 config ilegivel.
+    Remove {
+        /// Numero com + e codigo do pais (ex.: +55 11 99999-8888), ou um
+        /// LID `<id>@lid`.
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        /// Confirma a remocao de um dono sem perguntar (obrigatorio fora de
+        /// terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Promove um numero a DONO (#1395).
+    ///
+    /// Grava em `channels.whatsapp_linked.owners`, a mesma escrita do
+    /// `allow --owner`. So vale com `execution.profile = isolated-pod`, e
+    /// exige confirmacao — `--yes` fora de terminal. Quem ainda nao estava
+    /// autorizado passa a estar (o portao admite a uniao das duas listas) e a
+    /// tela avisa. Exit codes: 0 ok (inclusive quem ja era dono), 1
+    /// cancelado, 64 fora de `isolated-pod` ou sem terminal e sem `--yes`,
+    /// 65 numero invalido, 70 config ilegivel.
+    Owner {
+        /// Numero com + e codigo do pais (ex.: +55 11 99999-8888), ou um
+        /// LID `<id>@lid`.
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        /// Confirma a promocao sem perguntar (obrigatorio fora de terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Tira o papel de DONO sem tirar o acesso (#1395).
+    ///
+    /// Sai de `owners` e, se preciso, a entrada passa para `allow` na mesma
+    /// escrita: rebaixar nunca revoga o acesso — quem revoga e o `remove`.
+    /// Funciona em qualquer perfil, porque um dono esquecido em `standard` e
+    /// justamente o privilegio latente que se quer limpar. Rebaixar o ULTIMO
+    /// dono exige confirmacao — `--yes` fora de terminal. Exit codes: 0 ok
+    /// (inclusive quem nao era dono), 1 cancelado, 64 ultimo dono sem
+    /// terminal e sem `--yes`, 65 numero invalido, 70 config ilegivel.
+    Unowner {
+        /// Numero com + e codigo do pais (ex.: +55 11 99999-8888), ou um
+        /// LID `<id>@lid`.
+        #[arg(value_name = "NUMERO")]
+        numero: String,
+        /// Confirma o rebaixamento do ultimo dono sem perguntar (obrigatorio
+        /// fora de terminal).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+/// `garraia whatsapp access <subcomando>` (ADR 0025).
+#[derive(Subcommand)]
+enum AccessCommands {
+    /// Admite QUALQUER numero, com o default do desconhecido (pede confirmacao).
+    Open {
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// So mostra o impacto; nao grava nem audita.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// So quem esta declarado ou pareou por codigo (o default).
+    Restricted {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// O que um desconhecido recebe em `open`: chat | read (nunca full).
+    Default {
+        #[arg(value_name = "NIVEL", value_parser = ["chat", "read"])]
+        nivel: String,
+        /// Libera escrita de arquivo (so com `read`).
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Grupos: on | off | default <nivel>.
+    Groups {
+        #[command(subcommand)]
+        cmd: GroupsCommands,
+    },
+    /// Politica de um grupo pelo JID (`<digitos>@g.us`).
+    Group {
+        #[arg(value_name = "JID")]
+        jid: String,
+        #[arg(value_name = "NIVEL", value_parser = ["chat", "read", "full"])]
+        nivel: String,
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Volta a politica ao seguro; donos e bloqueios ficam (pede confirmacao).
+    Reset {
+        #[arg(long, short = 'y')]
+        yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Trilha local de mudancas na politica, mais recente primeiro.
+    Audit {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
+/// `garraia whatsapp access groups <subcomando>`.
+#[derive(Subcommand)]
+enum GroupsCommands {
+    /// Responder em grupos.
+    On {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Nao responder em grupos.
+    Off {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// O nivel de um grupo sem politica propria.
+    Default {
+        #[arg(value_name = "NIVEL", value_parser = ["chat", "read", "full"])]
+        nivel: String,
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// `chat|read|full` da linha de comando — o `value_parser` ja garantiu o
+/// valor; o fallback e fail-closed por principio.
+fn nivel_de(nome: &str) -> garraia_agents::modes::Nivel {
+    garraia_agents::modes::Nivel::parse(nome).unwrap_or(garraia_agents::modes::Nivel::Chat)
 }
 
 #[derive(Subcommand)]
@@ -409,6 +745,37 @@ enum RecoveryCommands {
     },
 }
 
+/// `garraia doctor <area>`: a same-vocabulary report for one path.
+#[derive(Subcommand)]
+enum DoctorArea {
+    /// The personal-WhatsApp path end to end: link, session key, gateway,
+    /// access, execution profile, workspace, MCP visibility, provider (#1419)
+    Whatsapp,
+}
+
+#[derive(Subcommand)]
+enum RunsCommands {
+    /// List the most recent agent runs, newest first.
+    ///
+    /// An empty ledger is not an error: exit 0 with a friendly line (or `[]`
+    /// under `--json`).
+    List {
+        /// Only runs in this status: `running`, `done`, `error`,
+        /// `cancelled` or `interrupted`. An unknown value is a usage error,
+        /// never a silently empty list.
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Cap on how many runs to show.
+        #[arg(long, default_value_t = runs_cmd::LIMITE_PADRAO)]
+        limit: u32,
+
+        /// Emit a stable JSON array instead of the human-friendly listing.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum MemoryCommands {
     /// Counts plus the vector-index integrity report (#960).
@@ -432,11 +799,11 @@ enum MemoryCommands {
     },
 
     /// Add an entry to the memory (#958).
-    ///
-    /// O `garra memory` sabia inspecionar e podar, mas nao semear: a unica
-    /// forma de por algo na memoria era conversar com o agente, o que exige um
-    /// provider de LLM. E o que torna possivel medir a qualidade do recall de
-    /// forma reproduzivel.
+    //
+    // O `garraia memory` sabia inspecionar e podar, mas nao semear: a unica
+    // forma de por algo na memoria era conversar com o agente, o que exige um
+    // provider de LLM. E o que torna possivel medir a qualidade do recall de
+    // forma reproduzivel.
     Add {
         /// O texto a lembrar.
         content: String,
@@ -875,6 +1242,31 @@ fn log_file_path() -> PathBuf {
     garraia_dir().join("garraia.log")
 }
 
+/// Abre o `garraia.log` que o daemon herda como stdout/stderr.
+///
+/// Em append, nunca `File::create`. O create fazia duas coisas erradas de uma
+/// vez. Truncava: cada `start -d` apagava o log da execucao anterior, justo o
+/// que se quer ler ao reiniciar depois de uma queda. E abria o descritor SEM
+/// `O_APPEND`: esse descritor vira stdout E stderr do daemon pelo `dup2`, e
+/// tudo que escreve cru nele (um `eprintln!`, a mensagem de um panic, um
+/// filho que herde o stderr) escrevia no offset proprio do descritor, que
+/// comeca em 0 — por cima das linhas que o `tracing` ja tinha posto la pelo
+/// `rolling::never`, que abre em append. Era a cabeca rasgada do smoke de
+/// instalacao limpa da v0.4.4 ("Secure MCP Filesystem Server running on
+/// stdio" seguido de meia linha de tracing).
+///
+/// Com `O_APPEND` nos dois escritores, cada `write(2)` vai para o fim do
+/// arquivo, atomicamente, e as execucoes anteriores ficam. O arquivo cresce
+/// sem rotacao — como ja crescia no `start` em foreground, que sempre abriu o
+/// mesmo arquivo em append.
+#[cfg(unix)]
+fn abrir_log_do_daemon(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// Read the PID from the PID file.
 pub(crate) fn read_pid() -> Option<u32> {
     let path = pid_file_path();
@@ -887,7 +1279,34 @@ pub(crate) fn read_pid() -> Option<u32> {
 #[cfg(unix)]
 pub(crate) fn is_process_running(pid: u32) -> bool {
     // Signal 0 checks existence without sending a signal
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    let existe = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    existe && !e_zumbi(pid)
+}
+
+/// #1426: `kill(pid, 0)` devolve 0 para um zumbi — o processo ja saiu, so
+/// falta o pai colher a saida. Um daemon cujo pai nao colhe filhos (um
+/// container cujo PID 1 e `sleep`, um `docker exec` sem `--init`) encerra
+/// limpo no SIGTERM e mesmo assim o `stop` esperava os 5 s, mandava SIGKILL e
+/// anunciava "survived SIGTERM and SIGKILL" de um processo morto. Um zumbi
+/// nao esta rodando. So o Linux tem `/proc/<pid>/stat`; fora dele fica o
+/// `kill`, que e o que sempre foi.
+#[cfg(target_os = "linux")]
+fn e_zumbi(pid: u32) -> bool {
+    // Formato: `pid (comm) estado ...` — `comm` pode ter espaco e parentese,
+    // por isso o estado e o que vem depois do ULTIMO `)`.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit(')')
+                .next()
+                .map(|depois| depois.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn e_zumbi(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -1110,6 +1529,161 @@ fn stderr_is_log_channel(command: &Commands) -> bool {
     )
 }
 
+/// Subcomandos em que SIGPIPE volta ao padrao do Unix (L2 do smoke da
+/// v0.4.4): os que so leem estado e imprimem, onde morrer no primeiro `write`
+/// sem leitor nao deixa nada pela metade — `garra status | head -1` sai em
+/// silencio, como `ls | head`, em vez do panico "failed printing to stdout".
+///
+/// O `match` e exaustivo de proposito, ate a folha: cada enum de subcomando
+/// aninhado tem o proprio `match` sem curinga (nada de `matches!`, `_ =>` ou
+/// `{ .. }` no lugar de um `action`), entao um subcomando novo, de primeiro
+/// nivel ou aninhado, nao compila ate alguem decidir de que lado ele fica — e
+/// o teste `sigpipe_decide_cada_subcomando_aninhado_pelo_nome` varre este
+/// corpo para que ninguem troque isso por um curinga. Ficam de fora, com o
+/// sinal ignorado do runtime do Rust:
+/// - o que roda por tempo indeterminado e nao pode morrer porque um leitor
+///   sumiu: `start`/`restart` (foreground e daemon), `mcp-server`, `chat`;
+/// - o que muda estado (config, memoria, credenciais, instalacao) ou lanca e
+///   conversa com outro processo: morrer no meio dele e deixar trabalho pela
+///   metade, e ai o `EPIPE` como erro tratado e o comportamento certo.
+///
+/// So e chamada no Unix (Windows nao tem SIGPIPE); o teste roda em todos.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn sigpipe_padrao_para(command: &Commands) -> bool {
+    match command {
+        Commands::About | Commands::Status | Commands::Logs { .. } | Commands::Doctor { .. } => {
+            true
+        }
+        // `ask` e one-shot: uma pergunta, uma resposta em stdout, sem estado.
+        Commands::Ask { .. } => true,
+        // So as formas que imprimem; sem flag, `desktop` lanca o aplicativo.
+        Commands::Desktop { status, no_launch } => *status || *no_launch,
+        Commands::Runs { action } => match action {
+            RunsCommands::List { .. } => true,
+        },
+        Commands::Config { action } => match action {
+            ConfigCommands::Check { .. } => true,
+            ConfigCommands::SetModel { .. } | ConfigCommands::SetRouting { .. } => false,
+        },
+        Commands::Memory { action } => match action {
+            MemoryCommands::Stats { .. }
+            | MemoryCommands::List { .. }
+            | MemoryCommands::Search { .. } => true,
+            MemoryCommands::Add { .. }
+            | MemoryCommands::Reindex { .. }
+            | MemoryCommands::Backup { .. }
+            | MemoryCommands::Pin { .. }
+            | MemoryCommands::Ttl { .. }
+            | MemoryCommands::Delete { .. }
+            | MemoryCommands::Compact { .. } => false,
+        },
+        Commands::Mcp { action } => match action {
+            McpCommands::List => true,
+            // Lancam o servidor MCP e conversam com ele.
+            McpCommands::Inspect { .. }
+            | McpCommands::Resources { .. }
+            | McpCommands::Prompts { .. } => false,
+        },
+        Commands::Channel { action } => match action {
+            ChannelCommands::List | ChannelCommands::Status { .. } => true,
+        },
+        Commands::Skill { action } => match action {
+            SkillCommands::List => true,
+            SkillCommands::Install { .. } | SkillCommands::Remove { .. } => false,
+        },
+        Commands::Glob { action } => match action {
+            GlobCommands::Test { .. } => true,
+        },
+        Commands::WhatsApp { action } => match action {
+            // `users` so le a config e imprime, como o `status`.
+            Some(WhatsAppCommands::Status | WhatsAppCommands::Users { .. }) => true,
+            // `access` e `access audit` so leem e imprimem; o resto grava.
+            Some(WhatsAppCommands::Access { cmd, .. }) => match cmd {
+                None | Some(AccessCommands::Audit { .. }) => true,
+                Some(
+                    AccessCommands::Open { .. }
+                    | AccessCommands::Restricted { .. }
+                    | AccessCommands::Default { .. }
+                    | AccessCommands::Group { .. }
+                    | AccessCommands::Reset { .. },
+                ) => false,
+                Some(AccessCommands::Groups { cmd }) => match cmd {
+                    GroupsCommands::On { .. }
+                    | GroupsCommands::Off { .. }
+                    | GroupsCommands::Default { .. } => false,
+                },
+            },
+            // Sem subcomando e o menu interativo.
+            None
+            | Some(
+                WhatsAppCommands::Link { .. }
+                | WhatsAppCommands::Cloud
+                | WhatsAppCommands::Logout
+                | WhatsAppCommands::Restore
+                | WhatsAppCommands::Allow { .. }
+                | WhatsAppCommands::Remove { .. }
+                | WhatsAppCommands::Owner { .. }
+                | WhatsAppCommands::Unowner { .. }
+                | WhatsAppCommands::Level { .. }
+                | WhatsAppCommands::Write { .. }
+                | WhatsAppCommands::Block { .. }
+                | WhatsAppCommands::Unblock { .. },
+            ) => false,
+        },
+        Commands::Admin { action } => match action {
+            AdminCommands::Recovery { action } => match action {
+                RecoveryCommands::Start { .. } | RecoveryCommands::Complete { .. } => false,
+            },
+        },
+        Commands::Migrate { action } => match action {
+            MigrateCommands::Openclaw { .. } | MigrateCommands::Workspace { .. } => false,
+        },
+        Commands::Agents { action } => match action {
+            AgentsCommands::Setup { .. }
+            | AgentsCommands::Status
+            | AgentsCommands::Link { .. }
+            | AgentsCommands::Rollback { .. }
+            | AgentsCommands::Web { .. } => false,
+        },
+        #[cfg(feature = "plugins")]
+        Commands::Plugin { action } => match action {
+            PluginCommands::List
+            | PluginCommands::Install { .. }
+            | PluginCommands::Remove { .. }
+            | PluginCommands::Watch => false,
+        },
+        Commands::Start { .. }
+        | Commands::Restart { .. }
+        | Commands::Stop
+        | Commands::McpServer
+        | Commands::Chat { .. }
+        | Commands::Init
+        | Commands::Update { .. }
+        | Commands::Rollback
+        | Commands::MaxPower { .. }
+        | Commands::Verify { .. } => false,
+    }
+}
+
+/// Modo de console por subcomando. Os canais de log (#933) espelham o
+/// arquivo; o REPL interativo fica em Quiet (#1301) — nem WARN cru compete
+/// com o renderer, porque a falha de turno já vira `ErrorCard`, e quem
+/// depura pede `--verbose`/`--debug`/`RUST_LOG`; os demais one-shot seguem
+/// em Normal (WARN+ no stderr, stdout limpo).
+fn console_mode_for_command(
+    command: &Commands,
+    debug: bool,
+    verbose: bool,
+) -> tracing_setup::ConsoleMode {
+    if stderr_is_log_channel(command) {
+        tracing_setup::ConsoleMode::Debug
+    } else if matches!(command, Commands::Chat { .. }) {
+        tracing_setup::repl_console_mode(debug, verbose)
+    } else {
+        tracing_setup::console_mode(debug, verbose)
+    }
+}
+
 fn value_taking_flags() -> Vec<String> {
     fn push(out: &mut Vec<String>, arg: &clap::Arg) {
         if !matches!(arg.get_action(), ArgAction::Set | ArgAction::Append) {
@@ -1163,6 +1737,16 @@ fn main() -> Result<()> {
     let args = cli_args::inject_default_subcommand(std::env::args_os().collect(), &flag_refs);
     let cli = Cli::parse_from(args);
 
+    // L2 (smoke da v0.4.4): `garra status | head` entrava em panico com
+    // "failed printing to stdout: Broken pipe". Nos comandos que so leem e
+    // imprimem, SIGPIPE volta ao padrao do Unix ANTES da primeira escrita em
+    // stdout; o gateway, o `mcp-server` e o REPL ficam como estao. Ver
+    // `sigpipe_padrao_para` e o modulo `sigpipe`.
+    #[cfg(unix)]
+    if sigpipe_padrao_para(&cli.command) {
+        sigpipe::restaurar_padrao();
+    }
+
     // Show update notice (non-blocking, from cache)
     if !matches!(cli.command, Commands::Update { .. })
         && let Some(notice) = update::check_for_update_notice()
@@ -1172,13 +1756,7 @@ fn main() -> Result<()> {
     }
 
     // Init tracing for non-daemon mode (daemon reconfigures after fork)
-    let console = if stderr_is_log_channel(&cli.command) {
-        // Espelha o arquivo, como antes do #933: journald / host MCP leem o
-        // stderr desses subcomandos como log operacional.
-        tracing_setup::ConsoleMode::Debug
-    } else {
-        tracing_setup::console_mode(cli.debug, cli.verbose)
-    };
+    let console = console_mode_for_command(&cli.command, cli.debug, cli.verbose);
     let init_tracing = move |level: &str| {
         let log_dir = garraia_dir();
         std::fs::create_dir_all(&log_dir).unwrap_or_else(|e| {
@@ -1230,8 +1808,11 @@ fn main() -> Result<()> {
     // (install.sh → doctor → chat), então como o `config check` precisa
     // sobreviver a config ausente/não-parseável e reportar sysexits em vez
     // de estourar no `load()` global.
-    if let Commands::Doctor { json, strict } = cli.command {
-        let code = doctor::run_doctor(json, strict)?;
+    if let Commands::Doctor { json, strict, area } = cli.command {
+        let code = match area {
+            Some(DoctorArea::Whatsapp) => doctor_whatsapp::run(json, strict)?,
+            None => doctor::run_doctor(json, strict)?,
+        };
         if code != 0 {
             std::process::exit(code);
         }
@@ -1309,6 +1890,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `garra desktop` resolves a path and spawns a GUI app; it touches no
+    // gateway state and must work on a machine that has never run `garra
+    // init` — the desktop installer is often the first thing a user runs.
+    if let Commands::Desktop { status, no_launch } = cli.command {
+        let code = desktop::run(status, no_launch, desktop::locate(), &desktop::RealLauncher);
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+
     // GAR-501 / plan 0155 — `garra verify` does not need the gateway config;
     // intercept early so the pipeline can run even without a `.garraia/` dir.
     if let Commands::Verify {
@@ -1328,9 +1920,167 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `garra whatsapp` resolve a propria config (e funciona sem ela): `status`
+    // e `logout` so precisam do diretorio de dados, e devem responder numa
+    // maquina que nunca rodou `garra init`. Mesmo padrao de `garra desktop`.
+    if let Commands::WhatsApp { ref action } = cli.command {
+        let whatsapp_action = match action {
+            None => whatsapp::Action::Menu,
+            Some(WhatsAppCommands::Link { allow, owner }) => {
+                if allow.is_none() && !owner {
+                    whatsapp::Action::Link
+                } else {
+                    whatsapp::Action::LinkCom(whatsapp::Pedido {
+                        numero: allow.clone(),
+                        owner: *owner,
+                        yes: false,
+                    })
+                }
+            }
+            Some(WhatsAppCommands::Cloud) => whatsapp::Action::Cloud,
+            Some(WhatsAppCommands::Status) => whatsapp::Action::Status,
+            Some(WhatsAppCommands::Logout) => whatsapp::Action::Logout,
+            Some(WhatsAppCommands::Restore) => whatsapp::Action::Restore,
+            Some(WhatsAppCommands::Allow { numero, owner, yes }) => {
+                whatsapp::Action::Allow(whatsapp::Pedido {
+                    numero: Some(numero.clone()),
+                    owner: *owner,
+                    yes: *yes,
+                })
+            }
+            Some(WhatsAppCommands::Users { json }) => whatsapp::Action::Users { json: *json },
+            Some(WhatsAppCommands::Remove { numero, yes }) => {
+                whatsapp::Action::Remove(whatsapp::PedidoRemocao {
+                    numero: numero.clone(),
+                    yes: *yes,
+                })
+            }
+            Some(WhatsAppCommands::Owner { numero, yes }) => {
+                whatsapp::Action::Owner(whatsapp::PedidoDePapel {
+                    numero: numero.clone(),
+                    yes: *yes,
+                })
+            }
+            Some(WhatsAppCommands::Unowner { numero, yes }) => {
+                whatsapp::Action::Unowner(whatsapp::PedidoDePapel {
+                    numero: numero.clone(),
+                    yes: *yes,
+                })
+            }
+            Some(WhatsAppCommands::Access { cmd, json, reveal }) => {
+                use whatsapp::ComandoDeAcesso as C;
+                whatsapp::Action::Access(match cmd {
+                    None => C::Mostrar {
+                        json: *json,
+                        revelar: *reveal,
+                    },
+                    Some(AccessCommands::Open { yes, dry_run }) => C::Abrir {
+                        yes: *yes,
+                        dry_run: *dry_run,
+                    },
+                    Some(AccessCommands::Restricted { dry_run }) => {
+                        C::Restringir { dry_run: *dry_run }
+                    }
+                    Some(AccessCommands::Default {
+                        nivel,
+                        write,
+                        dry_run,
+                    }) => C::Default {
+                        nivel: nivel_de(nivel),
+                        write: *write,
+                        dry_run: *dry_run,
+                    },
+                    Some(AccessCommands::Groups { cmd }) => match cmd {
+                        GroupsCommands::On { dry_run } => C::Grupos {
+                            ligados: true,
+                            dry_run: *dry_run,
+                        },
+                        GroupsCommands::Off { dry_run } => C::Grupos {
+                            ligados: false,
+                            dry_run: *dry_run,
+                        },
+                        GroupsCommands::Default {
+                            nivel,
+                            write,
+                            dry_run,
+                        } => C::GrupoDefault {
+                            nivel: nivel_de(nivel),
+                            write: *write,
+                            dry_run: *dry_run,
+                        },
+                    },
+                    Some(AccessCommands::Group {
+                        jid,
+                        nivel,
+                        write,
+                        dry_run,
+                    }) => C::Grupo {
+                        jid: jid.clone(),
+                        nivel: nivel_de(nivel),
+                        write: *write,
+                        dry_run: *dry_run,
+                    },
+                    Some(AccessCommands::Reset { yes, dry_run }) => C::Reset {
+                        yes: *yes,
+                        dry_run: *dry_run,
+                    },
+                    Some(AccessCommands::Audit { json, limit }) => C::Audit {
+                        json: *json,
+                        limit: *limit,
+                    },
+                })
+            }
+            Some(WhatsAppCommands::Level {
+                numero,
+                nivel,
+                dry_run,
+            }) => whatsapp::Action::Access(whatsapp::ComandoDeAcesso::Nivel {
+                numero: numero.clone(),
+                nivel: nivel_de(nivel),
+                dry_run: *dry_run,
+            }),
+            Some(WhatsAppCommands::Write {
+                numero,
+                estado,
+                dry_run,
+            }) => whatsapp::Action::Access(whatsapp::ComandoDeAcesso::Write {
+                numero: numero.clone(),
+                on: estado == "on",
+                dry_run: *dry_run,
+            }),
+            Some(WhatsAppCommands::Block { numero, dry_run }) => {
+                whatsapp::Action::Access(whatsapp::ComandoDeAcesso::Bloquear {
+                    numero: numero.clone(),
+                    dry_run: *dry_run,
+                })
+            }
+            Some(WhatsAppCommands::Unblock { numero, dry_run }) => {
+                whatsapp::Action::Access(whatsapp::ComandoDeAcesso::Desbloquear {
+                    numero: numero.clone(),
+                    dry_run: *dry_run,
+                })
+            }
+        };
+        let ctx = whatsapp::Context::from_env();
+        let code = whatsapp::run(whatsapp_action, &ctx, &wizard::prompts::DialoguerPrompter);
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+
     let config_loader = garraia_config::ConfigLoader::new()?;
     config_loader.ensure_dirs()?;
     let config = config_loader.load()?;
+
+    // #1247: o MESMO `run_check` do `garraia config check`, uma vez, em todo
+    // `start`/`restart`/`start -d` — sobre a config do arquivo, antes dos
+    // overrides de host/porta e antes de qualquer efeito do boot. Recusa (exit
+    // 78) so pela allowlist fechada; o resto e dito. No daemon os achados vao
+    // para stderr agora, porque depois do fork o log e invisivel ao terminal.
+    if let Commands::Start { daemon, .. } | Commands::Restart { daemon, .. } = &cli.command {
+        boot_gate_cli::rodar(&config_loader, &config, *daemon);
+    }
 
     // Handle daemon mode BEFORE creating the tokio runtime. The fork must
     // happen before any async runtime is initialised, otherwise the child
@@ -1351,6 +2101,13 @@ fn main() -> Result<()> {
         let mut config = config;
         config.gateway.host = host;
         config.gateway.port = port;
+        // #1261 (decisao A): bind exposto sem credencial e RECUSADO. Depois
+        // do fork o tracing aponta para `~/.garraia/garraia.log`, e `start -d`
+        // e o modo que o `install.sh` recomenda e que uma unit systemd usa —
+        // entao a recusa (e o aviso do opt-out) sai aqui, em stderr, ANTES do
+        // fork e ANTES de derrubar o daemon atual num `restart -d`, sobre o
+        // host ja resolvido acima (flag > env > default, nunca o arquivo).
+        preflight_do_bind(&config.gateway, true);
         if is_restart {
             // Don't init tracing here — try_stop_daemon uses println!,
             // and the daemon child will init its own subscriber after fork.
@@ -1362,6 +2119,32 @@ fn main() -> Result<()> {
     // All other commands run inside a tokio runtime.
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(async_main(cli, config, config_loader, init_tracing))
+}
+
+/// sysexits `EX_CONFIG`: a config (aqui, o bind com a credencial) nao
+/// permite subir.
+const EX_CONFIG: i32 = 78;
+
+/// Roda a recusa do #1261 antes de qualquer efeito colateral do boot.
+///
+/// Recusado: a mensagem (que diz como corrigir usando o binario instalado)
+/// vai para stderr e o processo sai com [`EX_CONFIG`] — antes do fork, do PID
+/// file e do `try_stop_daemon`. Com o opt-out, `imprimir_aviso` decide se o
+/// aviso sai em stderr aqui (daemon: o log do filho e invisivel ao terminal)
+/// ou fica so com o `warn!` do gateway (foreground).
+fn preflight_do_bind(gateway: &garraia_config::GatewayConfig, imprimir_aviso: bool) {
+    match bind_gate::preflight(gateway) {
+        Ok(bind_gate::Preflight::Sobe) => {}
+        Ok(bind_gate::Preflight::SobeComAviso(aviso)) => {
+            if imprimir_aviso {
+                eprintln!("warning: {aviso}");
+            }
+        }
+        Err(recusa) => {
+            eprintln!("{recusa}");
+            std::process::exit(EX_CONFIG);
+        }
+    }
 }
 
 async fn async_main(
@@ -1387,10 +2170,14 @@ async fn async_main(
             let mut config = config;
             config.gateway.host = host;
             config.gateway.port = port;
+            // #1261: recusa antes do banner, do PID file e do bind.
+            preflight_do_bind(&config.gateway, false);
             if with_voice {
                 config.voice.enabled = true;
             }
             init_tracing(&effective_level);
+            // #1247: os achados do boot gate, uma linha por achado.
+            boot_gate_cli::logar();
             // GAR-384: Initialize OpenTelemetry tracing + Prometheus metrics.
             // Guard is bound to `_telemetry_guard` so its Drop (which flushes
             // and shuts down the exporter) runs at the end of this scope.
@@ -1424,7 +2211,9 @@ async fn async_main(
 
         Commands::Stop => {
             init_tracing(&effective_level);
-            stop_daemon(config.gateway.port)?;
+            // #1261: a porta que o `start` usou (env > default), nunca a
+            // `gateway.port` deprecada do arquivo.
+            stop_daemon(garraia_config::bind::endereco_do_cliente().1)?;
         }
         Commands::Restart {
             host,
@@ -1432,13 +2221,17 @@ async fn async_main(
             with_voice,
             ..
         } => {
-            init_tracing(&effective_level);
-            #[cfg(feature = "telemetry")]
-            let (_telemetry_guard, telemetry_config) = init_telemetry_guard();
-            try_stop_daemon(port);
             let mut config = config;
             config.gateway.host = host;
             config.gateway.port = port;
+            // #1261: um `restart` recusado nao pode derrubar o daemon atual.
+            preflight_do_bind(&config.gateway, false);
+            init_tracing(&effective_level);
+            // #1247: os achados do boot gate, uma linha por achado.
+            boot_gate_cli::logar();
+            #[cfg(feature = "telemetry")]
+            let (_telemetry_guard, telemetry_config) = init_telemetry_guard();
+            try_stop_daemon(port);
             if with_voice {
                 config.voice.enabled = true;
             }
@@ -1537,33 +2330,33 @@ async fn async_main(
             // #1045: com `gateway.api_key` configurada, `/api/status` passou
             // a exigir `Authorization: Bearer`. Sem isto o `garra status`
             // responderia 401 contra o proprio gateway do usuario.
+            // #1261: o endereco que o `start` usou (env > default, com
+            // `0.0.0.0` trocado por loopback), nunca `gateway.host`/`port`
+            // do arquivo, que estao deprecados e podem apontar para uma
+            // porta que o gateway nunca abriu.
+            let (status_host, status_port) = garraia_config::bind::endereco_do_cliente();
             let mut pedido = client.get(format!(
-                "http://{}:{}/api/status",
-                config.gateway.host, config.gateway.port
+                "{}/api/status",
+                garraia_config::bind::url_http(&status_host, status_port)
             ));
-            if let Some(chave) = config
-                .gateway
-                .api_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-            {
+            // `api_key_normalizada` inclui GARRAIA_GATEWAY_API_KEY (#1261).
+            if let Some(chave) = config.gateway.api_key_normalizada() {
                 pedido = pedido.bearer_auth(chave);
             }
             match pedido.send().await {
                 Ok(resp) => {
                     if managed_pid.is_none() {
-                        match find_pid_on_port(config.gateway.port) {
+                        match find_pid_on_port(status_port) {
                             Some(pid) => println!(
                                 "Gateway is responding on port {} (PID {pid}, not started by \
                                  'garraia start' from this config dir — 'garraia stop' will \
                                  use the port lookup)",
-                                config.gateway.port
+                                status_port
                             ),
                             None => println!(
                                 "Gateway is responding on port {} but no local process was \
                                  found (remote host, container, or 'lsof' unavailable)",
-                                config.gateway.port
+                                status_port
                             ),
                         }
                     }
@@ -1574,9 +2367,10 @@ async fn async_main(
                     if let Some(pid) = managed_pid {
                         println!(
                             "PID {pid} is alive but the gateway is not responding on \
-                             http://{}:{} — it may still be starting, or is bound to a \
-                             different host/port than the config says.",
-                            config.gateway.host, config.gateway.port
+                             {} — it may still be starting, or is bound to a \
+                             different host/port (it binds --host/--port, else HOST/PORT, \
+                             else 127.0.0.1:3888).",
+                            garraia_config::bind::url_http(&status_host, status_port)
                         );
                     } else {
                         println!("Gateway is not responding.");
@@ -1759,9 +2553,27 @@ async fn async_main(
                                 } else {
                                     format!(" [triggers: {}]", s.frontmatter.triggers.join(", "))
                                 };
+                                // A categoria de hardware (#1131) e o que o
+                                // operador precisa ver para saber por que um
+                                // skill nao virou dispositivo: o transporte
+                                // declarado aparece junto do kind.
+                                let categoria = if s.frontmatter.kind.e_hardware() {
+                                    let transporte = s
+                                        .frontmatter
+                                        .provides
+                                        .as_ref()
+                                        .map(|p| p.transport.as_str())
+                                        .unwrap_or("?");
+                                    format!(" [{}: {transporte}]", s.frontmatter.kind)
+                                } else {
+                                    String::new()
+                                };
                                 println!(
-                                    "  {} - {}{}",
-                                    s.frontmatter.name, s.frontmatter.description, triggers
+                                    "  {} - {}{}{}",
+                                    s.frontmatter.name,
+                                    s.frontmatter.description,
+                                    categoria,
+                                    triggers
                                 );
                             }
                         }
@@ -1803,11 +2615,18 @@ async fn async_main(
                     for (name, server) in &mcp_configs {
                         let enabled = server.enabled.unwrap_or(true);
                         let status = if enabled { "enabled" } else { "disabled" };
+                        // #1274: an HTTP entry has no `command` (it used to be
+                        // dropped by the loader entirely) — name the `url`
+                        // instead of printing an empty command.
+                        let target = match server.command.as_str() {
+                            "" => server.url.as_deref().unwrap_or("(no command or url)"),
+                            c => c,
+                        };
                         println!(
                             "  {} [{}] {} {:?} (timeout: {}s)",
                             name,
                             status,
-                            server.command,
+                            target,
                             server.args,
                             server.timeout.unwrap_or(30),
                         );
@@ -1818,6 +2637,17 @@ async fn async_main(
                         println!("MCP server '{}' not found in config", name);
                         return Ok(());
                     };
+
+                    // #1274: HTTP entries are visible in the merged config now
+                    // (they used to be dropped by the loader), and `inspect`
+                    // always connects over stdio. Refuse an entry without a
+                    // `command` instead of spawning an empty command.
+                    if server_config.command.trim().is_empty() {
+                        println!(
+                            "MCP server '{name}' has no 'command' — `garra mcp inspect` only supports stdio servers"
+                        );
+                        return Ok(());
+                    }
 
                     println!("Connecting to MCP server '{name}'...");
                     let manager = garraia_agents::McpManager::new();
@@ -1834,6 +2664,7 @@ async fn async_main(
                             server_config.memory_limit_mb,
                             server_config.max_restarts.unwrap_or(5),
                             server_config.restart_delay_secs.unwrap_or(5),
+                            server_config.inherit_env,
                         )
                         .await
                     {
@@ -1874,6 +2705,7 @@ async fn async_main(
                             server_config.memory_limit_mb,
                             server_config.max_restarts.unwrap_or(5),
                             server_config.restart_delay_secs.unwrap_or(5),
+                            server_config.inherit_env,
                         )
                         .await
                     {
@@ -1919,6 +2751,7 @@ async fn async_main(
                             server_config.memory_limit_mb,
                             server_config.max_restarts.unwrap_or(5),
                             server_config.restart_delay_secs.unwrap_or(5),
+                            server_config.inherit_env,
                         )
                         .await
                     {
@@ -2055,8 +2888,16 @@ async fn async_main(
             // nothing in chat mode. Since #933 the file gets everything while
             // stderr stays WARN+ unless --verbose/--debug asks for more — the
             // interactive console no longer competes with INFO records.
+            // Since #1301 the REPL goes further: default is Quiet, so raw
+            // WARN/ERROR lines from provider internals (retry, fallback,
+            // circuit breaker) no longer interleave with the renderer — the
+            // turn failure itself still surfaces as an ErrorCard, and the
+            // full detail stays in garraia.log / --debug / RUST_LOG.
             init_tracing(&effective_level);
-            chat::run_chat(
+            // #1297: Ctrl+C no prompt do editor de linha chega como leitura
+            // interrompida, nao como SIGINT, e o REPL devolve o 130 que o
+            // vigia sempre deu — pelo mesmo caminho que o `ask` ja usa.
+            let code = chat::run_chat(
                 config,
                 provider,
                 model,
@@ -2067,6 +2908,9 @@ async fn async_main(
                 resume,
             )
             .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Commands::Ask {
             message,
@@ -2095,6 +2939,23 @@ async fn async_main(
                 yes,
             )
             .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Commands::Runs { action } => {
+            // Mesmo console limpo do `memory` (#933): a saida do subcomando e
+            // o relatorio, e o tracing so entra quando o operador pede.
+            if cli.verbose || cli.debug {
+                init_tracing(&effective_level);
+            }
+            let code = match action {
+                RunsCommands::List {
+                    status,
+                    limit,
+                    json,
+                } => runs_cmd::run_list(&config, status, limit, json)?,
+            };
             if code != 0 {
                 std::process::exit(code);
             }
@@ -2194,7 +3055,11 @@ async fn async_main(
             mcp_server::run_mcp_server(config).await?;
         }
         Commands::MaxPower { goal, mode } => {
-            max_power::run(goal, mode, &config);
+            // #1228: sem isto o pipeline provider-backed nao deixava rastro no
+            // `garraia.log`, e uma etapa que caia (corpo truncado do provider)
+            // so sobrava como uma linha na tela, sem como investigar depois.
+            init_tracing(&effective_level);
+            max_power::run(goal, mode, &config).await;
         }
         Commands::Verify { .. } => {
             // Handled in main() before the async runtime starts.
@@ -2203,6 +3068,18 @@ async fn async_main(
         Commands::Doctor { .. } => {
             // Handled in main() before the async runtime starts.
             unreachable!("Commands::Doctor is intercepted in main() before async_main");
+        }
+        Commands::WhatsApp { .. } => {
+            // Interceptado em `main()` antes do ConfigLoader.
+            unreachable!("Commands::WhatsApp is intercepted in main() before async_main");
+        }
+
+        Commands::Desktop { .. } => {
+            // #1181 (M1): handled in main() before the async runtime starts.
+            // `garra desktop` only resolves a path and spawns the app, so it
+            // must not require a loadable gateway config — the desktop
+            // installer is often the first thing a user runs.
+            unreachable!("Commands::Desktop is intercepted in main() before async_main");
         }
     }
 
@@ -2218,8 +3095,9 @@ fn start_daemon(config: garraia_config::AppConfig) -> Result<()> {
     let pid_path = pid_file_path();
     let log_path = log_file_path();
 
-    let log_file = File::create(&log_path)
-        .context(format!("failed to create log file: {}", log_path.display()))?;
+    // Append, nao truncate: ver `abrir_log_do_daemon`.
+    let log_file = abrir_log_do_daemon(&log_path)
+        .context(format!("failed to open log file: {}", log_path.display()))?;
     let log_fd = log_file.as_raw_fd();
 
     // First fork: parent exits, child becomes a background process.
@@ -2279,6 +3157,9 @@ fn start_daemon(config: garraia_config::AppConfig) -> Result<()> {
         .init();
 
     tracing::info!("daemon started (PID file: {})", pid_path.display());
+    // #1247: o relatorio do boot gate (calculado antes do fork) tambem no log
+    // do daemon — o stderr do pai ja o mostrou ao terminal.
+    boot_gate_cli::logar();
 
     // GAR-384: telemetry guard must outlive the server run.
     #[cfg(feature = "telemetry")]
@@ -2449,6 +3330,34 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
 
+    /// O clap publica o doc comment inteiro de cada comando no `--help`, entao
+    /// nota de implementacao escrita com `///` vaza para o usuario (#1228:
+    /// o `whatsapp --help` explicava o `#[command(name)]` e citava o teste que
+    /// o prende). Varre a ajuda longa de todos os comandos e subcomandos.
+    #[test]
+    fn ajuda_nao_vaza_nota_de_implementacao() {
+        fn varrer(cmd: &mut clap::Command, caminho: &str, achados: &mut Vec<String>) {
+            let ajuda = cmd.render_long_help().to_string();
+            for marca in ["clap", "#[", "kebab-case", "teste `", "sabia inspecionar"] {
+                if ajuda.contains(marca) {
+                    achados.push(format!("`{caminho} --help` contem `{marca}`"));
+                }
+            }
+            for sub in cmd.get_subcommands_mut() {
+                let nome = format!("{caminho} {}", sub.get_name());
+                varrer(sub, &nome, achados);
+            }
+        }
+        let mut raiz = Cli::command();
+        raiz.build();
+        let mut achados = Vec::new();
+        varrer(&mut raiz, "garraia", &mut achados);
+        assert!(
+            achados.is_empty(),
+            "nota de implementacao na ajuda: {achados:#?}"
+        );
+    }
+
     /// `cli_args::inject_default_subcommand` needs to know which tokens eat
     /// the next argv entry; `value_taking_flags` derives that from the clap
     /// tree. Pin the derivation so adding a value-taking flag to `chat` (or a
@@ -2480,6 +3389,66 @@ mod tests {
         );
     }
 
+    /// #1301: o REPL interativo (`garra chat`, inclusive via `garra` nu) é a
+    /// única superfície cujo stderr não é canal de log e mesmo assim fica
+    /// silencioso — nem WARN cru compete com o renderer, porque a falha de
+    /// turno já vira `ErrorCard`. `--verbose`/`--debug` continuam valendo.
+    #[test]
+    fn console_mode_for_command_puts_the_repl_on_quiet() {
+        let chat = |args: &[&str]| Cli::try_parse_from(args).expect("chat parses").command;
+        // `garra` nu abre o REPL via a injecao do cli_args — o mesmo caminho
+        // de `bare_model_flag_parses_as_chat`.
+        let argv = cli_args::inject_default_subcommand(
+            ["garra"].iter().map(std::ffi::OsString::from).collect(),
+            &value_taking_flags()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        let bare = Cli::try_parse_from(argv)
+            .expect("bare garra parses")
+            .command;
+        assert_eq!(
+            console_mode_for_command(&chat(&["garra", "chat"]), false, false),
+            tracing_setup::ConsoleMode::Quiet,
+            "REPL default deve silenciar o stderr de tracing (#1301)"
+        );
+        assert_eq!(
+            console_mode_for_command(&bare, false, false),
+            tracing_setup::ConsoleMode::Quiet,
+            "`garra` nu abre o mesmo REPL"
+        );
+        assert_eq!(
+            console_mode_for_command(&chat(&["garra", "chat"]), false, true),
+            tracing_setup::ConsoleMode::Verbose,
+        );
+        assert_eq!(
+            console_mode_for_command(&chat(&["garra", "chat"]), true, false),
+            tracing_setup::ConsoleMode::Debug,
+        );
+    }
+
+    /// Os canais de log do #933 seguem espelhando o arquivo e os one-shot
+    /// seguem em Normal (WARN+ no stderr, stdout limpo) — o Quiet é só do
+    /// REPL.
+    #[test]
+    fn log_channels_and_one_shot_commands_keep_their_modes() {
+        let start = Cli::try_parse_from(["garra", "start"])
+            .expect("start parses")
+            .command;
+        assert_eq!(
+            console_mode_for_command(&start, false, false),
+            tracing_setup::ConsoleMode::Debug,
+        );
+        let ask = Cli::try_parse_from(["garra", "ask", "oi"])
+            .expect("ask parses")
+            .command;
+        assert_eq!(
+            console_mode_for_command(&ask, false, false),
+            tracing_setup::ConsoleMode::Normal,
+        );
+    }
+
     /// End-to-end through clap: the argv rewrite plus the derives must yield
     /// a `Chat` command carrying the model. Guards the whole feature, not
     /// just the scanner in isolation.
@@ -2503,6 +3472,68 @@ mod tests {
             }
             _ => panic!("expected the Chat subcommand"),
         }
+    }
+
+    /// #1300: `--resume` sem valor (e `--resume latest`) vira o alvo da
+    /// ultima atividade, e o id explicito continua sendo adotado como veio.
+    #[test]
+    fn resume_sem_valor_vira_latest_e_com_valor_mantem_o_id() {
+        let cli = Cli::try_parse_from(["garra", "chat", "--resume"]).expect("bare --resume");
+        match cli.command {
+            Commands::Chat { resume, .. } => {
+                assert_eq!(resume.as_deref(), Some("latest"), "bare --resume");
+            }
+            _ => panic!("expected the Chat subcommand"),
+        }
+        let cli =
+            Cli::try_parse_from(["garra", "chat", "--resume", "latest"]).expect("latest valor");
+        match cli.command {
+            Commands::Chat { resume, .. } => {
+                assert_eq!(resume.as_deref(), Some("latest"));
+            }
+            _ => panic!("expected the Chat subcommand"),
+        }
+        let cli = Cli::try_parse_from(["garra", "chat", "--resume", "cli-abc"]).expect("id");
+        match cli.command {
+            Commands::Chat { resume, .. } => {
+                assert_eq!(resume.as_deref(), Some("cli-abc"));
+            }
+            _ => panic!("expected the Chat subcommand"),
+        }
+    }
+
+    /// The `garra desktop` surface is a script contract (#1181, M1), so pin
+    /// it through clap and not only through `desktop::run`. Both flags are
+    /// booleans on purpose: a value-taking flag here would also have to be
+    /// added to `value_taking_flags`, changing how bare `garra --model …` is
+    /// rewritten — see the drift test above.
+    #[test]
+    fn desktop_subcommand_parses_its_flags() {
+        let bare = Cli::try_parse_from(["garra", "desktop"]).expect("`garra desktop` parses");
+        assert!(matches!(
+            bare.command,
+            Commands::Desktop {
+                status: false,
+                no_launch: false
+            }
+        ));
+
+        let status =
+            Cli::try_parse_from(["garra", "desktop", "--status"]).expect("`--status` parses");
+        assert!(matches!(
+            status.command,
+            Commands::Desktop { status: true, .. }
+        ));
+
+        let no_launch =
+            Cli::try_parse_from(["garra", "desktop", "--no-launch"]).expect("`--no-launch` parses");
+        assert!(matches!(
+            no_launch.command,
+            Commands::Desktop {
+                no_launch: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2563,5 +3594,207 @@ mod tests {
         let (host, port) = parsed(&["garra", "start"]);
         assert_eq!(port, 3888, "fallback default port must be 3888");
         assert_eq!(host, "127.0.0.1", "fallback default host must be 127.0.0.1");
+    }
+
+    /// L1 (smoke da v0.4.4): o descritor que o daemon herda como
+    /// stdout/stderr nao pode truncar o log nem escrever no proprio offset.
+    /// O `tracing` escreve pelo SEU descritor (append, `rolling::never`); uma
+    /// escrita crua pelo herdado (panic, `eprintln!`, filho com stderr
+    /// herdado) tem de ir para o fim, depois dele, sem apagar a execucao
+    /// anterior. Com `File::create` a execucao anterior sumia e a escrita
+    /// crua caia no offset 0, por cima da linha do tracing.
+    #[cfg(unix)]
+    #[test]
+    fn log_do_daemon_abre_em_append_sem_truncar_nem_sobrescrever() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("garraia.log");
+        std::fs::write(&path, "execucao anterior\n").expect("semeia o log");
+
+        let mut herdado = abrir_log_do_daemon(&path).expect("abre o log do daemon");
+        let mut do_tracing = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("descritor do tracing");
+        do_tracing
+            .write_all(b"linha do tracing\n")
+            .expect("tracing escreve");
+        herdado
+            .write_all(b"escrita crua\n")
+            .expect("herdado escreve");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("le o log"),
+            "execucao anterior\nlinha do tracing\nescrita crua\n"
+        );
+    }
+
+    /// L2 (smoke da v0.4.4): so os comandos que leem e imprimem ganham
+    /// SIGPIPE padrao. O gateway, o `mcp-server` e o REPL nunca — la um leitor
+    /// que some nao pode matar o processo —, nem o que muda estado.
+    #[test]
+    #[serial]
+    fn sigpipe_padrao_so_nos_comandos_que_leem_e_imprimem() {
+        let cmd = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .unwrap_or_else(|e| panic!("{args:?} deveria parsear: {e}"))
+                .command
+        };
+        for args in [
+            &["garra", "status"][..],
+            &["garra", "about"],
+            &["garra", "logs"],
+            &["garra", "logs", "-f"],
+            &["garra", "logs", "--path"],
+            &["garra", "doctor", "--json"],
+            &["garra", "runs", "list"],
+            &["garra", "config", "check"],
+            &["garra", "memory", "stats"],
+            &["garra", "memory", "list"],
+            &["garra", "memory", "search", "x"],
+            &["garra", "mcp", "list"],
+            &["garra", "channel", "list"],
+            &["garra", "channel", "status", "telegram"],
+            &["garra", "skill", "list"],
+            &["garra", "glob", "test", "*.rs", "a.rs"],
+            &["garra", "whatsapp", "status"],
+            &["garra", "whatsapp", "users"],
+            &["garra", "whatsapp", "users", "--json"],
+            &["garra", "ask", "oi"],
+            &["garra", "desktop", "--status"],
+            &["garra", "desktop", "--no-launch"],
+        ] {
+            assert!(
+                sigpipe_padrao_para(&cmd(args)),
+                "{args:?} so le e imprime: deveria sair em silencio com stdout fechado"
+            );
+        }
+        for args in [
+            &["garra", "start"][..],
+            &["garra", "start", "-d"],
+            &["garra", "restart"],
+            &["garra", "restart", "-d"],
+            &["garra", "stop"],
+            &["garra", "mcp-server"],
+            &["garra", "chat"],
+            &["garra", "init"],
+            &["garra", "update"],
+            &["garra", "verify"],
+            &["garra", "desktop"],
+            &["garra", "whatsapp"],
+            &["garra", "whatsapp", "link"],
+            &["garra", "mcp", "inspect", "x"],
+            &["garra", "memory", "reindex"],
+            &["garra", "memory", "compact"],
+            &["garra", "memory", "add", "x"],
+            &["garra", "config", "set-model", "--model", "m"],
+            &["garra", "skill", "install", "u"],
+            &["garra", "skill", "remove", "n"],
+            &["garra", "whatsapp", "logout"],
+            &["garra", "whatsapp", "remove", "+5511999998888"],
+            &["garra", "whatsapp", "owner", "+5511999998888"],
+            &["garra", "whatsapp", "unowner", "+5511999998888"],
+            &["garra", "agents", "status"],
+        ] {
+            assert!(
+                !sigpipe_padrao_para(&cmd(args)),
+                "{args:?} roda por tempo indeterminado ou muda estado: SIGPIPE segue ignorado"
+            );
+        }
+    }
+
+    /// A decisao de SIGPIPE e exaustiva ate a folha: o compilador so recusa
+    /// um subcomando aninhado novo se o `match` do enum dele nao tiver
+    /// curinga. Este teste prende isso: o corpo de `sigpipe_padrao_para` nao
+    /// usa `matches!` nem `_ =>`, e cada variante de cada enum de subcomando
+    /// (`enum XxxCommands` deste arquivo) aparece la pelo nome — um
+    /// `Commands::Channel { .. } => true` deixaria `ChannelCommands::List`
+    /// sem nome e falharia aqui.
+    #[test]
+    fn sigpipe_decide_cada_subcomando_aninhado_pelo_nome() {
+        let fonte = include_str!("main.rs");
+        let inicio = fonte
+            .find("fn sigpipe_padrao_para(")
+            .expect("sigpipe_padrao_para existe");
+        let corpo = &fonte[inicio..];
+        let corpo = &corpo[..corpo.find("\n}\n").expect("fim da funcao")];
+        assert!(!corpo.contains("matches!"), "matches! esconde variantes");
+        assert!(!corpo.contains("_ =>"), "curinga esconde variantes");
+
+        let mut enums = Vec::new();
+        let mut variantes = 0;
+        for (pos, _) in fonte.match_indices("\nenum ") {
+            let resto = &fonte[pos + "\nenum ".len()..];
+            let nome: String = resto
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if nome == "Commands" || !nome.ends_with("Commands") {
+                continue;
+            }
+            let bloco = &resto[..resto.find("\n}\n").expect("fim do enum")];
+            for linha in bloco.lines() {
+                let Some(v) = linha.strip_prefix("    ") else {
+                    continue;
+                };
+                if !v.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    continue;
+                }
+                let variante: String = v
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                assert!(
+                    corpo.contains(&format!("{nome}::{variante}")),
+                    "{nome}::{variante} nao tem decisao de SIGPIPE explicita"
+                );
+                variantes += 1;
+            }
+            enums.push(nome);
+        }
+        for esperado in ["MemoryCommands", "WhatsAppCommands", "RecoveryCommands"] {
+            assert!(
+                enums.iter().any(|e| e == esperado),
+                "varredura nao achou {esperado}: {enums:?}"
+            );
+        }
+        assert!(variantes >= 40, "varredura achou so {variantes} variantes");
+    }
+
+    /// #1426 (dogfood em container limpo): o pai do daemon nem sempre colhe
+    /// filhos — um container cujo PID 1 e `sleep`, um `docker exec` sem
+    /// `--init`. Ai o gateway encerra limpo no SIGTERM, vira zumbi, e
+    /// `kill(pid, 0)` continua devolvendo 0: o `stop` esperava 5 s, mandava
+    /// SIGKILL e dizia "survived SIGTERM and SIGKILL" de um processo que ja
+    /// tinha morrido. Um zumbi nao esta rodando.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zumbi_nao_conta_como_processo_rodando() {
+        // SAFETY: o filho so chama `_exit`, que e async-signal-safe; o pai
+        // nao compartilha nada com ele e o colhe com `waitpid` antes de
+        // qualquer assert, para nao deixar zumbi no harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork falhou");
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        // Espera o filho virar zumbi DE FATO (estado `Z` no /proc), sem colher.
+        let stat = format!("/proc/{pid}/stat");
+        let virou_zumbi = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::fs::read_to_string(&stat)
+                .ok()
+                .and_then(|s| {
+                    s.rsplit(')')
+                        .next()
+                        .map(|depois| depois.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false)
+        });
+        let resultado = is_process_running(pid as u32);
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(virou_zumbi, "o filho nao virou zumbi em 2 s");
+        assert!(!resultado, "zumbi tratado como processo vivo");
     }
 }

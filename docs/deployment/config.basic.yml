@@ -1,12 +1,24 @@
 # Configuração básica do GarraIA para implantação com Docker
 # Utiliza provedores em nuvem (Anthropic, OpenAI) e conecta-se a APIs externas.
 
-gateway:
-  # Vincula a todas as interfaces dentro do container
-  host: "0.0.0.0"
-  port: 3888
+# #1261: o bind nao mora mais aqui. `gateway.host`/`gateway.port` estao
+# deprecados (o `garraia start` nunca os leu): o Dockerfile passa
+# `--host 0.0.0.0`, e `HOST`/`PORT` do ambiente valem como sempre.
+#
+# Num bind nao-loopback o `garraia start` RECUSA subir sem credencial de
+# gateway. Este arquivo e montado somente-leitura pelo compose, entao a
+# credencial vem do ambiente: defina GARRAIA_GATEWAY_API_KEY (no `.env` ou
+# no painel do RunPod) com um segredo longo e aleatorio, por exemplo
+# `openssl rand -hex 32`. Nunca commite esse valor.
 
 llm:
+  # NOTA: este perfil de exemplo desvia do padrao do projeto de proposito.
+  # O padrao oficial (issue #1180) e OpenRouter + `z-ai/glm-5.3-flash`, com o
+  # local como segunda opcao; aqui o primario e Anthropic porque o exemplo
+  # existe para mostrar dois provedores de nuvem e o encadeamento de
+  # `fallback_providers`. Uma instalacao que nao quer escolher nada e so
+  # rodar `garra init` cai no padrao do projeto, nao neste arquivo.
+  #
   # Anthropic Claude (requer ANTHROPIC_API_KEY)
   claude:
     provider: anthropic
@@ -83,6 +95,27 @@ timeouts:
 #     command: npx
 #     args: ["-y", "my-mcp-server"]
 #     # allowed_tools: []  <- padrão: todas as tools permitidas
+#
+# #1075 (continuação): o processo do servidor MCP NÃO herda o ambiente do
+# gateway. Ele recebe uma allowlist mínima (PATH, HOME, locale, TMPDIR) mais
+# o mapa `env` deste servidor — nenhum segredo do gateway (JWT, chaves de
+# provider, passphrase do cofre) chega ao filho. Declare no `env` o que o
+# servidor precisar:
+# mcp:
+#   meu-servidor:
+#     command: npx
+#     args: ["-y", "my-mcp-server"]
+#     env:
+#       GITHUB_TOKEN: "vault:mcp.meu-servidor.GITHUB_TOKEN"
+#     # inherit_env: true   <- válvula de escape: devolve o ambiente INTEIRO
+#     #                        do gateway (segredos inclusive) ao filho.
+#     #                        Padrão false; emite warn! na conexão.
+#
+# Referências `vault:<chave>` em `env` são resolvidas no boot (#1237): o
+# valor cifrado do cofre é entregue ao filho, em config.yml e mcp.json.
+# O cofre precisa estar aberto (GARRAIA_VAULT_PASSPHRASE definida) e a
+# referência precisa existir no cofre — referência que não resolve impede o
+# servidor de subir (fail-closed, aviso nomeando servidor e chave).
 
 # GAR-261: Configuração de glob e ignore para ferramentas de busca de arquivos
 fs:

@@ -1,4 +1,3 @@
-use crate::mcp_commands;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
@@ -13,7 +12,6 @@ use garraia_auth::{
 use garraia_channels::{ChannelRegistry, CommandRegistry};
 use garraia_config::{AppConfig, AuthConfig};
 use garraia_db::{ChatSessionManager, SessionStore};
-use garraia_runtime::RuntimeSettings;
 use garraia_security::{Allowlist, PairingManager};
 use secrecy::SecretString;
 use std::sync::RwLock;
@@ -26,9 +24,195 @@ const SESSION_TTL: Duration = Duration::from_secs(3600); // 1 hour
 /// How often the cleanup task runs.
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
 
+/// O canal com que a superficie REST de sessoes (`/api/sessions/*`) grava as
+/// dela: e o que `send_message`/`session_history` passam a
+/// [`AppState::hydrate_session_history`] e a [`AppState::persist_turn`], e a
+/// `source` do token que `POST /api/sessions` emite.
+pub const CANAL_DA_API: &str = "api";
+
+/// O tenant de toda sessao que a superficie REST cria: `POST /api/sessions`
+/// passa por [`AppState::create_session`], que usa o de
+/// [`AppState::create_session_with_id`].
+pub(crate) const TENANT_DA_API: &str = "default";
+
+/// O que [`AppState::sessao_da_api`] encontrou.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessaoDaApi {
+    /// Ja estava em memoria, e so foi tocada pelas superficies locais do
+    /// operador ([`SUPERFICIES_LOCAIS`]).
+    EmMemoria,
+    /// Estava so no `sessions.db`, gravada so pela superficie REST, e voltou
+    /// para a memoria.
+    Readotada,
+    /// Nao existe; existe mas e de outra superficie — canal com humano do
+    /// outro lado, mobile —, em memoria ou no disco (#1462); ou foi encerrada
+    /// pelo `DELETE`: em todos os casos, o mesmo `404` de id desconhecido.
+    NaoEncontrada,
+}
+
+/// Se tudo o que o banco guarda desta sessao e o que a superficie REST
+/// grava — a condicao para a rota REST readota-la do disco.
+///
+/// A superficie REST grava: a linha com canal [`CANAL_DA_API`] no tenant
+/// [`TENANT_DA_API`] (`create_token` e a hidratacao), token com `source`
+/// [`CANAL_DA_API`], e turnos com `metadata.channel_id` [`CANAL_DA_API`]. Ela
+/// **nunca** grava chave do Chat Sync (`chat_session_keys`): chave e sinal de
+/// que um canal externo mapeou a sessao, e basta uma, de qualquer fonte, para
+/// recusar.
+///
+/// Todas as marcas, e nao so `sessions.channel_id`: ele e do ultimo a gravar,
+/// e uma leitura REST de uma sessao do Telegram que estava em memoria ja o
+/// reescreve para `api`. As mensagens, as chaves e os tokens guardam quem
+/// veio antes. Metadado de mensagem ilegivel recusa: nao da para dizer quem a
+/// gravou, e na duvida a sessao fica onde esta. Mensagem **sem** canal no
+/// metadado (a da tarefa agendada, que grava o metadado da sessao) nao conta
+/// nem a favor nem contra: o canal dela e o da linha, ja conferido.
+pub fn sessao_so_da_api(s: &garraia_db::SessionSurfaces) -> bool {
+    s.channel_id == CANAL_DA_API
+        && s.tenant_id == TENANT_DA_API
+        && !s.unreadable_message_metadata
+        && s.key_sources.is_empty()
+        && s.token_sources
+            .iter()
+            .chain(&s.message_channels)
+            .all(|superficie| superficie == CANAL_DA_API)
+}
+
+/// Se a rota REST pode readotar esta sessao do disco: [`sessao_so_da_api`] e
+/// **nao encerrada** pelo `DELETE /api/sessions/{id}`.
+///
+/// O `DELETE` revoga os tokens, e revogar so esvazia `session_tokens`: sem
+/// mais nada, a linha de uma sessao encerrada ficava identica a de uma sessao
+/// REST viva, e a readocao servia o historico inteiro de uma sessao que o
+/// dono tinha fechado. A marca de logout
+/// ([`garraia_db::SessionStore::mark_api_logout`]) e o que as separa. Metadado
+/// da linha ilegivel recusa tambem: dele nao da para dizer se ha a marca, e na
+/// duvida a sessao fica fechada.
+pub fn sessao_readotavel_pela_api(s: &garraia_db::SessionSurfaces) -> bool {
+    sessao_so_da_api(s) && !s.api_logout && !s.unreadable_session_metadata
+}
+
+/// As superficies **locais do operador** — as unicas que um `session_id`
+/// escolhido pelo cliente pode alcancar (#1462).
+///
+/// `X-Session-Id` em `/v1/chat/completions` e o `{id}` de
+/// `POST /api/sessions/{id}/messages` sao valores que quem chama inventa. Os
+/// ids de canal sao adivinhaveis por construcao (`whatsapp-linked-<numero>`,
+/// `telegram-<chat>`), e a sessao do mobile deriva do `sub` do JWT: alcancar
+/// qualquer uma delas por id e ler a conversa de outra pessoa para dentro do
+/// proprio request e gravar o proprio turno na conversa dela. As quatro aqui
+/// sao as superficies sem humano de terceiro do outro lado — o REST, o VS
+/// Code, o chat web e o overlay do desktop —, que compartilham sessao entre
+/// si por desenho (o operador continua no VS Code o que comecou no console).
+pub const SUPERFICIES_LOCAIS: &[&str] = &[
+    CANAL_DA_API,
+    "vscode",
+    crate::approval_scope::CANAL_WEB,
+    crate::approval_scope::CANAL_PARROT,
+];
+
+/// `superficie` esta em [`SUPERFICIES_LOCAIS`]?
+///
+/// Compara o nome **antes do primeiro `:`**: `POST /api/sessions` com
+/// `agent_id` etiqueta a sessao em memoria como `api:<agent>` (`api.rs`,
+/// `projects_handler.rs`), e essa etiqueta e a mesma superficie REST — uma
+/// comparacao exata recusava a sessao para o proprio chamador (achado da
+/// revisao independente da PR #1468). O corte nao alarga nada: um
+/// `telegram:<id>` continua sendo `telegram`, e fechado.
+pub fn superficie_e_local(superficie: &str) -> bool {
+    let base = superficie.split(':').next().unwrap_or(superficie);
+    SUPERFICIES_LOCAIS.contains(&base)
+}
+
+/// Uma sessao gravada no `sessions.db` pode ser alcancada por um id que o
+/// cliente escolheu (#1462)?
+///
+/// Mesma leitura de marcas de [`sessao_so_da_api`], com a allowlist de
+/// [`SUPERFICIES_LOCAIS`] no lugar de "so `api`": toda superficie que ja tocou
+/// a sessao — a linha, os tokens, as mensagens — tem de ser local, e nenhuma
+/// chave do Chat Sync pode existir (chave e sinal de canal externo). Metadado
+/// ilegivel recusa: sem saber quem gravou, a sessao fica fechada.
+pub fn sessao_alcancavel_por_id_do_cliente(s: &garraia_db::SessionSurfaces) -> bool {
+    superficie_e_local(&s.channel_id)
+        && !s.unreadable_session_metadata
+        && !s.unreadable_message_metadata
+        && s.key_sources.is_empty()
+        && s.token_sources
+            .iter()
+            .chain(&s.message_channels)
+            .all(|superficie| superficie_e_local(superficie))
+}
+
+/// A sessao **em memoria** so foi tocada por [`SUPERFICIES_LOCAIS`] (#1462)?
+///
+/// A leitura em memoria de [`sessao_alcancavel_por_id_do_cliente`]:
+/// `channel_id` e o ultimo a gravar e `canais_dos_turnos` guarda todos os que
+/// ja atenderam um turno — basta um de fora para a sessao ser de outra
+/// pessoa. Sessao recem-criada (sem canal ainda) e local: vai nascer da
+/// superficie de quem chama.
+pub fn sessao_em_memoria_e_local(s: &SessionState) -> bool {
+    s.channel_id.as_deref().is_none_or(superficie_e_local)
+        && s.canais_dos_turnos
+            .iter()
+            .all(|canal| superficie_e_local(canal))
+}
+
+/// O que o `sessions.db` guarda de uma sessao, no formato do historico em
+/// memoria: o ultimo resumo (GAR-208) como mensagem de sistema, e depois os
+/// ultimos 100 turnos `user`/`assistant`.
+///
+/// E o que [`AppState::hydrate_session_history`] carrega na primeira
+/// hidratacao e o que [`AppState::historico_de_qualquer_sessao`] le para o
+/// operador sem hidratar. Erro de leitura vira aviso e lista vazia, como a
+/// hidratacao sempre fez.
+fn historico_gravado(guard: &SessionStore, session_id: &str) -> Vec<ChatMessage> {
+    let mut historico = Vec::new();
+    // GAR-208: prepend latest summary (if any) as a System message so the
+    // LLM has context about turns that fall outside the sliding window.
+    if let Ok(Some((summary_text, _))) = guard.get_latest_session_summary(session_id) {
+        historico.push(ChatMessage {
+            role: garraia_agents::ChatRole::System,
+            content: garraia_agents::MessagePart::Text(format!(
+                "[Conversation summary up to this point]\n{summary_text}"
+            )),
+        });
+    }
+
+    match guard.load_recent_messages(session_id, 100) {
+        Ok(messages) => {
+            let recent = messages
+                .into_iter()
+                .filter_map(|m| match m.direction.as_str() {
+                    "user" => Some(ChatMessage {
+                        role: garraia_agents::ChatRole::User,
+                        content: garraia_agents::MessagePart::Text(m.content),
+                    }),
+                    "assistant" => Some(ChatMessage {
+                        role: garraia_agents::ChatRole::Assistant,
+                        content: garraia_agents::MessagePart::Text(m.content),
+                    }),
+                    _ => None,
+                });
+            historico.extend(recent);
+        }
+        Err(e) => {
+            warn!("failed to load session history for {session_id}: {e}");
+        }
+    }
+    historico
+}
+
 /// Shared application state accessible from all request handlers.
 pub struct AppState {
     pub config: AppConfig,
+    /// #1459: as raizes das file tools nativas, resolvidas **uma** vez aqui,
+    /// da mesma config e pela mesma funcao que `build_agent_runtime` usa para
+    /// montar o jail. O `/api/diagnostics` (rota auth-free) e o `garra_status`
+    /// leem daqui em vez de resolver por request/chamada — o que custava um
+    /// `canonicalize` por raiz e um `warn!` por raiz que nao resolve, a cada
+    /// pedido de qualquer um. E descreve o jail que o turno de fato usa: o
+    /// jail e fixado no boot, entao o disco de agora nao e a verdade.
+    pub raizes_das_file_tools: crate::bootstrap::RaizesDasFileTools,
     pub channels: tokio::sync::RwLock<ChannelRegistry>,
     pub agents: Arc<AgentRuntime>,
     pub sessions: DashMap<String, SessionState>,
@@ -36,9 +220,13 @@ pub struct AppState {
     pub channel_models: DashMap<String, String>,
     /// In-flight A2A tasks keyed by task ID.
     pub a2a_tasks: DashMap<String, garraia_agents::a2a::A2ATask>,
-    /// MCP manager wrapped in Arc for health monitoring, slash commands and
-    /// the admin API. Populated by `GatewayServer::run` right after
-    /// `AppState::new` — before `register_mcp_tools()` reads it.
+    /// MCP manager wrapped in Arc for health monitoring and the admin API.
+    /// Populated by `GatewayServer::run` right after `AppState::new`.
+    ///
+    /// MCP tools reach the model through `AgentRuntime` (see
+    /// `sync_mcp_tools`/`replace_mcp_tools`), which dispatches them behind
+    /// `ToolGate`. They are deliberately **not** exposed as slash commands:
+    /// that parallel path skipped the gate entirely (issue #1386).
     pub mcp_manager_arc: Option<Arc<garraia_agents::McpManager>>,
     /// Live registry of MCP server configs and statuses (source of truth for admin API).
     pub mcp_registry: crate::mcp::McpRuntimeRegistry,
@@ -82,8 +270,15 @@ pub struct AppState {
     pub pairing: Arc<std::sync::Mutex<PairingManager>>,
     /// Tracks when the application started for uptime calculation.
     pub boot_time: std::time::Instant,
-    /// Runtime settings for agent execution.
-    pub runtime_settings: RuntimeSettings,
+    /// #1238 (fatia D): o que o supervisor do canal `whatsapp_linked` sabe
+    /// sobre a ponte Node/Baileys.
+    ///
+    /// Nao e `Option`: o handle e barato (um `AtomicU8`) e criar sempre evita
+    /// a ordem impossivel — o sink precisa de `SharedState` e o `AppState`
+    /// precisa do handle, entao um dos dois teria de nascer vazio. Com o
+    /// handle sempre presente, `BridgeView::Unknown` diz "ninguem
+    /// supervisiona", que e a verdade num gateway sem WhatsApp vinculado.
+    pub whatsapp_linked: Arc<crate::bootstrap::WhatsAppLinkedRuntime>,
 
     // ── GAR-391c: garraia-auth wiring ──────────────────────────────────────
     // All five are `Option` so the gateway boots in fail-soft mode when
@@ -193,6 +388,16 @@ pub struct SessionState {
     pub project_name: Option<String>,
     /// Phase 1.3: Project ID linking this session to a registered project.
     pub project_id: Option<String>,
+    /// #1347: toda superficie que ja atendeu um turno desta sessao — o nome
+    /// que o ponto de entrada passa a [`AppState::hydrate_session_history`] /
+    /// [`AppState::persist_turn`] (`"telegram"`, `"web"`, `"mobile"`...).
+    ///
+    /// Diferente de `channel_id`, que e o ULTIMO a escrever, isto so
+    /// cresce: uma sessao compartilhada (Chat Sync, VS Code + Telegram) guarda
+    /// os dois nomes, e um turno local nao apaga o fato de que um remetente
+    /// remoto le esta conversa. E o que o `garra_status` consulta para decidir
+    /// se retem o que e do operador (ver `channels_view::sessao_do_operador`).
+    pub canais_dos_turnos: std::collections::BTreeSet<String>,
 }
 
 /// Agent configuration override for a session.
@@ -206,8 +411,38 @@ pub struct AgentConfigOverride {
 
 impl AppState {
     pub fn new(config: AppConfig, agents: Arc<AgentRuntime>, channels: ChannelRegistry) -> Self {
+        Self::with_config_dir(
+            config,
+            agents,
+            channels,
+            &garraia_config::ConfigLoader::default_config_dir(),
+        )
+    }
+
+    /// Like [`Self::new`], with the config directory (where `mcp.json` is
+    /// provisioned and `allowlist.json` lives) passed in instead of resolved
+    /// from `GARRAIA_CONFIG_DIR`/`$HOME`.
+    ///
+    /// Tests use it so they never touch the process environment: a test that
+    /// pointed `GARRAIA_CONFIG_DIR` at its tempdir raced every other test
+    /// building an `AppState` in parallel — any of them could provision its own
+    /// `mcp.json` into that tempdir first (the flaky
+    /// `o_relatorio_de_verdade_inclui_perfil_e_raiz_do_mcp`).
+    pub(crate) fn with_config_dir(
+        config: AppConfig,
+        agents: Arc<AgentRuntime>,
+        channels: ChannelRegistry,
+        config_dir: &std::path::Path,
+    ) -> Self {
+        // ADR 0024 (#1329): raizes do MCP `filesystem` por perfil de execucao,
+        // resolvidas antes de `config` ser movida para o estado.
+        let raizes_mcp = crate::bootstrap::raizes_do_mcp_filesystem(&config);
+        // #1459: idem para as file tools nativas — uma vez, antes de `config`
+        // ser movida, e nunca mais por request.
+        let raizes_das_file_tools = crate::bootstrap::raizes_das_file_tools(&config);
         Self {
             config,
+            raizes_das_file_tools,
             channels: tokio::sync::RwLock::new(channels),
             agents,
             sessions: DashMap::new(),
@@ -217,8 +452,9 @@ impl AppState {
             mcp_registry: {
                 // GAR-291: attach vault so sensitive env vars are resolved on load.
                 // Provision filesystem MCP on first boot when mcp.json is absent.
-                let svc = crate::mcp::McpPersistenceService::with_default_path();
-                svc.provision_filesystem_if_missing();
+                // ADR 0024 (#1329): raizes por perfil de execucao, nunca `$HOME`.
+                let svc = crate::mcp::McpPersistenceService::new(config_dir.join("mcp.json"));
+                svc.provision_filesystem_if_missing(&raizes_mcp);
                 let svc = if let Some(vp) = crate::bootstrap::default_vault_path() {
                     svc.with_vault(vp)
                 } else {
@@ -242,13 +478,13 @@ impl AppState {
                 Arc::new(RwLock::new(reg))
             },
             allowlist: Arc::new(std::sync::Mutex::new(Allowlist::load_or_create(
-                &garraia_config::ConfigLoader::default_config_dir().join("allowlist.json"),
+                &config_dir.join("allowlist.json"),
             ))),
             pairing: Arc::new(std::sync::Mutex::new(PairingManager::new(
                 std::time::Duration::from_secs(300),
             ))),
             boot_time: Instant::now(),
-            runtime_settings: RuntimeSettings::default(),
+            whatsapp_linked: Arc::new(crate::bootstrap::WhatsAppLinkedRuntime::default()),
             // GAR-391c auth wiring — None until bootstrap loads AuthConfig.
             auth_provider: None,
             jwt_issuer: None,
@@ -398,29 +634,6 @@ impl AppState {
         self.config_rx = Some(rx);
     }
 
-    /// Configure the runtime settings for agent execution.
-    pub fn set_runtime_settings(&mut self, settings: RuntimeSettings) {
-        self.runtime_settings = settings;
-    }
-
-    /// Register MCP tools as slash commands.
-    /// This does the async work first, then registers synchronously.
-    pub async fn register_mcp_tools(&self) {
-        if let Some(manager_arc) = &self.mcp_manager_arc {
-            // First, do all async work to collect commands (no lock held)
-            let commands = mcp_commands::collect_mcp_commands(Arc::clone(manager_arc)).await;
-
-            // Then acquire lock and register synchronously
-            let mut registry = self.command_registry.write().unwrap();
-            mcp_commands::register_collected_commands(&mut registry, commands);
-        }
-    }
-
-    /// Get a reference to the runtime settings.
-    pub fn runtime_settings(&self) -> &RuntimeSettings {
-        &self.runtime_settings
-    }
-
     /// Check if config hot-reload watcher is active.
     pub fn has_config_watcher(&self) -> bool {
         self.config_rx.is_some()
@@ -480,6 +693,7 @@ impl AppState {
                 working_dir: None,
                 project_name: None,
                 project_id: None,
+                canais_dos_turnos: std::collections::BTreeSet::new(),
             },
         );
     }
@@ -577,6 +791,7 @@ impl AppState {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             if let Some(channel) = channel_id {
                 session.channel_id = Some(channel.to_string());
+                session.canais_dos_turnos.insert(channel.to_string());
             }
             if let Some(user) = user_id {
                 session.user_id = Some(user.to_string());
@@ -617,39 +832,7 @@ impl AppState {
             }
 
             if should_load {
-                // GAR-208: prepend latest summary (if any) as a System message so the
-                // LLM has context about turns that fall outside the sliding window.
-                if let Ok(Some((summary_text, _))) = guard.get_latest_session_summary(session_id) {
-                    loaded_history.push(ChatMessage {
-                        role: garraia_agents::ChatRole::System,
-                        content: garraia_agents::MessagePart::Text(format!(
-                            "[Conversation summary up to this point]\n{summary_text}"
-                        )),
-                    });
-                }
-
-                match guard.load_recent_messages(session_id, 100) {
-                    Ok(messages) => {
-                        let recent: Vec<ChatMessage> = messages
-                            .into_iter()
-                            .filter_map(|m| match m.direction.as_str() {
-                                "user" => Some(ChatMessage {
-                                    role: garraia_agents::ChatRole::User,
-                                    content: garraia_agents::MessagePart::Text(m.content),
-                                }),
-                                "assistant" => Some(ChatMessage {
-                                    role: garraia_agents::ChatRole::Assistant,
-                                    content: garraia_agents::MessagePart::Text(m.content),
-                                }),
-                                _ => None,
-                            })
-                            .collect();
-                        loaded_history.extend(recent);
-                    }
-                    Err(e) => {
-                        warn!("failed to load session history for {session_id}: {e}");
-                    }
-                }
+                loaded_history = historico_gravado(&guard, session_id);
             }
         }
 
@@ -659,6 +842,9 @@ impl AppState {
         {
             session.history = loaded_history;
         }
+        // #1379: o projeto que a sessao tinha antes do restart volta do banco,
+        // confinado de novo pelas raizes de projeto do operador.
+        crate::projetos_da_sessao::restaurar(self, session_id).await;
     }
 
     /// Append a user/assistant turn to in-memory state and persistent session storage.
@@ -677,6 +863,7 @@ impl AppState {
         if let Some(mut session) = self.sessions.get_mut(session_id) {
             if let Some(channel) = channel_id {
                 session.channel_id = Some(channel.to_string());
+                session.canais_dos_turnos.insert(channel.to_string());
             }
             if let Some(user) = user_id {
                 session.user_id = Some(user.to_string());
@@ -777,6 +964,206 @@ impl AppState {
         }
     }
 
+    /// A sessao que `/api/sessions/{id}/*` pode servir: a que esta em memoria
+    /// ou, fora dela, a que o `sessions.db` diz que **so a superficie REST**
+    /// gravou — e essa volta para a memoria aqui.
+    ///
+    /// # Por que existe
+    ///
+    /// `GET /api/sessions/{id}/history`, `POST .../messages` e `DELETE` so
+    /// olhavam o mapa em memoria, e ele nasce vazio a cada subida: depois de
+    /// qualquer restart toda sessao REST virava `404 session not found` com
+    /// as linhas inteiras no `sessions.db` (a hidratacao que as carregaria
+    /// vinha depois do 404). E o mesmo buraco da #922, na superficie REST.
+    ///
+    /// # Em memoria: so as superficies locais do operador (#1462)
+    ///
+    /// Ate a #1462 o ramo em memoria nao consultava regra nenhuma, e a
+    /// sessao de um canal esta em memoria no caso normal — a hidratacao do
+    /// canal a poe la. `GET /api/sessions/{id}/history` devolvia entao a
+    /// transcricao de qualquer conversa de canal, verbatim, por um id
+    /// adivinhavel por construcao (`whatsapp-linked-<numero>`,
+    /// `telegram-<chat>`), numa rota auth-free por padrao e sem LLM no meio.
+    /// Agora vale aqui a mesma regra da escrita por id
+    /// ([`sessao_em_memoria_e_local`]): so sessao tocada apenas por
+    /// [`SUPERFICIES_LOCAIS`]; a de canal ou do mobile e `NaoEncontrada` —
+    /// o mesmo `404` de id inexistente, sem confirmar que existe — e **nao e
+    /// tocada**: quem chama ainda nao hidratou nada. A leitura de qualquer
+    /// sessao e do operador autenticado, em
+    /// [`Self::historico_de_qualquer_sessao`].
+    ///
+    /// # O que pode voltar do disco — e o que nao pode
+    ///
+    /// A regra do disco nao pode deixar esta rota alcancar o que ela nao
+    /// alcancava antes do restart. Uma sessao de outra superficie (Telegram,
+    /// WhatsApp, web, mobile, CLI...) so entra na memoria do gateway pela
+    /// propria superficie; trazer ela do disco por aqui seria alcance novo —
+    /// e a do `garra chat --persist` nunca esteve na memoria do gateway. Por
+    /// isso so volta a sessao cujas marcas no banco sao todas as que a
+    /// superficie REST grava e que o `DELETE` nao encerrou (ver
+    /// [`sessao_readotavel_pela_api`]). A de outra superficie segue
+    /// `NaoEncontrada` ate a propria superficie a trazer de volta.
+    ///
+    /// A readocao so pos na memoria o que o banco ja dizia — tenant
+    /// [`TENANT_DA_API`] e canal [`CANAL_DA_API`] — e nao escreve no banco:
+    /// quem escreve e a hidratacao do handler, com o mesmo canal que ela ja
+    /// usava. Por isso nada de uma sessao recusada muda, nem a linha, nem as
+    /// marcas que as outras superficies e o `--resume latest` do CLI leem.
+    ///
+    /// # Por que nao pede token, como a #922 no WS
+    ///
+    /// O WS re-adota do disco so com token porque, la, estar em memoria tem
+    /// prazo: sessao desconectada sai pelo TTL, e o token e o que prova dono
+    /// depois disso. Aqui a prova nunca foi o token — nenhuma rota HTTP valida
+    /// token de sessao (ver `refuse_inert_auth_flag` em `server.rs`) — e a
+    /// sessao REST nao desconecta sozinha: so o `DELETE` a marca assim. Ele
+    /// revoga os tokens sem apagar a conversa, que seguia legivel por aqui
+    /// enquanto estava em memoria (e cada leitura a reconectava) — isso nao
+    /// muda. Depois que a memoria a esquece (TTL ou restart), a sessao
+    /// encerrada dava `404`, e continua dando: o `DELETE` grava a marca de
+    /// logout no banco ([`Self::registrar_logout_da_api`]) e a readocao recusa
+    /// quem a carrega. O que protege estas rotas e o gate de `api_key`
+    /// (#1045/#1261), que roda antes do handler e nao muda aqui.
+    ///
+    /// `Err` so quando o banco nao pode ser lido: ai nada e readotado, e o
+    /// handler diz que falhou em vez de afirmar que a sessao nao existe.
+    pub async fn sessao_da_api(&self, session_id: &str) -> garraia_common::Result<SessaoDaApi> {
+        if let Some(sessao) = self.sessions.get(session_id) {
+            if sessao_em_memoria_e_local(&sessao) {
+                return Ok(SessaoDaApi::EmMemoria);
+            }
+            // Sem o id no log: o de sessao de canal carrega telefone.
+            warn!("sessao de outra superficie em memoria: a rota REST por id nao a alcanca");
+            return Ok(SessaoDaApi::NaoEncontrada);
+        }
+        let Some(store) = &self.session_store else {
+            return Ok(SessaoDaApi::NaoEncontrada);
+        };
+        let superficies = store.lock().await.get_session_surfaces(session_id)?;
+        let Some(superficies) = superficies else {
+            return Ok(SessaoDaApi::NaoEncontrada);
+        };
+        if !sessao_readotavel_pela_api(&superficies) {
+            // Sem o id nem o canal no log: o id de sessao de canal carrega
+            // telefone (`whatsapp-<numero>`), e o `channel_id` que o Chat Sync
+            // grava ao criar a sessao e o id externo (o `chat_id`).
+            tracing::debug!(
+                encerrada = superficies.api_logout,
+                "sessao de outra superficie ou encerrada: a rota REST nao a readota do disco"
+            );
+            return Ok(SessaoDaApi::NaoEncontrada);
+        }
+        // Reconfere depois do `await` do lock: outra requisicao pode ter
+        // readotado (ou a hidratacao de um canal, criado) nesse meio tempo,
+        // e recriar apagaria o historico que ela ja carregou. E o mesmo
+        // `contains_key` + insercao da hidratacao, com a mesma janela curta.
+        if !self.sessions.contains_key(session_id) {
+            self.create_session_with_id(session_id.to_string());
+            if let Some(mut sessao) = self.sessions.get_mut(session_id) {
+                sessao.channel_id = Some(CANAL_DA_API.to_string());
+            }
+        }
+        info!("sessao REST readotada do sessions.db");
+        Ok(SessaoDaApi::Readotada)
+    }
+
+    /// Um `session_id` que o **cliente escolheu** pode alcancar esta sessao
+    /// (#1462)?
+    ///
+    /// `Ok(true)`: a sessao nao existe (vai nascer agora, da superficie de
+    /// quem chama) ou so foi tocada por [`SUPERFICIES_LOCAIS`]. `Ok(false)`:
+    /// e de um canal com humano do outro lado, ou do mobile — o chamador
+    /// responde como se nao existisse, sem confirmar que existe. `Err`: o
+    /// `sessions.db` nao pode ser lido; nada e afirmado.
+    ///
+    /// Le a memoria primeiro, pelo mesmo motivo do `EmMemoria` de
+    /// [`Self::sessao_da_api`]: uma sessao de canal esta em memoria no caso
+    /// normal, porque a hidratacao do canal a poe la. Depois o disco, para a
+    /// sessao que um restart tirou da memoria — e e por isso que a checagem
+    /// vem **antes** de [`Self::hydrate_session_history`]: hidratar primeiro
+    /// traria o historico da vitima e gravaria a superficie do atacante na
+    /// linha dela.
+    pub async fn id_de_sessao_do_cliente_alcanca(
+        &self,
+        session_id: &str,
+    ) -> garraia_common::Result<bool> {
+        if let Some(sessao) = self.sessions.get(session_id) {
+            return Ok(sessao_em_memoria_e_local(&sessao));
+        }
+        let Some(store) = &self.session_store else {
+            return Ok(true);
+        };
+        let superficies = store.lock().await.get_session_surfaces(session_id)?;
+        Ok(superficies
+            .as_ref()
+            .is_none_or(sessao_alcancavel_por_id_do_cliente))
+    }
+
+    /// O historico de **qualquer** sessao, para a leitura do operador
+    /// autenticado (`GET /admin/api/sessions/{id}/history`, #1462).
+    ///
+    /// Memoria primeiro; se ela nao tem a sessao (ou a tem vazia, recem
+    /// readotada), o `sessions.db` — **sem hidratar**. A hidratacao gravaria
+    /// `channel_id = api` por cima da linha do canal e anotaria a superficie
+    /// REST em `canais_dos_turnos`: exatamente as marcas que
+    /// [`sessao_alcancavel_por_id_do_cliente`] e [`sessao_em_memoria_e_local`]
+    /// leem para decidir quem alcanca a sessao. Uma leitura administrativa
+    /// nao pode reetiquetar a conversa de um terceiro como do operador.
+    ///
+    /// `Ok(None)`: a sessao nao existe em lugar nenhum. `Err`: o banco nao
+    /// pode ser lido; nada e afirmado. Quem chama e que prova a credencial —
+    /// esta funcao nao decide autorizacao.
+    pub async fn historico_de_qualquer_sessao(
+        &self,
+        session_id: &str,
+    ) -> garraia_common::Result<Option<Vec<ChatMessage>>> {
+        let em_memoria = self.sessions.get(session_id).map(|s| s.history.clone());
+        if let Some(historico) = &em_memoria
+            && !historico.is_empty()
+        {
+            return Ok(em_memoria);
+        }
+        let Some(store) = &self.session_store else {
+            return Ok(em_memoria);
+        };
+        let guard = store.lock().await;
+        if guard.get_session_surfaces(session_id)?.is_none() {
+            return Ok(em_memoria);
+        }
+        Ok(Some(historico_gravado(&guard, session_id)))
+    }
+
+    /// Grava no `sessions.db` que o `DELETE /api/sessions/{id}` encerrou esta
+    /// sessao — a marca que [`Self::sessao_da_api`] recusa depois que a
+    /// memoria a esquece.
+    ///
+    /// So o metadado da linha muda (ver
+    /// [`garraia_db::SessionStore::mark_api_logout`]): o `DELETE` alcanca
+    /// sessao em memoria de qualquer superficie, e nada dela e reetiquetado.
+    /// Sem linha no banco, ela nasce com os valores que a hidratacao REST
+    /// gravaria (o tenant da memoria, canal [`CANAL_DA_API`], usuario
+    /// `anonymous`) e a marca, para uma leitura depois do logout nao criar
+    /// uma linha sem ela. Sem banco nao ha de onde readotar, e nao ha o que
+    /// gravar.
+    ///
+    /// `Err` quando a marca nao pode ser gravada: o logout nao e duravel, e o
+    /// handler diz isso em vez de responder `ok`.
+    pub async fn registrar_logout_da_api(&self, session_id: &str) -> garraia_common::Result<()> {
+        let Some(store) = &self.session_store else {
+            return Ok(());
+        };
+        // Clonado antes do `await`: o guard do DashMap nao atravessa o lock.
+        let tenant_id = self
+            .sessions
+            .get(session_id)
+            .map(|s| s.tenant_id.clone())
+            .unwrap_or_else(|| TENANT_DA_API.to_string());
+        store
+            .lock()
+            .await
+            .mark_api_logout(session_id, &tenant_id, CANAL_DA_API, "anonymous")
+    }
+
     /// Remove sessions that have been disconnected longer than the TTL.
     pub fn cleanup_expired_sessions(&self) -> usize {
         self.cleanup_expired_sessions_at(Instant::now())
@@ -852,6 +1239,66 @@ impl AppState {
     /// distinguivel — CLI, overlay, `POST /api/chat` — passa `None`, e a sessao
     /// e a pessoa.
     pub async fn exec_context_for(&self, session_id: &str, user_id: Option<&str>) -> ExecContext {
+        self.exec_context_for_msg(session_id, user_id, None).await
+    }
+
+    /// `exec_context_for` com auto-classify de modo (P1 do gap analysis
+    /// 2026-09-15 — o roteador LLM GAR-227 só valia no shim OpenAI).
+    ///
+    /// Quando: (1) a sessão **não tem modo escolhido**, (2)
+    /// `agent.auto_router_llm_enabled = true` e (3) há texto da mensagem —
+    /// roda o `auto_classify` (heurística primeiro, LLM depois) e persiste o
+    /// modo deduzido com `set_agent_mode_auto`: aparece no `/mode`, mas **não**
+    /// liga a ToolPolicy do #988 — deduzir não é consentir. Contrato idêntico
+    /// ao do shim OpenAI, agora em todos os pontos de entrada.
+    ///
+    /// `text = None` preserva o comportamento antigo (a2a, caminhos sem
+    /// mensagem disponível).
+    pub async fn exec_context_for_msg(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+        text: Option<&str>,
+    ) -> ExecContext {
+        // Auto-classify só na ausência de escolha explícita e com flag ligada.
+        if let Some(texto) = text
+            && !texto.trim().is_empty()
+            && self.chosen_agent_mode_for(session_id).await.is_none()
+        {
+            let cfg = self.current_config();
+            let runtime_ref = self.agents.default_provider().map(|_| &*self.agents);
+            if cfg.agent.auto_router_llm_enabled
+                && let Some(modo) = garraia_agents::auto_router::auto_classify(
+                    texto,
+                    true,
+                    cfg.agent.auto_router_model.as_deref(),
+                    runtime_ref,
+                )
+                .await
+                && let Some(store) = &self.session_store
+            {
+                match store
+                    .lock()
+                    .await
+                    .set_agent_mode_auto(session_id, modo.as_str())
+                {
+                    Ok(()) => tracing::debug!(
+                        mode = %modo,
+                        session = %session_id,
+                        "auto_router: modo deduzido persistido (entrada principal)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        session = %session_id,
+                        erro = %e,
+                        "falhou ao gravar o modo deduzido"
+                    ),
+                }
+            }
+        }
+        self.exec_context_for_inner(session_id, user_id).await
+    }
+
+    async fn exec_context_for_inner(&self, session_id: &str, user_id: Option<&str>) -> ExecContext {
         let goal = self.session_goal_for(session_id, user_id).await;
         // O diretorio da sessao existe desde a Fase 1.3 (`SessionState::working_dir`,
         // gravado por `POST /api/sessions` com `project_id`/`working_dir`) e nunca
@@ -1038,6 +1485,27 @@ pub type SharedState = Arc<AppState>;
 #[cfg(test)]
 mod tests {
 
+    /// P1 gap analysis 2026-09-15: `exec_context_for_msg` com flag desligada
+    /// (default) NÃO muda o comportamento — sem modo escolhido, `exec` sai
+    /// sem política, exatamente como `exec_context_for` de sempre. (O caminho
+    /// com LLM ligado depende de provider e é exercitado pelo auto-router do
+    /// shim OpenAI, que já tem cobertura própria.)
+    #[tokio::test]
+    async fn exec_context_for_msg_sem_flag_preserva_comportamento() {
+        let st = test_state();
+        let sid = "sess-autorouter-off";
+
+        // Flag desligada (default da config de teste).
+        let a = st.exec_context_for(sid, None).await;
+        let b = st
+            .exec_context_for_msg(sid, None, Some("escreve uma funcao que soma"))
+            .await;
+        assert_eq!(a.agent_mode, b.agent_mode);
+        assert_eq!(a.agent_mode, None);
+        // E nada foi gravado como modo deduzido.
+        assert_eq!(st.chosen_agent_mode_for(sid).await, None);
+    }
+
     /// A chave de sessao do Telegram e montada **num lugar so**.
     ///
     /// Este teste existe porque a divergencia ja aconteceu: o GAR-202 migrou a
@@ -1156,6 +1624,136 @@ mod tests {
 
     use super::*;
     use garraia_agents::AgentRuntime;
+
+    // ─── #1462: id escolhido pelo cliente so alcanca superficie local ───
+
+    fn superficies(canal: &str, tocaram: &[&str]) -> garraia_db::SessionSurfaces {
+        garraia_db::SessionSurfaces {
+            tenant_id: TENANT_DA_API.to_string(),
+            channel_id: canal.to_string(),
+            key_sources: Default::default(),
+            token_sources: Default::default(),
+            message_channels: tocaram.iter().map(|s| s.to_string()).collect(),
+            unreadable_message_metadata: false,
+            api_logout: false,
+            unreadable_session_metadata: false,
+        }
+    }
+
+    /// Tabela da regra: so as quatro superficies locais passam, em qualquer
+    /// combinacao; qualquer canal de terceiro, o mobile, uma chave do Chat
+    /// Sync ou um metadado ilegivel fecham a sessao.
+    #[test]
+    fn id_do_cliente_alcanca_so_superficies_locais() {
+        for canal in ["api", "vscode", "web", "parrot"] {
+            assert!(
+                sessao_alcancavel_por_id_do_cliente(&superficies(canal, &[canal])),
+                "{canal} sozinho e local"
+            );
+        }
+        assert!(sessao_alcancavel_por_id_do_cliente(&superficies(
+            "vscode",
+            &["web", "api", "parrot"]
+        )));
+
+        for canal in [
+            "telegram",
+            "whatsapp",
+            "whatsapp_linked",
+            "discord",
+            "imessage",
+            "mobile",
+            "a2a",
+            "openclaw",
+        ] {
+            assert!(
+                !sessao_alcancavel_por_id_do_cliente(&superficies(canal, &[canal])),
+                "{canal} na linha fecha"
+            );
+            assert!(
+                !sessao_alcancavel_por_id_do_cliente(&superficies("api", &["api", canal])),
+                "{canal} num turno fecha, mesmo com a linha em api"
+            );
+        }
+
+        let mut com_chave = superficies("api", &["api"]);
+        com_chave.key_sources.insert("telegram".to_string());
+        assert!(!sessao_alcancavel_por_id_do_cliente(&com_chave));
+
+        let mut token_de_canal = superficies("web", &["web"]);
+        token_de_canal.token_sources.insert("mobile".to_string());
+        assert!(!sessao_alcancavel_por_id_do_cliente(&token_de_canal));
+
+        let mut ilegivel = superficies("api", &["api"]);
+        ilegivel.unreadable_message_metadata = true;
+        assert!(!sessao_alcancavel_por_id_do_cliente(&ilegivel));
+        let mut ilegivel = superficies("api", &["api"]);
+        ilegivel.unreadable_session_metadata = true;
+        assert!(!sessao_alcancavel_por_id_do_cliente(&ilegivel));
+    }
+
+    /// Em memoria a regra le `channel_id` e `canais_dos_turnos`; sem sessao
+    /// e sem store, o id e novo e passa.
+    #[tokio::test]
+    async fn id_do_cliente_em_memoria_le_os_canais_dos_turnos() {
+        let st = AppState::new(
+            AppConfig::default(),
+            Arc::new(AgentRuntime::new()),
+            ChannelRegistry::new(),
+        );
+        assert!(st.id_de_sessao_do_cliente_alcanca("nova").await.unwrap());
+
+        st.hydrate_session_history("do-web", Some("web"), None)
+            .await;
+        assert!(st.id_de_sessao_do_cliente_alcanca("do-web").await.unwrap());
+
+        st.hydrate_session_history("do-telegram", Some("telegram"), Some("7"))
+            .await;
+        assert!(
+            !st.id_de_sessao_do_cliente_alcanca("do-telegram")
+                .await
+                .unwrap()
+        );
+
+        // Uma sessao compartilhada (VS Code + Telegram) guarda os dois nomes:
+        // o turno remoto fecha, mesmo que o ultimo a escrever seja local.
+        st.hydrate_session_history("do-telegram", Some("vscode"), None)
+            .await;
+        assert!(
+            !st.id_de_sessao_do_cliente_alcanca("do-telegram")
+                .await
+                .unwrap()
+        );
+
+        // `POST /api/sessions` com `agent_id` etiqueta a sessao em memoria
+        // como `api:<agent>` (`api.rs`, `projects_handler.rs`): continua
+        // sendo a superficie REST. A regra le a superficie ANTES do `:`.
+        st.hydrate_session_history("do-api-com-agente", Some("api"), None)
+            .await;
+        st.sessions
+            .get_mut("do-api-com-agente")
+            .expect("sessao")
+            .channel_id = Some("api:reachy_voice".to_string());
+        assert!(
+            st.id_de_sessao_do_cliente_alcanca("do-api-com-agente")
+                .await
+                .unwrap(),
+            "api:<agent> e a superficie REST"
+        );
+
+        // O mesmo corte NAO alarga nada: um prefixo de canal segue fechado.
+        st.hydrate_session_history("do-telegram-etiquetado", Some("api"), None)
+            .await;
+        st.sessions
+            .get_mut("do-telegram-etiquetado")
+            .expect("sessao")
+            .channel_id = Some("telegram:123".to_string());
+        assert!(
+            !st.id_de_sessao_do_cliente_alcanca("do-telegram-etiquetado")
+                .await
+                .unwrap()
+        );
+    }
 
     // ─── issue #922: continuidade sobrevive à perda da sessão em memória ───
 
@@ -1436,6 +2034,227 @@ mod tests {
         st.adopt_verified_session("s-nova");
         assert!(st.resume_session("s-nova"), "agora existe e retoma");
         assert!(st.session_history("s-nova").is_empty());
+    }
+
+    /// A regra de readocao REST: toda marca tem de ser a que a superficie
+    /// REST grava. Cada linha da tabela troca uma marca so, para uma regra que
+    /// olhe menos fontes do que deveria falhar aqui.
+    #[test]
+    fn so_volta_do_disco_a_sessao_que_so_a_api_gravou() {
+        use std::collections::BTreeSet;
+        let um = |s: &str| BTreeSet::from([s.to_string()]);
+        let so_api = garraia_db::SessionSurfaces {
+            tenant_id: TENANT_DA_API.to_string(),
+            channel_id: CANAL_DA_API.to_string(),
+            key_sources: BTreeSet::new(),
+            token_sources: um(CANAL_DA_API),
+            message_channels: um(CANAL_DA_API),
+            unreadable_message_metadata: false,
+            api_logout: false,
+            unreadable_session_metadata: false,
+        };
+        assert!(sessao_so_da_api(&so_api));
+        assert!(sessao_readotavel_pela_api(&so_api));
+        assert!(
+            sessao_so_da_api(&garraia_db::SessionSurfaces {
+                token_sources: BTreeSet::new(),
+                message_channels: BTreeSet::new(),
+                ..so_api.clone()
+            }),
+            "sessao da API recem-criada, sem turno nem token"
+        );
+
+        let casos: Vec<(&str, garraia_db::SessionSurfaces)> = vec![
+            (
+                "ultimo canal do cli",
+                garraia_db::SessionSurfaces {
+                    channel_id: "cli".to_string(),
+                    ..so_api.clone()
+                },
+            ),
+            (
+                "prefixo parecido nao e o canal",
+                garraia_db::SessionSurfaces {
+                    channel_id: "api:reachy".to_string(),
+                    ..so_api.clone()
+                },
+            ),
+            (
+                "outro tenant",
+                garraia_db::SessionSurfaces {
+                    tenant_id: "tenant-a".to_string(),
+                    ..so_api.clone()
+                },
+            ),
+            (
+                "chave do Chat Sync",
+                garraia_db::SessionSurfaces {
+                    key_sources: um("telegram"),
+                    ..so_api.clone()
+                },
+            ),
+            (
+                // A REST nunca mapeia chave externa; nem a da fonte `api` do
+                // Chat Sync e dela.
+                "chave do Chat Sync com fonte api",
+                garraia_db::SessionSurfaces {
+                    key_sources: um(CANAL_DA_API),
+                    ..so_api.clone()
+                },
+            ),
+            (
+                "token do WS",
+                garraia_db::SessionSurfaces {
+                    token_sources: um("web"),
+                    ..so_api.clone()
+                },
+            ),
+            (
+                "turno gravado por outro canal",
+                garraia_db::SessionSurfaces {
+                    message_channels: BTreeSet::from([
+                        CANAL_DA_API.to_string(),
+                        "whatsapp".to_string(),
+                    ]),
+                    ..so_api.clone()
+                },
+            ),
+            (
+                "metadado ilegivel",
+                garraia_db::SessionSurfaces {
+                    unreadable_message_metadata: true,
+                    ..so_api.clone()
+                },
+            ),
+        ];
+        for (caso, s) in casos {
+            assert!(!sessao_so_da_api(&s), "{caso}: {s:?}");
+            assert!(!sessao_readotavel_pela_api(&s), "{caso}: {s:?}");
+        }
+
+        // So da API, mas encerrada pelo `DELETE` — ou sem como saber: a
+        // superficie e a da API e mesmo assim nao volta do disco.
+        for (caso, s) in [
+            (
+                "marca de logout",
+                garraia_db::SessionSurfaces {
+                    api_logout: true,
+                    ..so_api.clone()
+                },
+            ),
+            (
+                "metadado da linha ilegivel",
+                garraia_db::SessionSurfaces {
+                    unreadable_session_metadata: true,
+                    ..so_api.clone()
+                },
+            ),
+        ] {
+            assert!(sessao_so_da_api(&s), "{caso}: a superficie e a da API");
+            assert!(!sessao_readotavel_pela_api(&s), "{caso}: {s:?}");
+        }
+    }
+
+    /// #1462: em memoria, `sessao_da_api` aplica a regra das superficies
+    /// locais. Ate entao o ramo retornava cedo sem olhar superficie, e a
+    /// sessao de um canal — que esta em memoria no caso normal — era servida
+    /// pela rota REST por id.
+    #[tokio::test]
+    async fn sessao_em_memoria_de_outra_superficie_nao_e_da_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_with_store(dir.path());
+        st.hydrate_session_history("telegram-7", Some("telegram"), Some("7"))
+            .await;
+        assert_eq!(
+            st.sessao_da_api("telegram-7").await.expect("ler"),
+            SessaoDaApi::NaoEncontrada,
+            "sessao de canal em memoria: o mesmo 404 de id inexistente"
+        );
+        st.hydrate_session_history("mobile-u1", Some("mobile"), Some("u1"))
+            .await;
+        assert_eq!(
+            st.sessao_da_api("mobile-u1").await.expect("ler"),
+            SessaoDaApi::NaoEncontrada
+        );
+        // Sessao local em memoria segue servida — inclusive a etiquetada com
+        // `agent_id` (`api:<agent>`), que e a mesma superficie REST.
+        st.hydrate_session_history("do-web", Some("web"), None)
+            .await;
+        assert_eq!(
+            st.sessao_da_api("do-web").await.expect("ler"),
+            SessaoDaApi::EmMemoria
+        );
+        st.hydrate_session_history("do-api", Some("api"), None)
+            .await;
+        st.sessions.get_mut("do-api").unwrap().channel_id = Some("api:reachy".to_string());
+        assert_eq!(
+            st.sessao_da_api("do-api").await.expect("ler"),
+            SessaoDaApi::EmMemoria
+        );
+        assert_eq!(
+            st.sessao_da_api("nunca-existiu").await.expect("ler"),
+            SessaoDaApi::NaoEncontrada
+        );
+        // Sem banco nao ha de onde readotar.
+        assert_eq!(
+            test_state().sessao_da_api("qualquer").await.expect("ler"),
+            SessaoDaApi::NaoEncontrada
+        );
+    }
+
+    /// #1462: a leitura do operador le de qualquer sessao, em memoria ou so
+    /// no disco, e nao hidrata — a linha do canal fica como estava.
+    #[tokio::test]
+    async fn historico_de_qualquer_sessao_le_memoria_e_disco_sem_hidratar() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state_with_store(dir.path());
+        let sid = "telegram-77";
+        st.hydrate_session_history(sid, Some("telegram"), Some("77"))
+            .await;
+        st.persist_turn(sid, Some("telegram"), Some("77"), "oi", "ola")
+            .await;
+
+        let em_memoria = st
+            .historico_de_qualquer_sessao(sid)
+            .await
+            .expect("ler")
+            .expect("existe");
+        assert_eq!(em_memoria.len(), 2);
+
+        st.sessions.remove(sid);
+        let do_disco = st
+            .historico_de_qualquer_sessao(sid)
+            .await
+            .expect("ler")
+            .expect("existe no disco");
+        assert_eq!(do_disco.len(), 2);
+        assert!(!st.sessions.contains_key(sid), "nao hidratou");
+        let superficies = st
+            .session_store
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .get_session_surfaces(sid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(superficies.channel_id, "telegram", "linha intacta");
+
+        assert!(
+            st.historico_de_qualquer_sessao("nunca-existiu")
+                .await
+                .expect("ler")
+                .is_none()
+        );
+        // Sem banco: so o que estiver em memoria.
+        let sem_banco = test_state();
+        assert!(
+            sem_banco
+                .historico_de_qualquer_sessao("x")
+                .await
+                .expect("ler")
+                .is_none()
+        );
     }
     use garraia_channels::ChannelRegistry;
     use garraia_config::AppConfig;

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::response::Html;
 use axum::routing::{get, patch, post};
+use garraia_config::defaults::DEFAULT_CLOUD_MODEL;
 use tokio::sync::Mutex;
 use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
@@ -17,7 +18,6 @@ use crate::mobile_chat;
 use crate::oauth;
 use crate::openai_api;
 use crate::parrot_ws;
-use crate::push_channels::ChannelKind;
 use crate::state::SharedState;
 use crate::stats_handler;
 use crate::totp;
@@ -166,16 +166,42 @@ pub fn build_router(
         }
     });
 
-    // Build CORS layer — use configured origins or allow all in dev mode.
+    // Build CORS layer.
+    //
+    // #1182: o ramo vazio era `allow_origin(Any)` + `allow_methods(Any)` +
+    // `allow_headers(Any)` — "dev mode". So que o default de instalacao e
+    // justamente `allowed_origins` vazio, entao a instalacao default dizia a
+    // QUALQUER pagina da web que ela podia ler a resposta de `127.0.0.1:3888`.
+    // Nao ha caso de uso legitimo para isso: o Web Console e servido pelo
+    // proprio gateway (`GET /`) e e same-origin — CORS nem entra. Cliente
+    // nao-navegador (app mobile, `curl`, Claude Code) ignora CORS. Quem tem
+    // front externo lista a origem dele em `gateway.allowed_origins`.
     let cors_layer = {
-        let origins = &state.config.gateway.allowed_origins;
-        let cors = CorsLayer::new().allow_methods(Any).allow_headers(Any);
+        // `origens_validas` descarta vazio e `*` (que faria o
+        // `AllowOrigin::list` do tower-http entrar em panico no boot).
+        let origins = crate::origin_guard::origens_validas(&state.config.gateway);
         if origins.is_empty() {
-            cors.allow_origin(Any)
+            // Nenhuma origem cross-origin. A camada continua montada (e nao
+            // removida) para o preflight `OPTIONS` seguir sendo tratado aqui,
+            // por fora do gate de api_key.
+            CorsLayer::new()
         } else {
-            let parsed: Vec<axum::http::HeaderValue> =
-                origins.iter().filter_map(|o| o.parse().ok()).collect();
-            cors.allow_origin(parsed)
+            let parsed: Vec<axum::http::HeaderValue> = origins
+                .iter()
+                .filter_map(|o| match o.parse::<axum::http::HeaderValue>() {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        tracing::warn!(
+                            "gateway.allowed_origins: entrada nao e um header value valido; ignorada"
+                        );
+                        None
+                    }
+                })
+                .collect();
+            CorsLayer::new()
+                .allow_methods(Any)
+                .allow_headers(Any)
+                .allow_origin(parsed)
         }
     };
 
@@ -191,15 +217,21 @@ pub fn build_router(
     // gate global, que ja exigiu o bearer quando a chave existe.
     //
     // O guarda compara o `Origin` contra o esquema do transporte, entao ele
-    // precisa saber se este gateway serve TLS nativo. Mesmo criterio do
-    // `use_tls` no server.rs e do `session_cookie_secure` no session_auth:
-    // cert E chave configurados → https; qualquer combinacao falta → http.
-    let use_tls =
-        state.config.gateway.tls_cert_path.is_some() && state.config.gateway.tls_key_path.is_some();
+    // precisa saber se este gateway serve TLS nativo — o que o `server.rs`
+    // de fato serve: feature `tls` E cert E chave (`esquema_efetivo`). Sem a
+    // feature o servidor avisa e cai para HTTP, e a guarda tem de cair junto.
     let learning_guard_state = crate::learning_auth::LearningGuardState {
         gate: api_key_gate.clone(),
-        scheme: if use_tls { "https" } else { "http" },
+        scheme: crate::origin_guard::esquema_efetivo(&state.config.gateway),
     };
+
+    // #1182: a mesma ideia, agora para TODA a superficie mutante do gateway —
+    // `PATCH /api/settings`, `POST /api/mode/select`, `POST /v1/chat/
+    // completions`, `DELETE /api/memory` e companhia — e para todo handshake
+    // de WebSocket. Construido aqui porque o `.nest("/admin", …)` la embaixo
+    // consome `state`. Ver `crate::origin_guard` para o recorte deliberado
+    // (sem `ConnectInfo`, para nao quebrar o app mobile na LAN sem `api_key`).
+    let origin_guard_state = crate::origin_guard::OriginGuardState::new(&state.config.gateway);
     let learning_routes = Router::new()
         .route("/learning", get(crate::learning_handler::learning_ui))
         .route(
@@ -340,6 +372,10 @@ pub fn build_router(
             get(crate::memory_handler::search_memory),
         )
         .route("/api/logs", get(crate::logs_handler::get_logs))
+        // #1227 (slice 6): ledger de runs, somente leitura. Atras do gate
+        // global; sem `api_key`, o handler so responde ao loopback com `Host`
+        // de loopback (ver `runs_handler`).
+        .route("/api/runs", get(crate::runs_handler::list_runs))
         // Plan 0156 (GAR-651): Learning Agent Web UI — montado acima, num
         // sub-router com o guarda de mutantes (#1093); aqui so o merge.
         .merge(learning_routes)
@@ -385,15 +421,6 @@ pub fn build_router(
                 .patch(api::update_custom_mode)
                 .delete(api::delete_custom_mode),
         )
-        // Runtime endpoints - temporarily disabled
-        // .route(
-        //     "/api/runtime/run",
-        //     post(runtime_handler::run_turn_handler),
-        // )
-        // .route(
-        //     "/api/runtime/tools",
-        //     get(runtime_handler::list_tools_handler),
-        // )
         // GAR-335/339: Mobile Cloud Alpha — auth + chat endpoints
         // Auth routes with strict rate limiting (10 req/min, burst 3).
         //
@@ -456,10 +483,11 @@ pub fn build_router(
             "/api/mcp/marketplace",
             get(crate::mcp_marketplace::marketplace_catalog),
         )
-        .route(
-            "/api/mcp/marketplace/install",
-            post(crate::mcp_marketplace::marketplace_install),
-        )
+        // #1245: `POST /api/mcp/marketplace/install` NAO mora aqui. Ele vive
+        // no sub-router protegido `mcp_marketplace::build_marketplace_install_
+        // routes`, merjado mais abaixo junto com `/api/plugins/*`. Montar de
+        // volta neste grupo aberto reabre o bug: registrar servidor MCP sem
+        // sessao de admin, com `env` e `extra_args` escolhidos pelo chamador.
         .route(
             "/api/mcp/{id}/health",
             get(crate::mcp_marketplace::mcp_server_health),
@@ -529,6 +557,13 @@ pub fn build_router(
             state.clone(),
             admin_store.clone(),
         ))
+        // #1245: mesmo tratamento para o install do marketplace — sessao de
+        // admin + CSRF + `Permission::ManagePlugins`. Merjado aqui, ao lado
+        // das rotas irmas, e antes do `nest` que consome o `admin_store`.
+        .merge(crate::mcp_marketplace::build_marketplace_install_routes(
+            state.clone(),
+            admin_store.clone(),
+        ))
         .nest(
             "/admin",
             admin::routes::build_admin_router(state, admin_store, admin_encryption_key),
@@ -538,12 +573,40 @@ pub fn build_router(
         // `build_skill_skin_routes` e `build_plugin_routes` montam sob
         // `/api/`. Com a chave ausente e um passa-direto.
         //
+        // A igualdade exata do conjunto `/v1/` do gate (`ROTAS_DE_CONVERSA`)
+        // depende de a TABELA DE ROTAS acima e o `is_gated_path` do
+        // `gateway_auth.rs` crescerem juntos. Hoje as duas literalidades se
+        // cancelam: o `matchit` nao casa `/v1/messages/`, `//v1/messages` nem
+        // dot-segment, e o gate tampouco os cobre. Quem registrar uma dessas
+        // variantes aqui — para consertar um 404, ou via wildcard ou alias —
+        // sem acrescenta-la la, reabre a #1240: a rota passa a levar ao
+        // handler e o gate segue dizendo "nao e do conjunto". Travado em
+        // `nenhuma_variante_de_uri_alcanca_o_plano_de_conversa_sem_credencial`.
+        //
+        // (Um `NormalizePathLayer` NAO e o risco aqui, ao contrario do que
+        // parece: `Router::layer` roda DEPOIS do roteamento — e por isso que
+        // rota inexistente sob `/api/` tambem leva 401 —, entao reescrever o
+        // path por dentro nao muda a rota ja escolhida; e por fora do router
+        // ele roda antes do gate, que entao ja ve o caminho canonico.)
+        //
         // Cuidado ao mover: em tower, o ultimo `.layer()` e o mais externo,
         // entao a ordem no codigo e o inverso da ordem de execucao. Escrito
         // aqui, o gate roda DEPOIS do CORS e do rate limit — que e o que se
         // quer: o preflight `OPTIONS` e respondido pelo `CorsLayer` sem
         // chegar ao gate, e uma sondagem sem credencial ainda gasta cota do
         // limitador em vez de ser barrada de graca.
+        // #1182: a guarda anti-CSRF generica (rotas mutantes + handshakes de
+        // WebSocket). Escrita ACIMA do `.layer()` do gate de api_key de
+        // proposito: em tower o ultimo `.layer()` do codigo-fonte e o mais
+        // externo, entao aqui ela fica POR DENTRO do gate e roda DEPOIS dele
+        // — um POST sem bearer e com `Origin` estranho morre no 401 do gate,
+        // nao no 403 daqui. E a mesma propriedade que o
+        // `learning_auth_layering.rs` ja exigia para learning, agora travada
+        // tambem para a superficie ampla em `origin_guard_layering.rs`.
+        .layer(axum::middleware::from_fn_with_state(
+            origin_guard_state,
+            crate::origin_guard::cross_origin_guard,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             api_key_gate,
             crate::gateway_auth::api_key_layer,
@@ -736,12 +799,12 @@ async fn list_providers(
 }
 
 #[derive(serde::Deserialize)]
-struct AddProviderRequest {
-    provider_type: String,
-    api_key: Option<String>,
-    model: Option<String>,
-    base_url: Option<String>,
-    set_default: Option<bool>,
+pub struct AddProviderRequest {
+    pub provider_type: String,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub set_default: Option<bool>,
 }
 
 /// Fetch policy for a caller-supplied provider `base_url`.
@@ -766,34 +829,91 @@ fn provider_base_url_policy() -> garraia_common::ssrf::UrlPolicy {
     .with_ip_scope(garraia_common::ssrf::IpScope::AllowPrivate)
 }
 
-/// Vet a caller-supplied `base_url`, if one was sent. `Ok(())` when absent —
+/// Vet a caller-supplied `base_url`, if one was sent. `Ok(None)` when absent —
 /// omitting it means "use the provider's built-in default", which is a
-/// compile-time constant and needs no check.
-fn validate_provider_base_url(base_url: Option<&String>) -> Result<(), String> {
+/// compile-time constant and needs no check. `Ok(Some(vetted))` when the URL
+/// passed the SSRF gate; the caller MUST build the provider's HTTP client
+/// from it via [`garraia_common::ssrf::pinned_client`] so the connect cannot
+/// resolve anywhere else (DNS rebinding) or follow a redirect to a blocked
+/// target (redirect laundering). Discarding the [`VettedUrl`] reopens both
+/// windows — see issue #1248 and rule 14 of `CLAUDE.md`.
+fn vet_provider_base_url(
+    base_url: Option<&String>,
+) -> Result<Option<garraia_common::ssrf::VettedUrl>, String> {
     let Some(raw) = base_url else {
-        return Ok(());
+        return Ok(None);
     };
     garraia_common::ssrf::vet_url(raw, &provider_base_url_policy())
-        .map(|_| ())
+        .map(Some)
         .map_err(|e| format!("base_url rejected: {e}"))
 }
 
+/// #1180 — the model an operator already wrote for `provider_type` in
+/// `config.yml`, if any. Key match first (`llm.openrouter.model`), then the
+/// first `llm:` block whose `provider:` field is `provider_type` — the same
+/// two steps `garra chat` walks before its hardcoded default, so the Web
+/// Console and the CLI cannot disagree about what the config asks for.
+fn configured_model_for(config: &garraia_config::AppConfig, provider_type: &str) -> Option<String> {
+    let non_empty = |m: &String| !m.trim().is_empty();
+    config
+        .llm
+        .get(provider_type)
+        .and_then(|block| block.model.clone())
+        .filter(non_empty)
+        .or_else(|| {
+            config
+                .llm
+                .values()
+                .filter(|block| block.provider == provider_type)
+                .filter_map(|block| block.model.clone())
+                .find(non_empty)
+        })
+}
+
 /// POST /api/providers — add a new LLM provider at runtime.
-async fn add_provider(
+pub async fn add_provider(
     axum::extract::State(state): axum::extract::State<SharedState>,
     axum::Json(body): axum::Json<AddProviderRequest>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
     // SSRF gate, ahead of every provider branch so none can be forgotten.
-    if let Err(message) = validate_provider_base_url(body.base_url.as_ref()) {
-        tracing::warn!(provider_type = %body.provider_type, "{message}");
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({
-                "status": "error",
-                "message": message,
-            })),
-        );
-    }
+    // The VettedUrl is kept (not discarded) so each provider's HTTP client can
+    // be pinned to the resolved addresses with redirects off — closing both the
+    // redirect-laundering and DNS-rebinding windows that an unpinned client
+    // opens (issue #1248, rule 14 of `CLAUDE.md`).
+    let vetted = match vet_provider_base_url(body.base_url.as_ref()) {
+        Ok(v) => v,
+        Err(message) => {
+            tracing::warn!(provider_type = %body.provider_type, "{message}");
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "status": "error",
+                    "message": message,
+                })),
+            );
+        }
+    };
+    // Build the pinned client once; cloned into every provider branch. `None`
+    // means the caller sent no `base_url` and the provider will use its
+    // compile-time default endpoint — a trusted constant that needs no
+    // pinning, only the `redirect::Policy::none()` defense-in-depth every
+    // provider constructor now applies.
+    let pinned_client: Option<reqwest::Client> = match vetted.as_ref() {
+        Some(v) => match garraia_common::ssrf::pinned_client(v, &provider_base_url_policy()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::error!(provider_type = %body.provider_type, "pinned client build failed: {e}");
+                return (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({
+                        "status": "error",
+                        "message": format!("base_url rejected: {e}"),
+                    })),
+                );
+            }
+        },
+        None => None,
+    };
 
     let provider_type = body.provider_type.as_str();
 
@@ -837,6 +957,13 @@ async fn add_provider(
                 body.model.clone(),
                 body.base_url.clone(),
             );
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "openai" => {
@@ -854,6 +981,13 @@ async fn add_provider(
                 body.model.clone(),
                 body.base_url.clone(),
             );
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "openrouter" => {
@@ -870,12 +1004,27 @@ async fn add_provider(
                 .base_url
                 .clone()
                 .or_else(|| Some("https://openrouter.ai/api/v1".to_string()));
+            // #1180: the Web Console's "Save & Activate" on a fresh install
+            // lands here with the pasted key and nothing else — no `model`.
+            // This path used to fall on a hardcoded `openai/gpt-4o`, one more
+            // answer to "which model runs when nobody chose one?" that the
+            // shared constant could not see. A `model:` the operator already
+            // wrote on the config's `openrouter` block wins; otherwise the
+            // project default, the same one the boot path uses.
             let model = body
                 .model
                 .clone()
-                .or_else(|| Some("openai/gpt-4o".to_string()));
+                .or_else(|| configured_model_for(&state.config, "openrouter"))
+                .or_else(|| Some(DEFAULT_CLOUD_MODEL.to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("openrouter");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "sansa" => {
@@ -898,6 +1047,13 @@ async fn add_provider(
                 .or_else(|| Some("sansa-auto".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("sansa");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "deepseek" => {
@@ -920,6 +1076,13 @@ async fn add_provider(
                 .or_else(|| Some("deepseek-chat".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("deepseek");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "mistral" => {
@@ -942,6 +1105,13 @@ async fn add_provider(
                 .or_else(|| Some("mistral-large-latest".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("mistral");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "gemini" => {
@@ -963,6 +1133,13 @@ async fn add_provider(
                 .or_else(|| Some("gemini-2.5-flash".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("gemini");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "falcon" => {
@@ -985,6 +1162,13 @@ async fn add_provider(
                 .or_else(|| Some("tiiuae/falcon-180b-chat".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("falcon");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "jais" => {
@@ -1007,6 +1191,13 @@ async fn add_provider(
                 .or_else(|| Some("jais-adapted-70b-chat".to_string()));
             let provider =
                 garraia_agents::OpenAiProvider::new(key.clone(), model, base_url).with_name("jais");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "qwen" => {
@@ -1025,6 +1216,13 @@ async fn add_provider(
             let model = body.model.clone().or_else(|| Some("qwen-plus".to_string()));
             let provider =
                 garraia_agents::OpenAiProvider::new(key.clone(), model, base_url).with_name("qwen");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "yi" => {
@@ -1044,6 +1242,13 @@ async fn add_provider(
             let model = body.model.clone().or_else(|| Some("yi-large".to_string()));
             let provider =
                 garraia_agents::OpenAiProvider::new(key.clone(), model, base_url).with_name("yi");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "cohere" => {
@@ -1066,6 +1271,13 @@ async fn add_provider(
                 .or_else(|| Some("command-r-plus".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("cohere");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "minimax" => {
@@ -1088,6 +1300,13 @@ async fn add_provider(
                 .or_else(|| Some("MiniMax-Text-01".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("minimax");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "moonshot" => {
@@ -1110,11 +1329,25 @@ async fn add_provider(
                 .or_else(|| Some("kimi-k2-0711-preview".to_string()));
             let provider = garraia_agents::OpenAiProvider::new(key.clone(), model, base_url)
                 .with_name("moonshot");
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         "ollama" => {
             let provider =
                 garraia_agents::OllamaProvider::new(body.model.clone(), body.base_url.clone());
+            // Pin the provider's HTTP client to the SSRF-vetted addresses
+            // (redirects off) when the caller supplied a `base_url`. `None`
+            // means a compile-time default endpoint — trusted, no pinning.
+            let provider = match pinned_client.as_ref() {
+                Some(c) => provider.with_client(c.clone()),
+                None => provider,
+            };
             state.agents.register_provider(Arc::new(provider));
         }
         other => {
@@ -1269,74 +1502,13 @@ async fn test_provider(
 
 // ─── Channels (plan 0120 / PR-7) ───────────────────────────────────────────
 
-/// Known channels — display metadata mirrors `KNOWN_PROVIDERS`. The `id`
-/// column matches `ChannelRegistry` entries for pull channels; `needs_secret`
-/// is purely informational (the Web Console renders an amber pill when true
-/// but the actual secret value never crosses the API boundary).
-///
-/// A coluna `kind` entrou pela #1079 e e a **unica** fonte de "quem e push".
-/// Canal push nao entra no `ChannelRegistry` — o `Vec<Arc<_>>` dele vira
-/// estado da rota `/webhooks/*` —, entao derivar status do registry dava
-/// `"offline"` eterno para os quatro. O status deles vem do
-/// [`PushChannelStates`], e um teste confere que todo `Push` desta tabela e
-/// conhecido la, para as duas fontes nao divergirem em silencio.
-///
-/// [`PushChannelStates`]: crate::push_channels::PushChannelStates
-const KNOWN_CHANNELS: &[(&str, &str, bool, ChannelKind)] = &[
-    ("web", "Web Chat", false, ChannelKind::Pull),
-    ("api", "REST API", false, ChannelKind::Pull),
-    ("telegram", "Telegram", true, ChannelKind::Pull),
-    ("discord", "Discord", true, ChannelKind::Pull),
-    ("slack", "Slack", true, ChannelKind::Pull),
-    ("whatsapp", "WhatsApp", true, ChannelKind::Push),
-    ("imessage", "iMessage", false, ChannelKind::Pull),
-    ("google_chat", "Google Chat", true, ChannelKind::Push),
-    ("teams", "Microsoft Teams", true, ChannelKind::Push),
-    ("line", "LINE", true, ChannelKind::Push),
-    ("irc", "IRC", false, ChannelKind::Pull),
-    ("signal", "Signal", false, ChannelKind::Pull),
-    ("matrix", "Matrix", true, ChannelKind::Pull),
-    ("openclaw", "OpenClaw", false, ChannelKind::Pull),
-    ("mcp", "MCP", false, ChannelKind::Pull),
-    ("cli", "CLI", false, ChannelKind::Pull),
-];
-
-/// Decide o `status` de uma linha do `/api/channels`.
-///
-/// Extraida do handler para poder ser exercitada sem montar router, pool nem
-/// runtime: e a regra que a #1079 errava, e um teste dela vale mais que um
-/// teste do JSON inteiro.
-///
-/// `mounted` e o que o [`PushChannelStates`] respondeu para este `id`:
-/// `None` para canal pull (a resposta vem de `live`), e para canal push
-/// significa que a tabela e o struct discordam — tratado como `"unknown"`
-/// em vez de virar `"offline"` numa linha que ninguem consegue explicar.
-///
-/// [`PushChannelStates`]: crate::push_channels::PushChannelStates
-fn channel_status(
-    kind: ChannelKind,
-    needs_secret: bool,
-    live: bool,
-    mounted: Option<usize>,
-) -> &'static str {
-    let up = match kind {
-        ChannelKind::Pull => live,
-        ChannelKind::Push => match mounted {
-            Some(n) => n > 0,
-            // A tabela diz push e o struct nao conhece o id. Defeito de
-            // codigo, nao estado de runtime — nao vale mentir "offline".
-            None => return "unknown",
-        },
-    };
-
-    if up {
-        "active"
-    } else if needs_secret {
-        "offline"
-    } else {
-        "optional"
-    }
-}
+// #1347 (fatia 2): `KNOWN_CHANNELS`, a regra `channel_status` e o montador
+// das linhas moraram aqui ate a tool `garra_status` precisar da MESMA
+// resposta. Agora vivem em `crate::channels_view`, e esta rota e o
+// `garra_status` chamam a mesma `channel_rows`. Os testes abaixo continuam
+// exercitando a tabela e a regra pelo `super::` via este import.
+#[cfg(test)]
+use crate::channels_view::{KNOWN_CHANNELS, channel_status};
 
 #[derive(serde::Serialize)]
 struct ChannelInfo {
@@ -1359,40 +1531,18 @@ async fn list_channels(
     axum::extract::State(state): axum::extract::State<SharedState>,
     axum::Extension(push): axum::Extension<Arc<crate::push_channels::PushChannelStates>>,
 ) -> axum::Json<serde_json::Value> {
-    let live: Vec<String> = state
-        .channels
-        .read()
+    let boot_time_secs = state.boot_time.elapsed().as_secs();
+    let channels: Vec<ChannelInfo> = crate::channels_view::channel_rows(&state, push.contagens())
         .await
-        .list()
         .into_iter()
-        .map(|s| s.to_string())
+        .map(|row| ChannelInfo {
+            id: row.id,
+            display_name: row.display_name,
+            status: row.status,
+            needs_secret: row.needs_secret,
+            boot_time_secs,
+        })
         .collect();
-
-    let mut channels: Vec<ChannelInfo> = Vec::with_capacity(KNOWN_CHANNELS.len());
-    for (id, display, needs_secret, kind) in KNOWN_CHANNELS {
-        // Canal push nunca aparece em `live` — nao entra no registry por
-        // desenho (#1079). Consultar `mounted` so quando `kind` diz push
-        // mantem o registry como fonte unica para os pull.
-        let mounted = match kind {
-            ChannelKind::Push => push.mounted(id),
-            ChannelKind::Pull => None,
-        };
-        let live_aqui = live.iter().any(|name| name == *id);
-        let status = channel_status(*kind, *needs_secret, live_aqui, mounted);
-        if status == "unknown" {
-            tracing::warn!(
-                channel = id,
-                "KNOWN_CHANNELS marca este canal como push mas PushChannelStates nao o conhece"
-            );
-        }
-        channels.push(ChannelInfo {
-            id,
-            display_name: display,
-            status,
-            needs_secret: *needs_secret,
-            boot_time_secs: state.boot_time.elapsed().as_secs(),
-        });
-    }
 
     axum::Json(serde_json::json!({ "channels": channels }))
 }
@@ -1503,24 +1653,54 @@ async fn list_mcp_runtime_tools(
     }))
 }
 
+/// #1346: one `/api/mcp/health` server row. Back-compat keys (`name`,
+/// `connected`, `tool_count`, `status`) keep their meaning; a server that is
+/// not connected also carries `cause`, `attempts`, `max_restarts` and a
+/// short `last_error`. Everything here is secret-free: the manager builds
+/// `last_error` from rmcp/io errors (never from the child's stderr or env)
+/// and caps it at 200 chars; the npx cache path stays out of this endpoint
+/// and only shows in `/api/diagnostics`' next step.
+fn mcp_health_server_json(s: &garraia_agents::McpServerStatus) -> serde_json::Value {
+    let connected = s.state == garraia_agents::McpServerState::Connected;
+    let mut row = serde_json::json!({
+        "name": s.name,
+        "connected": connected,
+        "tool_count": s.tool_count,
+        "status": s.state.as_str(),
+    });
+    if !connected && let Some(obj) = row.as_object_mut() {
+        obj.insert("attempts".into(), s.attempts.into());
+        obj.insert("max_restarts".into(), s.max_restarts.into());
+        obj.insert(
+            "cause".into(),
+            s.cause
+                .as_ref()
+                .map(|c| serde_json::Value::from(c.as_str()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "last_error".into(),
+            s.last_error
+                .clone()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    row
+}
+
 /// GET /api/mcp/health — per-server MCP connection status and tool inventory.
 async fn mcp_health(
     axum::extract::State(state): axum::extract::State<SharedState>,
 ) -> axum::Json<serde_json::Value> {
+    // #1346: `server_statuses`, not `list_servers` — the latter only walks
+    // live connections, so a server that failed at boot (parked in
+    // `pending`) was invisible and a lone broken `filesystem` made this
+    // endpoint answer `no_mcp_configured`.
     let (servers, total_mcp_tools) = if let Some(mgr) = &state.mcp_manager_arc {
-        let list = mgr.list_servers().await;
-        let total: usize = list.iter().map(|(_, count, _)| count).sum();
-        let servers = list
-            .into_iter()
-            .map(|(name, tool_count, connected)| {
-                serde_json::json!({
-                    "name": name,
-                    "connected": connected,
-                    "tool_count": tool_count,
-                    "status": if connected { "ok" } else { "disconnected" },
-                })
-            })
-            .collect::<Vec<_>>();
+        let list = mgr.server_statuses().await;
+        let total: usize = list.iter().map(|s| s.tool_count).sum();
+        let servers = list.iter().map(mcp_health_server_json).collect::<Vec<_>>();
         (servers, total)
     } else {
         (Vec::new(), 0)
@@ -1656,6 +1836,138 @@ mod tests {
         assert!(!super::bind_is_loopback("this is not a hostname"));
     }
 
+    // ─── #1180: POST /api/providers sem `model` ────────────────────────────
+
+    use crate::state::AppState;
+    use garraia_agents::AgentRuntime;
+    use garraia_channels::ChannelRegistry;
+    use garraia_config::{AppConfig, LlmProviderConfig};
+
+    fn state_with(config: AppConfig) -> SharedState {
+        Arc::new(AppState::new(
+            config,
+            Arc::new(AgentRuntime::new()),
+            ChannelRegistry::new(),
+        ))
+    }
+
+    /// O request que o "Save & Activate" do Web Console manda numa
+    /// instalacao limpa: a chave colada e mais nada.
+    fn openrouter_request(model: Option<&str>) -> AddProviderRequest {
+        AddProviderRequest {
+            provider_type: "openrouter".to_string(),
+            // Chave de mentira: o arm exige uma, e nada aqui sai para a rede
+            // (registrar um provider nao faz chamada; so `persist_api_key`
+            // roda, e sem GARRAIA_VAULT_PASSPHRASE ele e um no-op).
+            api_key: Some("sk-teste-nao-e-segredo".to_string()),
+            model: model.map(str::to_string),
+            base_url: None,
+            set_default: None,
+        }
+    }
+
+    fn openrouter_block(model: Option<&str>) -> LlmProviderConfig {
+        LlmProviderConfig {
+            provider: "openrouter".to_string(),
+            model: model.map(str::to_string),
+            api_key: None,
+            base_url: None,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    async fn activate(state: &SharedState, body: AddProviderRequest) -> Option<String> {
+        let (status, _) = add_provider(axum::extract::State(state.clone()), axum::Json(body)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "openrouter deveria ter sido registrado"
+        );
+        state
+            .agents
+            .get_provider("openrouter")
+            .expect("openrouter registrado")
+            .configured_model()
+            .map(str::to_string)
+    }
+
+    /// #1180 — sem `model` no request e sem `model:` no config, o provider
+    /// nasce no default do projeto. Antes caia num `openai/gpt-4o` hardcoded
+    /// aqui, invisivel para o lock da constante compartilhada.
+    #[tokio::test]
+    async fn post_providers_openrouter_sem_model_cai_no_default_do_projeto() {
+        let state = state_with(AppConfig::default());
+        assert_eq!(
+            activate(&state, openrouter_request(None)).await.as_deref(),
+            Some(DEFAULT_CLOUD_MODEL),
+            "POST /api/providers sem `model` tem que herdar o default compartilhado, \
+             nao um literal proprio do router"
+        );
+    }
+
+    /// Um `model:` que o operador ja escreveu no bloco `openrouter` do
+    /// config vence o default — o console nao pode ignorar o config.yml.
+    #[tokio::test]
+    async fn post_providers_openrouter_sem_model_respeita_o_model_do_config() {
+        let mut config = AppConfig::default();
+        config.llm.insert(
+            "openrouter".to_string(),
+            openrouter_block(Some("mistralai/mistral-small")),
+        );
+        let state = state_with(config);
+        assert_eq!(
+            activate(&state, openrouter_request(None)).await.as_deref(),
+            Some("mistralai/mistral-small")
+        );
+    }
+
+    /// Bloco com nome arbitrario (`my-router`) e `provider: openrouter`
+    /// tambem conta — mesmo passo 3 da resolucao do `garra chat`.
+    #[tokio::test]
+    async fn post_providers_openrouter_acha_o_model_por_provider_field() {
+        let mut config = AppConfig::default();
+        config.llm.insert(
+            "my-router".to_string(),
+            openrouter_block(Some("mistralai/mistral-small")),
+        );
+        let state = state_with(config);
+        assert_eq!(
+            activate(&state, openrouter_request(None)).await.as_deref(),
+            Some("mistralai/mistral-small")
+        );
+    }
+
+    /// `model` explicito no request continua vencendo tudo.
+    #[tokio::test]
+    async fn post_providers_openrouter_com_model_explicito_mantem_o_pedido() {
+        let mut config = AppConfig::default();
+        config.llm.insert(
+            "openrouter".to_string(),
+            openrouter_block(Some("mistralai/mistral-small")),
+        );
+        let state = state_with(config);
+        assert_eq!(
+            activate(&state, openrouter_request(Some("gpt-4o-mini")))
+                .await
+                .as_deref(),
+            Some("gpt-4o-mini")
+        );
+    }
+
+    /// `model: ""` no config nao conta como escolha — cai no default.
+    #[test]
+    fn configured_model_for_ignora_model_vazio() {
+        let mut config = AppConfig::default();
+        config
+            .llm
+            .insert("openrouter".to_string(), openrouter_block(Some("  ")));
+        assert_eq!(configured_model_for(&config, "openrouter"), None);
+        assert_eq!(
+            configured_model_for(&AppConfig::default(), "openrouter"),
+            None
+        );
+    }
+
     // ─── #1079: status dos canais push ────────────────────────────────────
 
     use crate::push_channels::{ChannelKind, PushChannelStates};
@@ -1670,6 +1982,7 @@ mod tests {
             true,  // needs_secret — era isto que empurrava para "offline"
             false, // nunca aparece no ChannelRegistry: e desenho
             Some(1),
+            None,
         );
         assert_eq!(status, "active");
     }
@@ -1679,7 +1992,7 @@ mod tests {
         // Configurado errado, ou recusado no boot (LINE com channel_secret
         // invalido, Teams sem app_id, WhatsApp sem app_secret desde a #1070).
         assert_eq!(
-            super::channel_status(ChannelKind::Push, true, false, Some(0)),
+            super::channel_status(ChannelKind::Push, true, false, Some(0), None),
             "offline"
         );
     }
@@ -1687,7 +2000,7 @@ mod tests {
     #[test]
     fn canal_push_sem_segredo_e_opcional_e_nao_offline() {
         assert_eq!(
-            super::channel_status(ChannelKind::Push, false, false, Some(0)),
+            super::channel_status(ChannelKind::Push, false, false, Some(0), None),
             "optional"
         );
     }
@@ -1698,7 +2011,7 @@ mod tests {
     #[test]
     fn live_do_registry_nao_promove_canal_push() {
         assert_eq!(
-            super::channel_status(ChannelKind::Push, true, true, Some(0)),
+            super::channel_status(ChannelKind::Push, true, true, Some(0), None),
             "offline"
         );
     }
@@ -1706,15 +2019,15 @@ mod tests {
     #[test]
     fn canal_pull_continua_vindo_do_registry() {
         assert_eq!(
-            super::channel_status(ChannelKind::Pull, true, true, None),
+            super::channel_status(ChannelKind::Pull, true, true, None, None),
             "active"
         );
         assert_eq!(
-            super::channel_status(ChannelKind::Pull, true, false, None),
+            super::channel_status(ChannelKind::Pull, true, false, None, None),
             "offline"
         );
         assert_eq!(
-            super::channel_status(ChannelKind::Pull, false, false, None),
+            super::channel_status(ChannelKind::Pull, false, false, None, None),
             "optional"
         );
     }
@@ -1725,7 +2038,7 @@ mod tests {
     #[test]
     fn mounted_de_canal_pull_e_ignorado() {
         assert_eq!(
-            super::channel_status(ChannelKind::Pull, true, true, Some(0)),
+            super::channel_status(ChannelKind::Pull, true, true, Some(0), None),
             "active"
         );
     }
@@ -1736,9 +2049,149 @@ mod tests {
     #[test]
     fn tabela_e_struct_em_desacordo_dao_unknown() {
         assert_eq!(
-            super::channel_status(ChannelKind::Push, true, false, None),
+            super::channel_status(ChannelKind::Push, true, false, None, None),
             "unknown"
         );
+    }
+
+    // ─── #1238: o canal `whatsapp_linked` no /api/channels ────────────────
+
+    /// Monta um estado com o data dir apontado para `dir` e devolve a linha
+    /// `whatsapp_linked` do `/api/channels`, ja com o status resolvido.
+    async fn linha_do_whatsapp_linked(
+        dir: &std::path::Path,
+        ponte: garraia_channels::whatsapp_linked::health::BridgeView,
+    ) -> serde_json::Value {
+        let config = AppConfig {
+            data_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        let state = state_with(config);
+        state.whatsapp_linked.set_bridge(ponte);
+
+        let axum::Json(body) = super::list_channels(
+            axum::extract::State(state),
+            axum::Extension(Arc::new(PushChannelStates::empty())),
+        )
+        .await;
+
+        body["channels"]
+            .as_array()
+            .expect("lista de canais")
+            .iter()
+            .find(|c| c["id"] == "whatsapp_linked")
+            .cloned()
+            .expect("o canal precisa aparecer na lista")
+    }
+
+    /// Grava um `session.enc` e um `node_modules` de mentira: os dois fatos de
+    /// disco que a classificacao le.
+    fn vincula(dir: &std::path::Path) {
+        let store = garraia_channels::whatsapp_linked::SessionStore::for_data_dir(
+            dir,
+            garraia_channels::whatsapp_linked::DEFAULT_ACCOUNT,
+        )
+        .expect("DEFAULT_ACCOUNT e um segmento valido");
+        let key = garraia_channels::whatsapp_linked::SessionKey::resolve(store.dir(), None)
+            .expect("chave");
+        store
+            .save(
+                &garraia_channels::whatsapp_linked::SessionBlob::new("eyJhIjoxfQ=="),
+                &key,
+            )
+            .expect("grava sessao");
+        std::fs::create_dir_all(dir.join("whatsapp/bridge/node_modules")).expect("node_modules");
+    }
+
+    /// Os **tres** estados do canal, na mesma tela onde o operador olha.
+    ///
+    /// A distincao entre `optional` e `offline` e o ponto: sem sessao ninguem
+    /// ligou o canal e nao ha defeito; com sessao e sem ponte, alguem ligou e
+    /// o canal nao esta funcionando — e o console precisa dizer isso.
+    #[tokio::test]
+    async fn o_whatsapp_vinculado_tem_os_tres_estados_no_api_channels() {
+        use garraia_channels::whatsapp_linked::health::BridgeView;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let linha = linha_do_whatsapp_linked(dir.path(), BridgeView::Unknown).await;
+        assert_eq!(
+            linha["status"], "optional",
+            "sem sessao o canal e opcional, nao offline: {linha}"
+        );
+        assert_eq!(
+            linha["needs_secret"], false,
+            "a credencial deste canal nao e um valor de config"
+        );
+        assert_eq!(linha["display_name"], "WhatsApp (dispositivo vinculado)");
+
+        vincula(dir.path());
+
+        let linha = linha_do_whatsapp_linked(dir.path(), BridgeView::Down).await;
+        assert_eq!(
+            linha["status"], "offline",
+            "ha sessao e a ponte caiu: isto e defeito, nao 'opcional': {linha}"
+        );
+
+        let linha = linha_do_whatsapp_linked(dir.path(), BridgeView::Connected).await;
+        assert_eq!(linha["status"], "active", "ponte conectada: {linha}");
+    }
+
+    /// `provisioned` so vale para quem o passa. Os quinze canais restantes
+    /// continuam classificados pelo `needs_secret`, como antes da #1238.
+    #[test]
+    fn provisioned_ausente_preserva_a_regra_antiga() {
+        assert_eq!(
+            super::channel_status(ChannelKind::Pull, true, false, None, None),
+            "offline"
+        );
+        assert_eq!(
+            super::channel_status(ChannelKind::Pull, false, false, None, None),
+            "optional"
+        );
+        // E quando ele e passado, vence o `needs_secret`.
+        assert_eq!(
+            super::channel_status(ChannelKind::Pull, false, false, None, Some(true)),
+            "offline"
+        );
+        assert_eq!(
+            super::channel_status(ChannelKind::Pull, true, false, None, Some(false)),
+            "optional"
+        );
+    }
+
+    /// **Uma fonte.** A CLI (`garra whatsapp status`) e o gateway
+    /// (`/api/diagnostics`, `/api/channels`) rodam em processos diferentes e
+    /// respondem a mesma pergunta ao mesmo usuario. As duas tem de classificar
+    /// pela `whatsapp_linked::health::classify`.
+    ///
+    /// Este e o mesmo guard do `todo_canal_push_da_tabela_e_conhecido_pelo_struct`
+    /// (#1079), aplicado a um par de superficies em vez de a um par de tabelas:
+    /// foi divergencia assim que fez o console chamar de `offline` um canal que
+    /// estava respondendo.
+    #[test]
+    fn a_cli_e_o_gateway_classificam_pela_mesma_funcao() {
+        let raiz = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/");
+        let superficies = [
+            raiz.join("garraia-cli/src/whatsapp.rs"),
+            raiz.join("garraia-gateway/src/bootstrap/whatsapp_linked.rs"),
+        ];
+        for caminho in superficies {
+            let fonte = std::fs::read_to_string(&caminho)
+                .unwrap_or_else(|e| panic!("{} ilegivel: {e}", caminho.display()));
+            assert!(
+                fonte.contains("health::{") || fonte.contains("whatsapp_linked::health"),
+                "{} precisa importar `whatsapp_linked::health`",
+                caminho.display()
+            );
+            assert!(
+                fonte.contains("classify(&facts"),
+                "{} precisa classificar pela funcao compartilhada, e nao por regra propria",
+                caminho.display()
+            );
+        }
     }
 
     /// O guard estrutural. A #1079 objetou que consultar as listas push
@@ -1767,6 +2220,105 @@ mod tests {
         }
     }
 
+    /// #1347: o `garra_status` e o `/api/channels` leem os mesmos fatos sobre
+    /// cada canal — as duas superficies chamam `channels_view::channel_rows`.
+    /// Sobre quem esta `active` eles concordam exatamente. O relatorio do
+    /// agente so deixa de fora o que ninguem ligou na config (C2): um
+    /// Telegram configurado e caido sai `offline` nos dois; o Discord que
+    /// ninguem configurou sai `offline` so no console (a pilula de "falta o
+    /// segredo") e nao aparece no relatorio.
+    #[tokio::test]
+    async fn api_channels_e_garra_status_concordam_sobre_cada_canal() {
+        use garraia_agents::tools::Tool;
+        use garraia_channels::whatsapp_linked::health::BridgeView;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        vincula(dir.path());
+        let mut config = AppConfig {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        config.channels.insert(
+            "meu-telegram".to_string(),
+            serde_json::from_value(serde_json::json!({ "type": "telegram" })).expect("canal"),
+        );
+        let state: SharedState = Arc::new(crate::state::AppState::with_config_dir(
+            config,
+            Arc::new(AgentRuntime::new()),
+            ChannelRegistry::new(),
+            dir.path(),
+        ));
+        state.whatsapp_linked.set_bridge(BridgeView::Connected);
+        let push = PushChannelStates::empty();
+
+        let axum::Json(body) = super::list_channels(
+            axum::extract::State(Arc::clone(&state)),
+            axum::Extension(Arc::new(push.clone())),
+        )
+        .await;
+        let console: std::collections::BTreeMap<String, String> = body["channels"]
+            .as_array()
+            .expect("lista")
+            .iter()
+            .map(|c| (c["id"].to_string(), c["status"].to_string()))
+            .collect();
+
+        let tool = crate::tools::GarraStatusTool::new(&state, push.contagens());
+        let ctx = garraia_agents::tools::ToolContext {
+            session_id: "sessao-1347".to_string(),
+            user_id: None,
+            is_heartbeat: false,
+            approval: garraia_agents::tools::approval::ToolApproval::None,
+            working_dir: None,
+            project_id: None,
+        };
+        let out = tool
+            .execute(&ctx, serde_json::json!({}))
+            .await
+            .expect("executa");
+        let json: serde_json::Value = serde_json::from_str(&out.content).expect("json");
+        let agente: std::collections::BTreeMap<String, String> = json["channels"]
+            .as_array()
+            .expect("lista")
+            .iter()
+            .map(|c| (c["id"].to_string(), c["status"].to_string()))
+            .collect();
+
+        let ativos = |m: &std::collections::BTreeMap<String, String>| -> Vec<String> {
+            m.iter()
+                .filter(|(_, st)| st.as_str() == "\"active\"")
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        assert_eq!(
+            ativos(&agente),
+            ativos(&console),
+            "{agente:?} x {console:?}"
+        );
+        assert_eq!(
+            agente.get("\"whatsapp_linked\"").map(String::as_str),
+            Some("\"active\"")
+        );
+        assert_eq!(
+            (
+                agente.get("\"telegram\"").map(String::as_str),
+                console.get("\"telegram\"").map(String::as_str)
+            ),
+            (Some("\"offline\""), Some("\"offline\"")),
+            "configurado e caido: offline nos dois"
+        );
+        assert_eq!(
+            console.get("\"discord\"").map(String::as_str),
+            Some("\"offline\""),
+            "o console mantem a regra antiga"
+        );
+        assert!(!agente.contains_key("\"discord\""), "{agente:?}");
+        for (id, st) in &agente {
+            assert!(console.contains_key(id), "{id} fora do console");
+            assert!(st == "\"active\"" || st == "\"offline\"", "{id}: {st}");
+        }
+    }
+
     /// Os quatro push nomeados. Se um deles for reclassificado como Pull
     /// por engano, este teste cai antes de o console voltar a mentir.
     #[test]
@@ -1787,5 +2339,95 @@ mod tests {
         for (id, _, _, _) in super::KNOWN_CHANNELS {
             assert!(vistos.insert(*id), "id duplicado no KNOWN_CHANNELS: {id}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_mcp_health_1346 {
+    use super::*;
+    use crate::state::AppState;
+    use garraia_agents::{AgentRuntime, McpManager};
+    use garraia_channels::ChannelRegistry;
+
+    /// A server that failed at boot (parked in `pending`, as `server.rs`
+    /// does) must be listed with `connected: false` and a cause — before
+    /// #1346 the endpoint answered `no_mcp_configured`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mcp_health_lista_servidor_pendente_com_causa() {
+        // The config dir is passed in, never via `GARRAIA_CONFIG_DIR`: see
+        // `AppState::with_config_dir` for the race that env caused.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mgr = Arc::new(McpManager::new());
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "SEGREDO_DE_TESTE".to_string(),
+            "valor-que-nao-pode-vazar".to_string(),
+        );
+        // A command that cannot spawn: the connect fails like a boot failure.
+        let args = vec!["-y".to_string(), "pacote".to_string()];
+        let missing = dir.path().join("nao-existe").join("npx");
+        let missing = missing.to_string_lossy().into_owned();
+        let err = mgr
+            .connect(
+                "filesystem",
+                &missing,
+                &args,
+                &env,
+                5,
+                vec![],
+                None,
+                5,
+                1,
+                false,
+            )
+            .await;
+        assert!(err.is_err());
+        mgr.register_pending_stdio(
+            "filesystem",
+            &missing,
+            &args,
+            &env,
+            5,
+            vec![],
+            None,
+            5,
+            1,
+            false,
+        )
+        .await;
+
+        let config = garraia_config::AppConfig {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let mut state = AppState::with_config_dir(
+            config,
+            Arc::new(AgentRuntime::new()),
+            ChannelRegistry::new(),
+            dir.path(),
+        );
+        state.mcp_manager_arc = Some(mgr);
+        let state: SharedState = Arc::new(state);
+
+        let axum::Json(body) = mcp_health(axum::extract::State(state)).await;
+
+        assert_eq!(body["status"], "all_disconnected", "{body}");
+        let servers = body["servers"].as_array().expect("servers");
+        assert_eq!(servers.len(), 1, "{body}");
+        let fs = &servers[0];
+        assert_eq!(fs["name"], "filesystem");
+        assert_eq!(fs["connected"], false);
+        assert_eq!(fs["status"], "retrying");
+        assert_eq!(fs["cause"], "other");
+        assert_eq!(fs["max_restarts"], 5);
+        let last = fs["last_error"].as_str().expect("last_error");
+        assert!(!last.is_empty() && last.chars().count() <= 200, "{last}");
+        let cru = body.to_string();
+        assert!(
+            !cru.contains("valor-que-nao-pode-vazar"),
+            "env vazou: {cru}"
+        );
     }
 }

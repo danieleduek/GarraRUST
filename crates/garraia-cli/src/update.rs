@@ -92,6 +92,36 @@ async fn fetch_latest_release(client: &reqwest::Client) -> Result<GitHubRelease>
         .context("failed to parse GitHub release response")
 }
 
+/// O binario instalado: o que `update` troca, `rollback` restaura e a varredura
+/// do #1030 exclui como "o proprio". E `std::env::current_exe()` RESOLVIDO ate
+/// o arquivo real — e esta e a unica chamada dele neste modulo (um teste varre
+/// o fonte).
+///
+/// #1328: os instaladores deixam `garra` como symlink para `garraia`. No
+/// Linux/Termux `current_exe()` le `/proc/self/exe`, que o kernel devolve ja
+/// resolvido, e no Windows o shim `garra.cmd` executa `garraia.exe` direto —
+/// nos dois o link nunca chega aqui. No macOS, porem, o valor vem de
+/// `_NSGetExecutablePath`, que a dyld(3) documenta como "may be a symbolic
+/// link and not the real file": sem resolver, `garra update` gravaria o
+/// binario novo POR CIMA DO LINK — `garra` vira arquivo real na versao nova,
+/// `garraia` fica na antiga, e o instalador, ao reencontrar um arquivo real,
+/// se recusa a tocar nele. O par que o link existe para manter unido se
+/// separa de vez. Canonizar aqui fecha isso em todo SO; no Windows o unico
+/// efeito colateral e cosmetico (`\\?\C:\...` nas mensagens), e todas as
+/// operacoes de arquivo abaixo aceitam essa forma.
+fn installed_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot determine current executable path")?;
+    resolve_exe_path(exe)
+}
+
+/// A metade pura de `installed_exe`: segue symlinks ate o arquivo real, para
+/// que `.old`, `.new` e o `rename` final caiam AO LADO DO BINARIO, nunca do
+/// alias. Separada para o teste montar `garra -> garraia` num tempdir.
+fn resolve_exe_path(exe: PathBuf) -> Result<PathBuf> {
+    fs::canonicalize(&exe)
+        .with_context(|| format!("cannot resolve current executable path {}", exe.display()))
+}
+
 /// Run `garraia update`. Returns Ok(true) if an update was applied.
 pub async fn run_update(yes: bool) -> Result<bool> {
     let client = reqwest::Client::new();
@@ -202,9 +232,8 @@ pub async fn run_update(yes: bool) -> Result<bool> {
     }
     println!(" ok");
 
-    // Locate current binary
-    let current_exe =
-        std::env::current_exe().context("cannot determine current executable path")?;
+    // Locate current binary -- resolved past the `garra` alias, see installed_exe.
+    let current_exe = installed_exe()?;
     let backup_path = current_exe.with_extension("old");
 
     // Write new binary to temp file
@@ -270,8 +299,7 @@ pub async fn run_update(yes: bool) -> Result<bool> {
 
 /// Run `garraia update --check-binaries`: so a varredura do PATH, sem rede.
 pub async fn run_check_binaries() -> Result<()> {
-    let current_exe =
-        std::env::current_exe().context("cannot determine current executable path")?;
+    let current_exe = installed_exe()?;
     match report_other_binaries(&current_exe, current_version()).await {
         Some(report) => println!("{report}"),
         None => println!(
@@ -285,8 +313,7 @@ pub async fn run_check_binaries() -> Result<()> {
 
 /// Run `garraia rollback`.
 pub fn run_rollback() -> Result<()> {
-    let current_exe =
-        std::env::current_exe().context("cannot determine current executable path")?;
+    let current_exe = installed_exe()?;
     let backup_path = current_exe.with_extension("old");
 
     if !backup_path.exists() {
@@ -315,13 +342,43 @@ pub fn check_for_update_notice() -> Option<String> {
     let current = current_version();
     let latest = strip_v(&cache.latest_version);
 
-    if latest != current {
+    if release_is_newer(current, latest) {
         Some(format!(
             "Update available: v{current} -> v{latest}  —  run `garraia update`"
         ))
     } else {
         None
     }
+}
+
+/// `latest` e uma release **mais nova** que `current`? (#1320)
+///
+/// A comparacao antiga era `latest != current`: qualquer binario a frente da
+/// ultima release publicada — build de um branch de release, RC, ou a janela
+/// entre o merge do bump e o tag — recebia um convite para REBAIXAR
+/// (`v0.4.3 -> v0.4.2`). Aqui as duas versoes sao lidas como `X.Y.Z` e so
+/// `latest > current` anuncia update. Sufixo de pre-release (`0.5.0-rc1`) ou
+/// texto que nao parseia caem no comportamento antigo (desigualdade), para o
+/// aviso nunca sumir por causa de um formato inesperado — o que e conservador
+/// no sentido certo: em caso de duvida, avisa.
+fn release_is_newer(current: &str, latest: &str) -> bool {
+    match (parse_release(current), parse_release(latest)) {
+        (Some(cur), Some(lat)) => lat > cur,
+        _ => latest != current,
+    }
+}
+
+/// `X.Y.Z` -> `(X, Y, Z)`; `None` para qualquer outra forma (pre-release,
+/// build metadata, campos a mais ou a menos, nao-numerico).
+fn parse_release(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v.trim().split('.');
+    let x = it.next()?.parse::<u64>().ok()?;
+    let y = it.next()?.parse::<u64>().ok()?;
+    let z = it.next()?.parse::<u64>().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((x, y, z))
 }
 
 /// Spawn a background version check that updates the cache file.
@@ -438,5 +495,100 @@ mod tests {
         // teste aponta direto para o mapa em asset_name_for.
         let name = platform_asset_name().unwrap();
         assert!(name.starts_with("garraia-"));
+    }
+}
+
+#[cfg(test)]
+mod update_notice_tests {
+    use super::{parse_release, release_is_newer};
+
+    /// #1320: a release publicada mais ANTIGA que o binario nao e update.
+    #[test]
+    fn binario_a_frente_da_release_nao_recebe_convite_para_rebaixar() {
+        assert!(!release_is_newer("0.4.3", "0.4.2"));
+        assert!(!release_is_newer("0.5.0", "0.4.9"));
+        assert!(!release_is_newer("1.0.0", "0.99.99"));
+    }
+
+    #[test]
+    fn release_mais_nova_anuncia_e_igual_nao() {
+        assert!(release_is_newer("0.4.2", "0.4.3"));
+        assert!(release_is_newer("0.4.9", "0.5.0"));
+        assert!(
+            release_is_newer("0.4.3", "0.4.10"),
+            "comparacao numerica, nao lexica"
+        );
+        assert!(!release_is_newer("0.4.3", "0.4.3"));
+    }
+
+    /// Formato que nao e `X.Y.Z` cai na desigualdade de antes: em caso de
+    /// duvida o aviso continua saindo, nunca somindo.
+    #[test]
+    fn forma_inesperada_cai_na_desigualdade_conservadora() {
+        assert!(release_is_newer("0.4.3", "0.5.0-rc1"));
+        assert!(release_is_newer("0.4.3-dev", "0.4.3"));
+        assert!(!release_is_newer("0.4.3-dev", "0.4.3-dev"));
+        assert_eq!(parse_release("0.4.3"), Some((0, 4, 3)));
+        assert_eq!(parse_release("0.4"), None);
+        assert_eq!(parse_release("0.4.3.1"), None);
+        assert_eq!(parse_release("0.4.x"), None);
+        assert_eq!(parse_release("0.5.0-rc1"), None);
+    }
+}
+
+#[cfg(test)]
+mod installed_exe_tests {
+    use super::resolve_exe_path;
+
+    /// #1328: o instalador deixa `garra -> garraia`. Rodando pelo alias, o
+    /// update tem de trocar `garraia`, e `.old`/`.new` tem de nascer ao lado
+    /// dele — nunca do link. (No Linux o kernel ja resolve `/proc/self/exe`;
+    /// no macOS `_NSGetExecutablePath` pode devolver o link, e e por isso que
+    /// a resolucao e explicita e fica testada aqui, onde a suite roda.)
+    #[cfg(unix)]
+    #[test]
+    fn alias_symlink_resolve_para_o_binario_real() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("garraia");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        let alias = dir.path().join("garra");
+        std::os::unix::fs::symlink("garraia", &alias).unwrap();
+
+        let resolved = resolve_exe_path(alias).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap());
+        assert_eq!(
+            resolved.with_extension("old").file_name().unwrap(),
+            "garraia.old",
+            "o backup fica ao lado do binario, nao do alias"
+        );
+        assert_ne!(resolved.file_name().unwrap(), "garra");
+    }
+
+    /// Um caminho que nao resolve e erro com o caminho na mensagem — o update
+    /// para ANTES de gravar um `.new` em lugar nenhum.
+    #[test]
+    fn caminho_que_nao_resolve_e_erro_nomeado() {
+        let dir = tempfile::tempdir().unwrap();
+        let ghost = dir.path().join("garra-que-nao-existe");
+        let err = resolve_exe_path(ghost).unwrap_err();
+        assert!(err.to_string().contains("garra-que-nao-existe"), "{err}");
+    }
+
+    /// Varre o fonte: `std::env::current_exe()` so pode aparecer dentro de
+    /// `installed_exe`, que canoniza. Uma segunda chamada crua em qualquer
+    /// caminho de escrita reabre a deriva `garra`/`garraia` no macOS.
+    #[test]
+    fn current_exe_cru_so_dentro_de_installed_exe() {
+        let source = include_str!("update.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let calls = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("std::env::current_exe()"))
+            .count();
+        assert_eq!(
+            calls, 1,
+            "update.rs deve chamar std::env::current_exe() exatamente uma vez, em installed_exe()"
+        );
     }
 }

@@ -47,9 +47,112 @@ python3 scripts/quality/compare.py --mode enforce \
 # Propor novo baseline (gera .proposed.json — NÃO commita automaticamente):
 python3 scripts/quality/freeze-baseline.py current-metrics.json
 
+# Sinal por PR (#1254): coletar tambem o merge-base e passar --base.
+# Cada linha ganha a coluna `Δ nesta PR` e o relatorio abre com o veredito
+# "Sem regressao nova nesta PR" / "REGRESSAO NOVA nesta PR: ...". O exit code
+# NAO muda (report-only sempre 0; enforce so olha o baseline).
+GARRAIA_REPO_ROOT=/caminho/do/worktree-do-merge-base \
+    bash scripts/quality/collect-metrics.sh > base-metrics.json
+python3 scripts/quality/compare.py --mode report-only \
+    .quality/baseline.json current-metrics.json --base base-metrics.json
+
 # Rodar testes dos parsers:
 python3 -m pytest scripts/quality/tests/
 ```
+
+## Sinal por PR e baseline defasado (#1254)
+
+O comparador confronta o `current` com **dois** pontos de referência:
+
+| Referência | Pergunta que responde | Efeito no exit code |
+|---|---|---|
+| `.quality/baseline.json` | "estamos melhores que o estado aceito?" | decide `enforce` |
+| `--base` (merge-base da PR) | "**esta PR** piorou algo?" | nenhum — só sinal |
+
+Sem `--base` (ex.: `push` em `main`) o relatório é byte-idêntico ao histórico.
+Com `--base`, a seção de regressões passa a se chamar
+`vs baseline (<frozenAt>) — ver #1254` e cada regressão diz se é
+`nova nesta PR`, `pre-existente no merge-base` ou `nao mensuravel no
+merge-base` (métrica não coletada no base — o caso da cobertura no CI, cujo
+`lcov.info` só existe no checkout da PR, nunca em `/tmp/base`). No terceiro
+caso o veredito desce de ✅ para ⚠️ `Sem regressao nova mensuravel`: o
+relatório não afirma que uma regressão é pré-existente quando nunca a mediu lá.
+
+Se `frozenAt` do baseline estiver a mais de **90 dias** de `collected_at` do
+`current`, entra a linha WARN `baseline_age_days`. O cálculo usa só os dois
+campos (ISO-8601 UTC), nunca o relógio — mesma entrada, mesmo relatório.
+Re-baseline continua sendo decisão do dono via `freeze-baseline.py`.
+
+## Re-baseline auditado (`--adopt-current-file-metrics`, #1254)
+
+Quando o baseline fica velho (a `main` passou muito dele) e as regressões de
+tamanho de arquivo são deriva, não PR, o caminho sancionado para **relaxar**
+é:
+
+```bash
+python3 scripts/quality/freeze-baseline.py current-metrics.json \
+    --adopt-current-file-metrics --reason '#NNNN'
+```
+
+- **Decisão do dono (R5).** Relaxar o baseline é trocar o que a catraca
+  protege; quem roda o comando propõe, o dono aprova o PR que promove o
+  `baseline.proposed.json`.
+- **Só métricas de tamanho de arquivo** (`max_file_lines`, `max_file_path`,
+  `files_over_{700,1500,2500}`, `total_rs_files`) adotam o valor atual.
+  `audit`, `coverage` e `clippy` seguem a catraca estrita, e `audit.critical`
+  continua 0.
+- `--reason` é obrigatório e precisa citar uma issue (`#` + número, sem zero
+  à esquerda). O `current-metrics.json` precisa ter `git_sha` e
+  `collected_at`, copiados para `source_git_sha` / `source_collected_at` ao
+  lado de `adopted_reason` — o revisor reproduz o arquivo a partir daquele
+  commit.
+- Continua escrevendo só `.quality/baseline.proposed.json`: `--seed` e um
+  `--out` igual ao `--baseline-in` são recusados.
+
+O `compare.py` não mostra `adopted_reason`; a proveniência aparece no diff do
+PR que promove o arquivo, e é lá que o revisor a confere.
+
+## Dívida aceita (#1254)
+
+O re-baseline de 2026-09-22 (último PR antes da tag `v0.4.5`) adotou o tamanho
+real dos arquivos, medido em `main` no SHA `af3227c562a4ec88ab26cbd8cb4c740c5adc5447`
+(`source_git_sha` do `baseline.json`). Reproduzir:
+
+```bash
+git worktree add /tmp/rb af3227c562a4ec88ab26cbd8cb4c740c5adc5447
+(cd /tmp/rb && bash scripts/quality/collect-metrics.sh > /tmp/rb-metrics.json)
+python3 scripts/quality/freeze-baseline.py /tmp/rb-metrics.json \
+    --adopt-current-file-metrics --reason '#1254' --out /tmp/rb-baseline.json
+```
+
+O `baseline.json` difere do resultado só em `frozenAt` e `source_collected_at`.
+
+Ficam como dívida aceita, **sem refatoração nesta release**, os 16 arquivos
+acima de 2500 linhas. Os maiores:
+
+| Arquivo | Linhas | Última mudança |
+|---|---|---|
+| `crates/garraia-agents/src/runtime.rs` | 10513 | 2026-09-22 |
+| `crates/garraia-config/src/check.rs` | 6901 | 2026-09-22 |
+| `crates/garraia-gateway/src/rest_v1/me.rs` | 6366 | 2026-09-01 |
+| `crates/garraia-cli/src/chat.rs` | 4694 | 2026-09-22 |
+| `crates/garraia-db/src/session_store.rs` | 4478 | 2026-09-22 |
+
+- **`me.rs`** carrega os caminhos de exportação, anonimização e exclusão da
+  LGPD/GDPR (#777, #843) e não muda desde 2026-09-01. Um refactor grande logo
+  antes de uma release seria risco sem valor para quem usa.
+- **`runtime.rs` e `check.rs`** crescem a cada ciclo. Dividi-los é a
+  modularização que falta.
+- A catraca por PR (`--base`, acima) é quem impede crescimento **novo**: um
+  PR que empurrar qualquer arquivo por cima de 700, 1500 ou 2500 linhas sai
+  com `REGRESSAO NOVA nesta PR`. O que está nesta tabela não conta como
+  regressão nova.
+- O teto absoluto de `thresholds.toml` (`max_file_lines = 3500`) **não**
+  subiu: subir seria afrouxar o gate do PR-4. Os arquivos acima dele estão
+  todos aqui.
+
+A modularização não ganhou issue própria: o ciclo da v0.4.5 fechou com zero
+issues abertas, e este registro é o ponto de partida de quem for fazê-la.
 
 ## Métricas trackedas (PR-1)
 

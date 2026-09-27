@@ -410,7 +410,10 @@ fn campo(input: &serde_json::Value, chave: &str) -> Option<String> {
 /// Truncar antes de redigir poderia cortar uma chave ao meio e deixar o
 /// prefixo passar pelo regex sem casar. E truncar antes de tirar os controles
 /// poderia deixar meia sequencia passar pela mesma razao.
-fn sanear(texto: &str) -> String {
+///
+/// `pub(crate)` porque o erro de loop do `ExecutionBudget` (#1295) passa a
+/// lista de chaves do input por aqui — mesma politica, um so lugar.
+pub(crate) fn sanear(texto: &str) -> String {
     let redigido = garraia_security::redact_secrets(texto.trim());
     let sem_controle = sanear_controles(&redigido, false);
     truncar(&sem_controle, SUMMARY_MAX_CHARS)
@@ -447,7 +450,11 @@ fn sanear(texto: &str) -> String {
 /// A consequencia de o reconhecimento errar e **cosmetica, nao de seguranca**:
 /// uma sequencia exotica que o parser nao entenda perde o `ESC` do mesmo jeito
 /// e sobra como texto literal feio. E o modo de falhar que se quer.
-fn sanear_controles(texto: &str, preservar_quebras: bool) -> String {
+///
+/// `pub(crate)` desde a #1225: o log do `bash_tool` precisa exatamente desta
+/// garantia (nenhum controle sobrevive) e duplicar a funcao seria criar uma
+/// segunda implementacao para divergir da primeira.
+pub(crate) fn sanear_controles(texto: &str, preservar_quebras: bool) -> String {
     let mut out = String::with_capacity(texto.len());
     let mut chars = texto.chars().peekable();
 
