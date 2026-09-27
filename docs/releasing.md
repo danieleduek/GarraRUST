@@ -44,6 +44,7 @@ registra data, sistema e quem executou. Linha sem data = release não sai.
 | D7 | Duas identidades autorizadas pedem `list_dir`; nenhuma vê os arquivos da outra | Ubuntu | isolamento do workspace por sessão (#1449) | teste de integração + manual |
 | D8 | `install-endpoints.yml` verde depois de publicar | — | `garraia.org` serve os instaladores (regra 17) | sim (workflow) |
 | D9 | `GET /api/diagnostics` numa instalação limpa sem nenhum aviso espúrio; `garraia doctor` exit 0 | Ubuntu + Windows | honestidade do status (#1437, #1387) | parcial — **Linux automatizado** pelo mesmo script (`doctor --json` exit 0, `doctor whatsapp --json` exit 69 com a linha `whatsapp.linked`, `/api/health` `healthy`); Windows manual |
+| D10 | Perguntas diretas de capacidade ao agente ("Você tem MCP?", "Pode escrever arquivos?", "Por que não lê esta pasta?") numa sessão `standard` e numa `isolated-pod` | Ubuntu + Windows | a resposta do modelo bate com o registro de capacidades — nada de "não tenho MCP" com MCP escondido nem "não tenho filesystem" com workspace só esperando seleção (#1428, #1387) | não — os fundamentos (nota do prompt e registro de capacidades) são cobertos em CI por `nota_garra_status.rs` e pelos testes do registro; a resposta do modelo continua manual |
 
 **D1/D9 Linux — como rodar a automação (#1426).** Numa máquina com
 Docker e Ollama (`ollama pull qwen3.5:0.8b`), a partir do checkout do
