@@ -759,7 +759,11 @@ var pages = {
 function navigate(page) {
   if (mcpRefreshTimer !== null) { clearInterval(mcpRefreshTimer); mcpRefreshTimer = null; }
   if (auditAutoRefresh !== null) { clearInterval(auditAutoRefresh); auditAutoRefresh = null; }
-  if (!pages[page]) page = 'dashboard';
+  // So pagina DECLARADA em `pages`: `#constructor` ou `#toString` vindo da
+  // URL passava em `!pages[page]` (herdado de Object.prototype) e virava
+  // `pages[page]()` numa funcao que nao e pagina (CodeQL
+  // js/unvalidated-dynamic-method-call).
+  if (!Object.prototype.hasOwnProperty.call(pages, page)) page = 'dashboard';
   currentPage = page;
   location.hash = '#' + page;
   document.getElementById('page-title').textContent = pageTitle(page);
