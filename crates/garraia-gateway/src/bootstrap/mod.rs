@@ -1552,6 +1552,10 @@ pub fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
         }
     }
 
+    // O `tools=N` do log de cada turno so diz quantas. Quando o numero muda
+    // entre dois boots, e a lista que fecha a pergunta de qual entrou.
+    info!(tools = ?runtime.tool_names(), "agent tools registered");
+
     runtime
 }
 
