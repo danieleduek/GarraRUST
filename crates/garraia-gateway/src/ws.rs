@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures::SinkExt;
 use futures::stream::StreamExt;
@@ -47,9 +47,27 @@ const MAX_DEFERRED_MESSAGES: usize = 8;
 pub async fn ws_handler(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
     State(state): State<SharedState>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // #1182: anti-CSRF do handshake. CORS nao vale para WebSocket — o
+    // `new WebSocket("ws://127.0.0.1:3888/ws")` de uma pagina qualquer sobe
+    // sem preflight —, entao a unica barreira de navegador aqui e o `Origin`
+    // do handshake. Cliente nao-navegador (app, CLI, `curl`) nao manda
+    // `Origin` e nao e afetado; para ele o gate continua sendo `api_key`.
+    // O `cross_origin_guard` do router ja julgou este handshake; repetir
+    // aqui e defesa em profundidade (o handler nao depende da montagem).
+    if !crate::origin_guard::ws_upgrade_permitido(
+        &crate::origin_guard::Pedido::de(&headers, &uri),
+        crate::origin_guard::esquema_efetivo(&state.config.gateway),
+        &crate::origin_guard::origens_validas_silenciosa(&state.config.gateway),
+    ) {
+        // Nada do pedido e ecoado no corpo; o log nao leva o valor do header.
+        warn!("WebSocket upgrade rejected: cross-origin");
+        return (StatusCode::FORBIDDEN, crate::origin_guard::CORPO_WS).into_response();
+    }
+
     let gate = crate::gateway_auth::ApiKeyGate::from_config(&state.config.gateway);
     if gate.is_enabled() {
         // A query e aceita **aqui** e so aqui: o handshake WebSocket de um
@@ -76,6 +94,13 @@ pub async fn ws_handler(
 
 async fn handle_socket(socket: WebSocket, state: SharedState) {
     let (mut sender, mut receiver) = socket.split();
+
+    // #1343: quem pode aprovar, no turno seguinte, um pedido de confirmacao
+    // que pausar um turno DESTA conexao. O chat web nao tem login e o
+    // `resume` sem token e aceito enquanto a sessao esta em memoria, entao o
+    // `session_id` nao prova quem e o humano; a conexao prova. O nonce nasce
+    // aqui e nunca sai para o cliente: reconectou, pergunta de novo.
+    let conexao = crate::approval_scope::nonce_de_conexao();
 
     // Declarados aqui, e nao junto do loop principal, porque desde o #1047 o
     // socket e lido durante o turno — e a primeira mensagem ja e um turno.
@@ -133,6 +158,27 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                 };
                 let token_ok = token_verified || resume_token.is_none();
 
+                // #1462: sem token verificado, o `session_id` e um valor que
+                // o cliente escolheu — vale a mesma regra do `X-Session-Id`
+                // e do `{id}` de `/api/sessions/{id}/*`: so sessao das
+                // superficies locais do operador. A de um canal esta em
+                // memoria no caso normal (a hidratacao do canal a poe la), e
+                // retoma-la anexava o chat web a conversa de outra pessoa,
+                // com o historico dela indo para o modelo no turno seguinte.
+                // Recusada, a sessao nao e tocada: nem `connected`, nem
+                // `last_active`. O token verificado continua provando dono.
+                let alcancavel_por_id = if token_verified {
+                    true
+                } else {
+                    match state.id_de_sessao_do_cliente_alcanca(&resume_id).await {
+                        Ok(alcanca) => alcanca,
+                        Err(e) => {
+                            warn!(erro = %e, "falhou ao ler o sessions.db para conferir o resume");
+                            false
+                        }
+                    }
+                };
+
                 // Issue #922: a gateway restart (or the TTL sweep) empties the
                 // in-memory map while `sessions.db` still holds the whole
                 // conversation. The client sent `resume`, this lookup missed,
@@ -145,7 +191,12 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                 // own: session ids are UUIDs that show up in logs and client
                 // storage, and adopting one on request alone would let anyone
                 // who learned an id resume someone else's conversation.
-                let resumed = if state.resume_session(&resume_id) {
+                let resumed = if !alcancavel_por_id {
+                    warn!(
+                        "resume sem token numa sessao de outra superficie; tratado como expirado"
+                    );
+                    false
+                } else if state.resume_session(&resume_id) {
                     token_ok
                 } else if token_verified {
                     info!("re-adopting session from store: {}", resume_id);
@@ -234,6 +285,7 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                 if drain_turns(
                     text.to_string(),
                     &id,
+                    &conexao,
                     &state,
                     &mut sender,
                     &mut receiver,
@@ -334,6 +386,7 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                         if drain_turns(
                             text.to_string(),
                             &session_id,
+                            &conexao,
                             &state,
                             &mut sender,
                             &mut receiver,
@@ -380,9 +433,11 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
 /// entrada — e cada volta do laco custa um turno de LLM inteiro.
 ///
 /// `Break` significa que o socket morreu — o chamador encerra a conexao.
+#[allow(clippy::too_many_arguments)]
 async fn drain_turns(
     first: String,
     session_id: &str,
+    conexao: &str,
     state: &SharedState,
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     receiver: &mut futures::stream::SplitStream<WebSocket>,
@@ -396,6 +451,7 @@ async fn drain_turns(
         match process_text_message(
             &text,
             session_id,
+            conexao,
             state,
             sender,
             receiver,
@@ -453,6 +509,7 @@ enum TurnOutcome {
 async fn process_text_message(
     text: &str,
     session_id: &str,
+    conexao: &str,
     state: &SharedState,
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     receiver: &mut futures::stream::SplitStream<WebSocket>,
@@ -484,7 +541,14 @@ async fn process_text_message(
     let continuity_key = state.continuity_key();
     // Lido **antes** do `spawn`: dentro da task seguraria o lock do store
     // pelo tempo do turno inteiro (mesma licao do `parrot_ws.rs`).
-    let exec = state.exec_context_for(session_id, None).await;
+    let exec = crate::approval_scope::com_escopo(
+        state
+            .exec_context_for_msg(session_id, None, Some(&user_text))
+            .await,
+        crate::approval_scope::CANAL_WEB,
+        session_id,
+        conexao,
+    );
 
     let (events_tx, events_rx) = tokio::sync::mpsc::channel::<TurnEvent>(TURN_EVENT_CHANNEL);
     let agents = state.agents.clone();

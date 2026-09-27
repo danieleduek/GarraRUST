@@ -40,9 +40,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -75,9 +75,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822 for the cross build: the zip must live INSIDE the workspace
-      # (cross mounts it at the same absolute path in the container) and the
-      # env var is passed through in Cross.toml.
+      # GAR-822 for the cross build (vestigial since #1228, see the action):
+      # the zip lives INSIDE the workspace (cross mounts it at the same
+      # absolute path) and the env var is passed through in Cross.toml.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
         with:
@@ -121,9 +121,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -160,9 +160,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -195,9 +195,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -243,9 +243,9 @@ jobs:
         with:
           targets: aarch64-pc-windows-msvc
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -301,9 +301,9 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -404,7 +404,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -468,11 +468,14 @@ jobs:
   # forbids outright (CLAUDE.md, Regras absolutas).
   #
   # Why it is treated as unproven: `garraia-desktop` is excluded from every
-  # cargo invocation in ci.yml because its build needs GTK and a sidecar that
-  # Linux runners lack. That reasoning is Linux-specific -- windows-latest ships
+  # cargo invocation in ci.yml, whose jobs install neither GTK/webkit nor the
+  # staged sidecar its build needs. desktop.yml does run this same
+  # build-installer.ps1 on pull requests that touch the desktop or the CLI,
+  # but it is path-filtered and not a required check, so nothing guarantees
+  # that the commit being tagged went through it green. windows-latest ships
   # WebView2, the Tauri CLI fetches WiX and NSIS itself, and step 1 of
-  # build-installer.ps1 produces the sidecar -- but this crate has never been
-  # built in CI, so a failure here must never block the CLI release.
+  # build-installer.ps1 produces the sidecar -- so the build is expected to
+  # work, but a failure here must never block the CLI release.
   #
   # Known failure mode: WiX ProductVersion is a three-part numeric field and
   # cannot express a semver prerelease, so an `-rc` tag fails this job. The
@@ -489,9 +492,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -534,8 +537,9 @@ jobs:
   #
   # Best-effort by design, mesmo tratamento do build-windows-installer acima:
   # em `needs:` do release, fora do `if:`, sem `continue-on-error` (proibido
-  # pelo CLAUDE.md). Único job do pipeline que compila o crate Tauri num
-  # runner Linux — ubuntu-22.04 fixado pela mesma razão do build-linux-x86_64
+  # pelo CLAUDE.md). Único job do release que compila o crate Tauri num
+  # runner Linux (em PR, o espelho é o build-linux-bundles do desktop.yml)
+  # — ubuntu-22.04 fixado pela mesma razão do build-linux-x86_64
   # (baseline glibc 2.35). Os pacotes são ADITIVOS aos da CLI (regra 15):
   # garraia-desktop-linux-x86_64.{deb,AppImage} ao lado de
   # garraia-linux-x86_64.{deb,rpm,AppImage}. O deb declara
@@ -561,9 +565,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # GAR-822: utoipa-swagger-ui's build.rs downloads swagger-ui at compile time
-      # and intermittently gets a truncated zip (E2E on main, 2026-09-07).
-      # The composite action pre-fetches, verifies and caches it.
+      # GAR-822 (vestigial since #1228): the gateway builds utoipa-swagger-ui with
+      # `vendored`, so its build.rs reads the embedded zip and never this cache.
+      # Kept for one release; the step soft-fails and cannot abort the job.
       - name: Cache Swagger UI zip
         uses: ./.github/actions/swagger-ui-cache
 
@@ -623,6 +627,12 @@ jobs:
       NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
       APPIMAGETOOL_VERSION: 1.9.1
       APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+      # Runtime puro aarch64 do AppImageKit — necessário porque o
+      # appimagetool x86_64 não embute um runtime aarch64 no AppImage de
+      # outra arquitetura (ROADMAP §4.1 "AppImage aarch64"). Pino `continuous`
+      # imutabilizado pelo checksum (o arquivo é estável desde 2021).
+      APPIMAGE_RUNTIME_AARCH64_URL: https://github.com/AppImage/AppImageKit/releases/download/continuous/runtime-aarch64
+      APPIMAGE_RUNTIME_AARCH64_SHA256: a9c09a26acb16590370e1ad0310c6f49b2677b0cecc9037fa74bdd53ec5e891f
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -720,6 +730,44 @@ jobs:
           # libfuse2, então o próprio appimagetool precisa rodar extraído.
           APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "${RUNNER_TEMP}/appimagetool" \
             "$appdir" stage/garraia-linux-x86_64.AppImage
+          ls -l stage/
+
+      - name: Build AppImage (aarch64, via --runtime-file)
+        # Best-effort como o binário: se o job build-linux-arm64 não produziu
+        # o binário, este AppImage simplesmente não sai (::warning::).
+        run: |
+          set -euo pipefail
+          bin="artifacts/garraia-linux-aarch64/garraia-linux-aarch64"
+          if [ ! -f "$bin" ]; then
+            echo "::warning ::garraia-linux-aarch64 not built; skipping its AppImage."
+            exit 0
+          fi
+
+          # Sem `cd`: os caminhos abaixo (`artifacts/`, `packaging/`, `crates/`,
+          # `stage/`) sao relativos ao workspace, e um `cd "${RUNNER_TEMP}"` aqui
+          # fazia o `cp` seguinte falhar com "cannot stat artifacts/..." — o que
+          # derrubou o job na v0.4.3, a primeira release em que o binario
+          # aarch64 existiu para chegar ate esta linha (antes o `exit 0` acima
+          # escondia o bug). O runtime baixa direto no caminho absoluto e o
+          # checksum e conferido la, sem mudar de diretorio.
+          curl -fsSL --retry 5 --retry-delay 2 -o "${RUNNER_TEMP}/runtime-aarch64" "${APPIMAGE_RUNTIME_AARCH64_URL}"
+          echo "${APPIMAGE_RUNTIME_AARCH64_SHA256}  ${RUNNER_TEMP}/runtime-aarch64" | sha256sum -c -
+
+          appdir="${RUNNER_TEMP}/garraia-aarch64.AppDir"
+          rm -rf "$appdir"
+          mkdir -p "$appdir/usr/bin"
+          cp "$bin" "$appdir/usr/bin/garraia"
+          chmod +x "$appdir/usr/bin/garraia"
+          cp packaging/appimage/garraia.desktop "$appdir/garraia.desktop"
+          cp crates/garraia-desktop/src-tauri/icons/128x128@2x.png "$appdir/garraia.png"
+          ln -s usr/bin/garraia "$appdir/AppRun"
+          # --runtime-file: embute o ELF runtime aarch64 no lugar do runtime
+          # x86_64 que o appimagetool usaria por padrão. O mksquashfs é
+          # agnóstico de arquitetura, então o appimagetool x86_64 empacota.
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=aarch64 "${RUNNER_TEMP}/appimagetool" \
+            --runtime-file "${RUNNER_TEMP}/runtime-aarch64" \
+            "$appdir" stage/garraia-linux-aarch64.AppImage
+          file stage/garraia-linux-aarch64.AppImage | grep -F aarch64
           ls -l stage/
 
       - name: Smoke-test packages
@@ -867,7 +915,7 @@ jobs:
               echo "::warning ::${pkg} not packaged; release will ship without it."
             fi
           done
-          for pkg in garraia-linux-aarch64.deb garraia-linux-aarch64.rpm; do
+          for pkg in garraia-linux-aarch64.deb garraia-linux-aarch64.rpm garraia-linux-aarch64.AppImage; do
             if [ -f "artifacts/garraia-linux-packages/${pkg}" ]; then
               cp "artifacts/garraia-linux-packages/${pkg}" release/
             fi
@@ -1054,6 +1102,7 @@ jobs:
             release/garraia-linux-x86_64.rpm
             release/garraia-linux-aarch64.rpm
             release/garraia-linux-x86_64.AppImage
+            release/garraia-linux-aarch64.AppImage
             release/garraia-desktop-windows-x86_64.msi
             release/garraia-desktop-windows-x86_64-setup.exe
             release/garraia-desktop-linux-x86_64.deb

@@ -10,11 +10,13 @@
 //! resolved by [`garraia_config::ConfigLoader::default_config_dir`]
 //! (usually `~/.garraia/` or `$XDG_CONFIG_HOME/garraia/`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
 use super::{McpConfig, McpRuntimeRegistry, is_sensitive_key};
+use crate::bootstrap::RaizesDoMcpFilesystem;
 
 /// Sentinel prefix for vault-referenced env values in `mcp.json`.
 const VAULT_REF_PREFIX: &str = "vault:";
@@ -22,6 +24,35 @@ const VAULT_REF_PREFIX: &str = "vault:";
 /// Returns the vault key used to store `env_key` for `server_name`.
 fn vault_key(server_name: &str, env_key: &str) -> String {
     format!("mcp.{server_name}.{env_key}")
+}
+
+/// Resolve `vault:` refs em um mapa `env`, reescrevendo cada referência pelo
+/// valor do cofre. Valores sem o prefixo ficam como estão.
+///
+/// Devolve as referências (`env_key`, `ref`) que **não** resolveram; a
+/// política de cada caminho é do chamador:
+///
+/// - **Boot** (`build_mcp_tools`, #1237): fechado — qualquer ref não
+///   resolvida impede o servidor de subir. O caminho de registry pode
+///   tolerar o literal porque a admin API mostra a config para depurar; o
+///   boot não pode: o literal iria direto para o processo filho como valor
+///   da variável, e um retry do `pending` (#1242) entregaria o literal de
+///   novo — por isso a porta fecha antes de qualquer spawn.
+/// - **Registry** (admin API, GAR-291): tolerante — avisa e deixa o literal.
+pub(crate) fn resolver_env_com_vault(
+    env: &mut HashMap<String, String>,
+    vault_path: &Path,
+) -> Vec<(String, String)> {
+    let mut nao_resolvidos = Vec::new();
+    for (env_key, env_val) in env.iter_mut() {
+        if let Some(vk) = env_val.strip_prefix(VAULT_REF_PREFIX) {
+            match garraia_security::try_vault_get(vault_path, vk) {
+                Some(resolved) => *env_val = resolved,
+                None => nao_resolvidos.push((env_key.clone(), vk.to_string())),
+            }
+        }
+    }
+    nao_resolvidos
 }
 
 /// Loads and saves `mcp.json`, and builds [`McpRuntimeRegistry`] from it.
@@ -76,18 +107,65 @@ impl McpPersistenceService {
     /// [`provision_filesystem_if_missing`](Self::provision_filesystem_if_missing).
     pub const DISABLE_AUTOPROVISION_ENV: &'static str = "GARRAIA_DISABLE_MCP_AUTOPROVISION";
 
+    /// O pacote npm do servidor `filesystem` autoprovisionado. As raizes
+    /// permitidas sao os argumentos **depois** dele — e o que
+    /// [`raizes_do_filesystem_persistido`] le de volta.
+    pub const FILESYSTEM_PACKAGE: &'static str = "@modelcontextprotocol/server-filesystem";
+
+    /// Versao do `server-filesystem` que o Garra testou (issue #1346).
+    ///
+    /// `npx -y <pacote>` sem versao resolve para o que for mais novo no
+    /// registry a cada cache frio: uma instalacao nova recebia um build que
+    /// ninguem tinha rodado, e um `_npx` montado pela metade (a queda do
+    /// `zod/v4/mini`) nao tinha como ser distinguido de um pacote quebrado.
+    /// Fixar a versao tambem ajuda a cadeia de suprimento, mas so no primeiro
+    /// nivel: o pacote de topo deixa de flutuar, e as dependencias DELE
+    /// (`@modelcontextprotocol/sdk`, `zod`, `glob`, ...) continuam resolvidas
+    /// pelos ranges semver do `package.json` publicado, sem lockfile — o
+    /// `npx -y` num cache frio ainda pega a versao mais nova que casar. Subir
+    /// a versao e um PR comum, depois de um handshake `initialize` +
+    /// `tools/list` em node 20 e 22.
+    pub const FILESYSTEM_PACKAGE_VERSION: &'static str = "2026.8.31";
+
+    /// `<pacote>@<versao>` — o argumento que a provisao, o template do admin e
+    /// o marketplace escrevem. So instalacoes NOVAS recebem: um `mcp.json`
+    /// existente nunca e reescrito, e o diagnostico `mcp.filesystem_pinned`
+    /// avisa quem ficou sem versao.
+    pub const FILESYSTEM_PACKAGE_SPEC: &'static str =
+        "@modelcontextprotocol/server-filesystem@2026.8.31";
+
     /// Seed `mcp.json` with a Filesystem MCP entry when the file does not exist yet.
     ///
     /// This is a first-run convenience: new installations get local filesystem
     /// access immediately without requiring manual admin-UI configuration.
     /// Existing installations (file already present) are **never** modified.
     ///
-    /// The allowed root is the user's home directory (`$HOME` / `%USERPROFILE%`),
-    /// falling back to the parent of `~/.garraia/` if the env var is absent.
+    /// # As raizes vem de fora (ADR 0024, #1329)
+    ///
+    /// `raizes` sao os diretorios que o servidor recebe como argumentos — todos
+    /// eles, na ordem dada. Quem decide quais sao e
+    /// `crate::bootstrap::raizes_do_mcp_filesystem`, por perfil de execucao:
+    /// `agent.file_roots` ou `<data_dir>/workspace` em `standard`,
+    /// `execution.pod_root` ou o mesmo workspace em `isolated-pod`. Ate a
+    /// #1329 a raiz era `$HOME`/`%USERPROFILE%` resolvido **aqui**, e isso era
+    /// o contorno do jail: as file tools nativas ficavam presas em
+    /// `agent.file_roots` enquanto `filesystem__read_file` lia a home inteira.
+    /// Este metodo nao le mais nenhuma env de diretorio e nao tem fallback:
+    /// lista vazia ou raiz que nao existe (ou nao da para criar) e "nao
+    /// provisiona" com um `warn!`, nunca "provisiona com `$HOME`" nem
+    /// "provisiona com `.`".
+    ///
+    /// So o **workspace** default (`RaizesDoMcpFilesystem::Workspace`) e
+    /// criado com `create_dir_all` antes da escrita — ele e um diretorio do
+    /// proprio Garra e nao existe num primeiro boot, e o `server-filesystem`
+    /// recusa subir com um diretorio inexistente. Raiz **declarada**
+    /// (`agent.file_roots`, `execution.pod_root`) precisa existir: o boot nao
+    /// cria diretorio no host (nem no cwd, no caso de um `pod_root` relativo)
+    /// por efeito colateral de um typo na config (F-3 da auditoria da #1329).
     ///
     /// # Por que existe um opt-out
     ///
-    /// A entrada provisionada roda `npx -y @modelcontextprotocol/server-filesystem`,
+    /// A entrada provisionada roda `npx -y @modelcontextprotocol/server-filesystem@<versao>`,
     /// e o `-y` **baixa o pacote do npm na primeira execução**. Como o boot do
     /// gateway spawna os servidores MCP logo em seguida (`build_mcp_tools`), num
     /// ambiente de cache frio esse download entra no caminho crítico do start.
@@ -106,7 +184,7 @@ impl McpPersistenceService {
     /// quem sobe o gateway sabendo que não vai exercitar MCP declara isso e o
     /// boot deixa de depender da rede. Não muda nada para o usuário final — o
     /// default segue provisionando.
-    pub fn provision_filesystem_if_missing(&self) {
+    pub fn provision_filesystem_if_missing(&self, raizes: &RaizesDoMcpFilesystem) {
         if std::env::var_os(Self::DISABLE_AUTOPROVISION_ENV)
             .is_some_and(|v| !v.is_empty() && v != "0")
         {
@@ -121,29 +199,52 @@ impl McpPersistenceService {
             return;
         }
 
-        // Resolve the user's home directory in a cross-platform way.
-        let home_dir = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                // Fallback: parent of ~/.garraia/ → ~
-                self.path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
+        match raizes {
+            RaizesDoMcpFilesystem::Workspace(workspace) => {
+                if let Err(e) = std::fs::create_dir_all(workspace) {
+                    warn!(
+                        "mcp: nao provisionou o servidor filesystem — nao foi possivel criar \
+                         o workspace {}: {e}",
+                        workspace.display()
+                    );
+                    return;
+                }
+            }
+            // Fail-closed: sem raiz declarada nao ha o que provisionar. Um
+            // fallback aqui seria exatamente o `$HOME` que a #1329 removeu.
+            RaizesDoMcpFilesystem::Declaradas(declaradas) if declaradas.is_empty() => {
+                warn!(
+                    "mcp: nao provisionou o servidor filesystem — nenhuma raiz declarada \
+                     (agent.file_roots / execution.pod_root / <data_dir>/workspace)"
+                );
+                return;
+            }
+            RaizesDoMcpFilesystem::Declaradas(declaradas) => {
+                for raiz in declaradas {
+                    if !raiz.is_dir() {
+                        warn!(
+                            "mcp: nao provisionou o servidor filesystem — a raiz declarada {} \
+                             nao existe (agent.file_roots / execution.pod_root); o boot nao \
+                             cria diretorio declarado pelo operador. Crie-a e reinicie, ou \
+                             corrija a config",
+                            raiz.display()
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        let raizes = raizes.caminhos();
+
+        let mut args = vec!["-y".to_string(), Self::FILESYSTEM_PACKAGE_SPEC.to_string()];
+        args.extend(raizes.iter().map(|r| r.to_string_lossy().into_owned()));
 
         let mut config = McpConfig::default();
         config.mcp_servers.insert(
             "filesystem".to_string(),
             super::McpServerConfig {
                 command: Some("npx".to_string()),
-                args: vec![
-                    "-y".to_string(),
-                    "@modelcontextprotocol/server-filesystem".to_string(),
-                    home_dir.to_string_lossy().into_owned(),
-                ],
+                args,
                 env: Default::default(),
                 url: None,
                 transport: None,
@@ -151,14 +252,19 @@ impl McpPersistenceService {
                 memory_limit_mb: None,
                 max_restarts: None,
                 restart_delay_secs: None,
+                allowed_tools: Vec::new(),
+                inherit_env: false,
+                enabled: None,
             },
         );
 
+        let lista = raizes
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         match self.save(&config) {
-            Ok(()) => info!(
-                "mcp: provisioned default mcp.json with filesystem MCP at {}",
-                home_dir.display()
-            ),
+            Ok(()) => info!("mcp: provisioned default mcp.json with filesystem MCP at [{lista}]"),
             Err(e) => warn!("mcp: failed to provision default mcp.json: {e}"),
         }
     }
@@ -194,7 +300,15 @@ impl McpPersistenceService {
     ///
     /// **GAR-291**: If a vault is configured, `vault:` references in env values
     /// are resolved to their plaintext secrets before the registry is built.
-    /// Servers are never exposed to unresolved `vault:` strings at runtime.
+    /// Servers loaded THROUGH THIS PATH are never exposed to unresolved
+    /// `vault:` strings at runtime.
+    ///
+    /// The qualifier is load-bearing (#1237): this is the registry path
+    /// (admin API / marketplace). The gateway ALSO reads `mcp.json` at boot
+    /// through `ConfigLoader::merged_mcp_config`, which does no resolution at
+    /// all — a `vault:` reference on that path reaches the child process as
+    /// the literal string. Do not read this sentence as "the product resolves
+    /// `vault:` everywhere"; it does not, and #1237 is about closing the gap.
     pub fn load_registry(&self) -> McpRuntimeRegistry {
         match self.load() {
             Ok(mut config) => {
@@ -244,7 +358,9 @@ impl McpPersistenceService {
     ///
     /// Values that are already plaintext (no prefix) are left untouched.
     /// Unresolvable `vault:` refs emit a warning and remain as-is so the
-    /// server config is still visible for debugging.
+    /// server config is still visible for debugging — this is the registry
+    /// path, tolerant by design; the boot path is fail-closed (see
+    /// [`resolver_env_com_vault`] and #1237).
     fn resolve_vault_refs(&self, config: &mut McpConfig) {
         let vault_path = match &self.vault_path {
             Some(p) => p.as_path(),
@@ -252,18 +368,13 @@ impl McpPersistenceService {
         };
 
         for (server_name, server_cfg) in config.mcp_servers.iter_mut() {
-            for (env_key, env_val) in server_cfg.env.iter_mut() {
-                if let Some(vk) = env_val.strip_prefix(VAULT_REF_PREFIX) {
-                    match garraia_security::try_vault_get(vault_path, vk) {
-                        Some(resolved) => *env_val = resolved,
-                        None => warn!(
-                            server = %server_name,
-                            env_key = %env_key,
-                            vault_ref = %vk,
-                            "mcp: vault ref unresolvable — vault missing or GARRAIA_VAULT_PASSPHRASE not set"
-                        ),
-                    }
-                }
+            for (env_key, vk) in resolver_env_com_vault(&mut server_cfg.env, vault_path) {
+                warn!(
+                    server = %server_name,
+                    env_key = %env_key,
+                    vault_ref = %vk,
+                    "mcp: vault ref unresolvable — vault missing or GARRAIA_VAULT_PASSPHRASE not set"
+                );
             }
         }
     }
@@ -332,12 +443,199 @@ impl McpPersistenceService {
     }
 }
 
+/// As raizes que a entrada `filesystem` persistida declara (ADR 0024, #1329).
+///
+/// `None` quando nao ha entrada `filesystem`; `Some(raizes)` com os
+/// argumentos **depois** de [`McpPersistenceService::FILESYSTEM_PACKAGE`]
+/// (com ou sem versao fixada: `@modelcontextprotocol/server-filesystem@0.6.2`
+/// tambem e o pacote), que e o formato que o autoprovisionamento escreve.
+/// Entrada editada a mao sem o pacote (um binario local, por exemplo) cai no
+/// que sobra depois de tirar as flags `-x`/`--x` e qualquer outro pacote
+/// `@modelcontextprotocol/...`, para o diagnostico ainda ter o que comparar.
+/// Pura: nao le disco; recebe o [`McpConfig`] que o chamador carregou.
+pub fn raizes_do_filesystem_persistido(config: &McpConfig) -> Option<Vec<PathBuf>> {
+    let entrada = config.mcp_servers.get("filesystem")?;
+    Some(raizes_dos_args(&entrada.args))
+}
+
+/// As raizes do `filesystem` que o boot **de fato** usa, olhando as duas
+/// fontes que `ConfigLoader::merged_mcp_config` funde: uma entrada
+/// `filesystem` em `config.yml` (`mcp:`) vence a do `mcp.json`, como no
+/// merge. `None` quando nenhuma das duas a declara.
+///
+/// Sem isto o diagnostico `mcp.filesystem_root` so via o `mcp.json` e
+/// dizia `skipped`/`ok` para um `filesystem` de `config.yml` apontando para
+/// fora das raizes declaradas (F-2 da auditoria da #1329). Puro.
+pub fn raizes_do_filesystem_efetivo(
+    do_config_yml: &HashMap<String, garraia_config::McpServerConfig>,
+    do_mcp_json: &McpConfig,
+) -> Option<Vec<PathBuf>> {
+    match do_config_yml.get("filesystem") {
+        Some(entrada) => Some(raizes_dos_args(&entrada.args)),
+        None => raizes_do_filesystem_persistido(do_mcp_json),
+    }
+}
+
+/// Se a entrada `filesystem` efetiva roda o pacote npm com versao fixada
+/// (issue #1346). Alimenta o diagnostico `mcp.filesystem_pinned`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersaoDoFilesystem {
+    /// Nenhuma entrada `filesystem` em `config.yml` nem no `mcp.json`.
+    Ausente,
+    /// A entrada nao roda o pacote via `npx` (binario local, `node` direto,
+    /// transporte HTTP) — versao nao e assunto do Garra.
+    ForaDoNpx,
+    /// `npx ... @modelcontextprotocol/server-filesystem@<versao exata>`
+    /// (`1.2.3`, com `-prerelease`/`+build` opcionais).
+    Fixada(String),
+    /// `npx ... @modelcontextprotocol/server-filesystem` sem `@versao`, ou com
+    /// algo que nao e versao exata — dist-tag (`@latest`, `@next`) ou range
+    /// (`@^1`, `@~2026.8`, `@*`): cada cache frio baixa o que for mais novo
+    /// no registry do mesmo jeito. Carrega os `args`
+    /// sugeridos (os mesmos, com o pacote trocado pela versao testada), para
+    /// o diagnostico dizer exatamente o que colar.
+    SemVersao { args_sugeridos: Vec<String> },
+}
+
+/// Classifica a versao da entrada `filesystem` que o boot de fato usa —
+/// `config.yml` vence o `mcp.json`, como em [`raizes_do_filesystem_efetivo`].
+/// Pura. NUNCA reescreve nada: um `mcp.json` existente e do operador.
+pub fn versao_do_filesystem_efetivo(
+    do_config_yml: &HashMap<String, garraia_config::McpServerConfig>,
+    do_mcp_json: &McpConfig,
+) -> VersaoDoFilesystem {
+    let (command, args) = match do_config_yml.get("filesystem") {
+        Some(e) => (Some(e.command.clone()), e.args.clone()),
+        None => match do_mcp_json.mcp_servers.get("filesystem") {
+            Some(e) => (e.command.clone(), e.args.clone()),
+            None => return VersaoDoFilesystem::Ausente,
+        },
+    };
+    classificar_versao(command.as_deref(), &args)
+}
+
+fn e_o_npx(command: Option<&str>) -> bool {
+    let Some(command) = command else {
+        return false;
+    };
+    let base = std::path::Path::new(command)
+        .file_name()
+        .and_then(|b| b.to_str())
+        .unwrap_or(command);
+    ["npx", "npx.cmd", "npx.exe"]
+        .iter()
+        .any(|n| base.eq_ignore_ascii_case(n))
+}
+
+fn classificar_versao(command: Option<&str>, args: &[String]) -> VersaoDoFilesystem {
+    if !e_o_npx(command) {
+        return VersaoDoFilesystem::ForaDoNpx;
+    }
+    let Some(i) = args.iter().position(|a| e_o_pacote_do_filesystem(a)) else {
+        return VersaoDoFilesystem::ForaDoNpx;
+    };
+    match args[i]
+        .strip_prefix(McpPersistenceService::FILESYSTEM_PACKAGE)
+        .and_then(|resto| resto.strip_prefix('@'))
+    {
+        Some(versao) if e_versao_exata(versao) => VersaoDoFilesystem::Fixada(versao.to_string()),
+        _ => {
+            let mut args_sugeridos = args.to_vec();
+            args_sugeridos[i] = McpPersistenceService::FILESYSTEM_PACKAGE_SPEC.to_string();
+            VersaoDoFilesystem::SemVersao { args_sugeridos }
+        }
+    }
+}
+
+/// `v` e uma versao semver EXATA (`MAJOR.MINOR.PATCH`, com `-prerelease` e
+/// `+build` opcionais)? Dist-tag (`latest`) e range (`^1`, `1.x`, `>=1`) nao
+/// sao — o npm resolve os dois para "o mais novo que casar" (revisao MCP-8).
+fn e_versao_exata(v: &str) -> bool {
+    let (resto, build) = match v.split_once('+') {
+        Some((r, b)) => (r, Some(b)),
+        None => (v, None),
+    };
+    let (nucleo, pre) = match resto.split_once('-') {
+        Some((n, p)) => (n, Some(p)),
+        None => (resto, None),
+    };
+    let identificadores_ok = |s: &str| {
+        !s.is_empty()
+            && s.split('.').all(|id| {
+                !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+    };
+    let partes: Vec<&str> = nucleo.split('.').collect();
+    partes.len() == 3
+        && partes
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        && pre.is_none_or(identificadores_ok)
+        && build.is_none_or(identificadores_ok)
+}
+
+/// `arg` e o pacote do servidor `filesystem`, nu ou com versao fixada
+/// (`@modelcontextprotocol/server-filesystem@0.6.2`)?
+fn e_o_pacote_do_filesystem(arg: &str) -> bool {
+    arg.strip_prefix(McpPersistenceService::FILESYSTEM_PACKAGE)
+        .is_some_and(|resto| resto.is_empty() || resto.starts_with('@'))
+}
+
+/// Os argumentos que sao raizes: tudo depois do pacote quando ele esta na
+/// lista; senao tudo que nao e flag nem pacote `@modelcontextprotocol/...`.
+fn raizes_dos_args(args: &[String]) -> Vec<PathBuf> {
+    match args.iter().position(|a| e_o_pacote_do_filesystem(a)) {
+        Some(i) => args[i + 1..].iter().map(PathBuf::from).collect(),
+        None => args
+            .iter()
+            .filter(|a| !a.starts_with('-') && !a.starts_with("@modelcontextprotocol/"))
+            .map(PathBuf::from)
+            .collect(),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mcp::{McpServerConfig, McpStatus};
+
+    /// Raiz que os testes de provisao passam: um subdiretorio do tempdir
+    /// que ainda NAO existe, para o `create_dir_all` ser exercitado.
+    fn raiz_de_teste(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("workspace")
+    }
+
+    /// #1237: valores plaintext passam inteiros; toda `vault:` de um mapa
+    /// com cofre INEXISTENTE volta como não resolvida — sem ler passphrase
+    /// (o vault nem existe), então o teste não depende de ambiente.
+    #[test]
+    fn resolver_env_com_vault_sem_cofre_deixa_plaintext_e_lista_refs() {
+        let mut env = HashMap::from([
+            ("PLAIN".to_string(), "valor-cru".to_string()),
+            ("REF_A".to_string(), "vault:mcp.ok.A".to_string()),
+            ("REF_B".to_string(), "vault:mcp.ok.B".to_string()),
+            ("JA_RESOLVIDO".to_string(), "token-ja-literal".to_string()),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nao_resolvidos =
+            resolver_env_com_vault(&mut env, dir.path().join("vault.json").as_path());
+        assert_eq!(env["PLAIN"], "valor-cru", "plaintext não pode ser tocado");
+        assert_eq!(
+            env["JA_RESOLVIDO"], "token-ja-literal",
+            "valor sem prefixo não pode ser tocado"
+        );
+        assert!(
+            nao_resolvidos.contains(&("REF_A".to_string(), "mcp.ok.A".to_string())),
+            "ref sem cofre precisa voltar como não resolvida: {nao_resolvidos:?}"
+        );
+        assert!(
+            nao_resolvidos.contains(&("REF_B".to_string(), "mcp.ok.B".to_string())),
+            "ref sem cofre precisa voltar como não resolvida: {nao_resolvidos:?}"
+        );
+        assert_eq!(nao_resolvidos.len(), 2);
+    }
 
     fn temp_mcp_json(content: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -442,17 +740,116 @@ mod tests {
         assert!(loaded.mcp_servers.contains_key("my-server"));
     }
 
+    /// Issue #1273 — a sonda do corpo da issue, como teste de regressão: um
+    /// `add_server` + `save_from_registry` não pode apagar o que os OUTROS
+    /// servidores declaram no disco.
+    ///
+    /// O fixture é o arquivo exatamente como o operador (ou o wizard) o
+    /// escreve: chaves snake_case, no schema `garraia_config` que o loader
+    /// de boot lê — allowlist GAR-190, válvula `inherit_env` (#1075),
+    /// chave de boot `enabled` e tuning. Antes de #1273 o tipo do registry
+    /// não carregava nada disso, então o snapshot que `save_from_registry`
+    /// serializa derrubava os campos de TODOS os servidores do arquivo —
+    /// `enabled: false` religando o servidor no próximo boot incluído.
+    ///
+    /// À prova de mutação: remova qualquer campo asserido de
+    /// `McpServerConfig` e o load deixa de capturá-lo, o arquivo reescrito
+    /// fica sem ele e a asserção falla.
+    #[tokio::test]
+    async fn save_from_registry_preserves_declared_fields_of_other_servers() {
+        let fixture = serde_json::json!({
+            "mcpServers": {
+                "keeper": {
+                    "command": "python3",
+                    "args": ["-m", "keeper"],
+                    "transport": "stdio",
+                    "timeout": 10,
+                    "allowed_tools": ["read_file", "write_file"],
+                    "inherit_env": true,
+                    "enabled": false,
+                    "memory_limit_mb": 512,
+                    "max_restarts": 3,
+                    "restart_delay_secs": 2
+                }
+            }
+        });
+        let (_dir, path) =
+            temp_mcp_json(&serde_json::to_string_pretty(&fixture).expect("serialize fixture"));
+        let svc = McpPersistenceService::new(&path);
+
+        let reg = svc.load_registry();
+        // O registry capturou os campos declarados (tolerância de alias).
+        {
+            let keeper = reg.get("keeper").await.expect("keeper loaded");
+            assert_eq!(keeper.config.allowed_tools.len(), 2);
+            assert!(keeper.config.inherit_env);
+            assert_eq!(keeper.config.enabled, Some(false));
+            assert_eq!(keeper.config.memory_limit_mb, Some(512));
+        }
+
+        // A escrita destrutiva que antes os apagava.
+        reg.add_server(
+            "novo",
+            McpServerConfig {
+                command: Some("echo".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        svc.save_from_registry(&reg).await.expect("save");
+
+        // Lê o ARQUIVO cru — a sonda exata do corpo da issue.
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("parse back");
+        let keeper = &raw["mcpServers"]["keeper"];
+        assert_eq!(
+            keeper["allowed_tools"],
+            serde_json::json!(["read_file", "write_file"]),
+            "a allowlist declarada no disco deve sobreviver a uma escrita de admin dos OUTROS servidores"
+        );
+        assert_eq!(keeper["inherit_env"], serde_json::json!(true));
+        assert_eq!(keeper["enabled"], serde_json::json!(false));
+        // O tuning preserva o valor: o load lê a grafia snake_case via alias
+        // e a gravação usa a grafia canônica do writer (camelCase).
+        assert_eq!(keeper["memoryLimitMb"], serde_json::json!(512));
+        assert_eq!(keeper["maxRestarts"], serde_json::json!(3));
+        assert_eq!(keeper["timeoutSecs"], serde_json::json!(10));
+        // E o recém-chegado está lá, allow-all (sem chave de allowlist).
+        assert!(raw["mcpServers"]["novo"].is_object());
+        assert!(raw["mcpServers"]["novo"]["allowed_tools"].is_null());
+    }
+
     /// O default segue provisionando — o opt-out não pode mudar o que o
-    /// usuário final vê num primeiro boot.
+    /// usuário final vê num primeiro boot. E a raiz gravada e a que foi
+    /// PASSADA, com o diretorio criado — nunca `$HOME` (#1329): a env vai
+    /// para um sentinela e o arquivo nao pode conte-lo.
     #[test]
     #[serial_test::serial]
     fn provision_writes_the_filesystem_entry_by_default() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mcp.json");
-        // SAFETY: teste serializado; ninguém mais lê esta var em paralelo.
-        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+        let raiz = raiz_de_teste(&dir);
+        const SENTINELA: &str = "/sentinela-home-que-nao-pode-aparecer";
+        // SAFETY: teste serializado; ninguém mais lê estas vars em paralelo.
+        let home_antes = std::env::var_os("HOME");
+        unsafe {
+            std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV);
+            std::env::set_var("HOME", SENTINELA);
+            std::env::set_var("USERPROFILE", SENTINELA);
+        }
 
-        McpPersistenceService::new(&path).provision_filesystem_if_missing();
+        McpPersistenceService::new(&path)
+            .provision_filesystem_if_missing(&RaizesDoMcpFilesystem::Workspace(raiz.clone()));
+
+        // SAFETY: idem — restaura antes de qualquer asserção.
+        unsafe {
+            match home_antes {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            std::env::remove_var("USERPROFILE");
+        }
 
         let loaded = McpPersistenceService::new(&path).load().expect("load");
         let fs = loaded
@@ -460,6 +857,286 @@ mod tests {
             .get("filesystem")
             .expect("entrada filesystem provisionada");
         assert_eq!(fs.command.as_deref(), Some("npx"));
+        assert_eq!(
+            fs.args,
+            vec![
+                "-y".to_string(),
+                McpPersistenceService::FILESYSTEM_PACKAGE_SPEC.to_string(),
+                raiz.to_string_lossy().into_owned(),
+            ]
+        );
+        assert!(raiz.is_dir(), "o workspace default e criado pelo boot");
+        let cru = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !cru.contains(SENTINELA),
+            "`$HOME` nao pode chegar ao mcp.json: {cru}"
+        );
+        assert_eq!(
+            raizes_do_filesystem_persistido(&loaded),
+            Some(vec![raiz]),
+            "o helper le de volta exatamente o que a provisao escreveu"
+        );
+    }
+
+    /// Varias raizes declaradas (`agent.file_roots` com mais de um item)
+    /// entram TODAS, na ordem, como argumentos finais do pacote — desde que
+    /// existam.
+    #[test]
+    #[serial_test::serial]
+    fn provision_writes_every_root_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp.json");
+        let a = dir.path().join("a");
+        let b = dir.path().join("b").join("profundo");
+        std::fs::create_dir_all(&a).expect("mkdir a");
+        std::fs::create_dir_all(&b).expect("mkdir b");
+        // SAFETY: teste serializado.
+        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+
+        McpPersistenceService::new(&path).provision_filesystem_if_missing(
+            &RaizesDoMcpFilesystem::Declaradas(vec![a.clone(), b.clone()]),
+        );
+
+        let loaded = McpPersistenceService::new(&path).load().expect("load");
+        assert_eq!(
+            raizes_do_filesystem_persistido(&loaded),
+            Some(vec![a.clone(), b.clone()])
+        );
+    }
+
+    /// F-3 da auditoria: raiz DECLARADA que nao existe e "nao provisiona" —
+    /// e o boot NAO a cria. Um `pod_root` com typo ou relativo nao pode virar
+    /// diretorio novo no host por efeito colateral do primeiro boot.
+    #[test]
+    #[serial_test::serial]
+    fn provision_skips_when_a_declared_root_does_not_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp.json");
+        let existe = dir.path().join("existe");
+        std::fs::create_dir_all(&existe).expect("mkdir");
+        let nao_existe = dir.path().join("pod-root-com-typo");
+        // SAFETY: teste serializado.
+        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+
+        McpPersistenceService::new(&path).provision_filesystem_if_missing(
+            &RaizesDoMcpFilesystem::Declaradas(vec![existe, nao_existe.clone()]),
+        );
+
+        assert!(
+            !path.exists(),
+            "raiz declarada inexistente => nao provisiona"
+        );
+        assert!(
+            !nao_existe.exists(),
+            "o boot nunca cria uma raiz declarada pelo operador"
+        );
+    }
+
+    /// Fail-closed: sem raiz, nada e gravado — o fallback para `$HOME` ou
+    /// `.` e o que a #1329 proibiu.
+    #[test]
+    #[serial_test::serial]
+    fn provision_without_roots_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp.json");
+        // SAFETY: teste serializado.
+        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+
+        McpPersistenceService::new(&path)
+            .provision_filesystem_if_missing(&RaizesDoMcpFilesystem::Declaradas(vec![]));
+
+        assert!(
+            !path.exists(),
+            "sem raiz nao pode haver mcp.json provisionado"
+        );
+    }
+
+    /// Workspace que nao da para criar (um ARQUIVO no caminho) tambem e
+    /// fail-closed: nada gravado, nenhum fallback.
+    #[test]
+    #[serial_test::serial]
+    fn provision_skips_when_the_workspace_cannot_be_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp.json");
+        let bloqueio = dir.path().join("arquivo-no-caminho");
+        std::fs::write(&bloqueio, b"x").expect("write");
+        let raiz_impossivel = bloqueio.join("sub");
+        // SAFETY: teste serializado.
+        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+
+        McpPersistenceService::new(&path)
+            .provision_filesystem_if_missing(&RaizesDoMcpFilesystem::Workspace(raiz_impossivel));
+
+        assert!(!path.exists(), "workspace impossivel => nao provisiona");
+    }
+
+    /// Arquivo presente nunca e tocado — nem quando as raizes mudam.
+    #[test]
+    #[serial_test::serial]
+    fn provision_never_touches_an_existing_file() {
+        let json = r#"{"mcpServers":{"meu":{"command":"cmd"}}}"#;
+        let (dir, path) = temp_mcp_json(json);
+        // SAFETY: teste serializado.
+        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+
+        McpPersistenceService::new(&path).provision_filesystem_if_missing(
+            &RaizesDoMcpFilesystem::Workspace(raiz_de_teste(&dir)),
+        );
+
+        let cru = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(cru, json, "arquivo existente e intocavel");
+        assert!(
+            !raiz_de_teste(&dir).exists(),
+            "com arquivo presente nem o diretorio e criado"
+        );
+    }
+
+    /// O helper do diagnostico: entrada ausente => `None`; formato
+    /// autoprovisionado => tudo depois do pacote; entrada manual sem o
+    /// pacote => o que nao e flag.
+    #[test]
+    fn raizes_do_filesystem_persistido_le_os_tres_formatos() {
+        assert_eq!(raizes_do_filesystem_persistido(&McpConfig::default()), None);
+
+        let mut cfg = McpConfig::default();
+        cfg.mcp_servers.insert(
+            "filesystem".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                args: vec![
+                    "-y".into(),
+                    McpPersistenceService::FILESYSTEM_PACKAGE.into(),
+                    "/srv/a".into(),
+                    "/srv/b".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            raizes_do_filesystem_persistido(&cfg),
+            Some(vec![PathBuf::from("/srv/a"), PathBuf::from("/srv/b")])
+        );
+
+        cfg.mcp_servers.insert(
+            "filesystem".into(),
+            McpServerConfig {
+                command: Some("/usr/local/bin/mcp-server-filesystem".into()),
+                args: vec!["--verbose".into(), "/srv/manual".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            raizes_do_filesystem_persistido(&cfg),
+            Some(vec![PathBuf::from("/srv/manual")])
+        );
+
+        // Entrada sem nenhuma raiz: `Some(vazio)`, nao `None` — o servidor
+        // existe, so nao declara nada; o diagnostico decide o que dizer.
+        cfg.mcp_servers.insert(
+            "filesystem".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                args: vec![
+                    "-y".into(),
+                    McpPersistenceService::FILESYSTEM_PACKAGE.into(),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(raizes_do_filesystem_persistido(&cfg), Some(vec![]));
+
+        // Pacote com versao fixada (review C2): o spec e o pacote, nao uma
+        // raiz — sem isto `@modelcontextprotocol/server-filesystem@0.6.2`
+        // virava a "primeira raiz fora do jail" no diagnostico.
+        cfg.mcp_servers.insert(
+            "filesystem".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                args: vec![
+                    "-y".into(),
+                    format!("{}@0.6.2", McpPersistenceService::FILESYSTEM_PACKAGE),
+                    "/srv/a".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            raizes_do_filesystem_persistido(&cfg),
+            Some(vec![PathBuf::from("/srv/a")])
+        );
+        // Um pacote com nome parecido nao e o pacote: `server-filesystem-x`.
+        assert!(!e_o_pacote_do_filesystem(
+            "@modelcontextprotocol/server-filesystem-x"
+        ));
+        assert!(e_o_pacote_do_filesystem(
+            "@modelcontextprotocol/server-filesystem"
+        ));
+
+        // Entrada manual com outro pacote `@modelcontextprotocol/...` e sem o
+        // do filesystem: o pacote nao e raiz.
+        cfg.mcp_servers.insert(
+            "filesystem".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                args: vec![
+                    "-y".into(),
+                    "@modelcontextprotocol/server-outro".into(),
+                    "/srv/manual".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            raizes_do_filesystem_persistido(&cfg),
+            Some(vec![PathBuf::from("/srv/manual")])
+        );
+    }
+
+    /// F-2 da auditoria: o boot funde `config.yml` (`mcp:`) e `mcp.json`, com
+    /// o `config.yml` vencendo; o diagnostico tem de olhar a mesma fusao.
+    #[test]
+    fn raizes_do_filesystem_efetivo_prefere_o_config_yml() {
+        let mut json = McpConfig::default();
+        json.mcp_servers.insert(
+            "filesystem".into(),
+            McpServerConfig {
+                command: Some("npx".into()),
+                args: vec![
+                    "-y".into(),
+                    McpPersistenceService::FILESYSTEM_PACKAGE.into(),
+                    "/srv/do-json".into(),
+                ],
+                ..Default::default()
+            },
+        );
+
+        // Sem entrada no config.yml: o mcp.json vale.
+        let vazio = HashMap::new();
+        assert_eq!(
+            raizes_do_filesystem_efetivo(&vazio, &json),
+            Some(vec![PathBuf::from("/srv/do-json")])
+        );
+        assert_eq!(
+            raizes_do_filesystem_efetivo(&vazio, &McpConfig::default()),
+            None
+        );
+
+        // Com `filesystem` no config.yml: ele vence, como no merge do boot.
+        let mut yml = HashMap::new();
+        let entrada: garraia_config::McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "npx",
+            "args": ["-y", McpPersistenceService::FILESYSTEM_PACKAGE, "/home/legado"],
+        }))
+        .expect("entrada de config.yml");
+        yml.insert("filesystem".to_string(), entrada);
+        assert_eq!(
+            raizes_do_filesystem_efetivo(&yml, &json),
+            Some(vec![PathBuf::from("/home/legado")])
+        );
+        assert_eq!(
+            raizes_do_filesystem_efetivo(&yml, &McpConfig::default()),
+            Some(vec![PathBuf::from("/home/legado")])
+        );
     }
 
     /// Com o opt-out ligado o boot não grava nada — e portanto não spawna
@@ -474,11 +1151,17 @@ mod tests {
         // SAFETY: teste serializado; ninguém mais lê esta var em paralelo.
         unsafe { std::env::set_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV, "1") };
 
-        McpPersistenceService::new(&path).provision_filesystem_if_missing();
+        McpPersistenceService::new(&path).provision_filesystem_if_missing(
+            &RaizesDoMcpFilesystem::Workspace(raiz_de_teste(&dir)),
+        );
 
         assert!(
             !path.exists(),
             "opt-out ligado deve deixar o mcp.json inexistente"
+        );
+        assert!(
+            !raiz_de_teste(&dir).exists(),
+            "com opt-out nem o diretorio da raiz e criado"
         );
 
         // SAFETY: idem.
@@ -496,7 +1179,9 @@ mod tests {
             // SAFETY: teste serializado.
             unsafe { std::env::set_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV, value) };
 
-            McpPersistenceService::new(&path).provision_filesystem_if_missing();
+            McpPersistenceService::new(&path).provision_filesystem_if_missing(
+                &RaizesDoMcpFilesystem::Workspace(raiz_de_teste(&dir)),
+            );
 
             assert!(
                 path.exists(),
@@ -505,5 +1190,182 @@ mod tests {
         }
         // SAFETY: idem.
         unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+    }
+
+    /// #1346: a provisao escreve o pacote COM a versao testada, e a leitura
+    /// das raizes continua devolvendo exatamente as raizes (o `@versao` nao
+    /// vira raiz nem some com a primeira).
+    #[test]
+    #[serial_test::serial]
+    fn provision_fixa_a_versao_testada_do_server_filesystem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp.json");
+        let raiz = dir.path().join("ws");
+        std::fs::create_dir_all(&raiz).expect("mkdir");
+        // SAFETY: teste serializado.
+        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+
+        McpPersistenceService::new(&path).provision_filesystem_if_missing(
+            &RaizesDoMcpFilesystem::Declaradas(vec![raiz.clone()]),
+        );
+
+        let cru = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            cru.contains("\"@modelcontextprotocol/server-filesystem@2026.8.31\""),
+            "a provisao tem de fixar a versao: {cru}"
+        );
+        assert_eq!(
+            McpPersistenceService::FILESYSTEM_PACKAGE_SPEC,
+            format!(
+                "{}@{}",
+                McpPersistenceService::FILESYSTEM_PACKAGE,
+                McpPersistenceService::FILESYSTEM_PACKAGE_VERSION
+            )
+        );
+        let loaded = McpPersistenceService::new(&path).load().expect("load");
+        assert_eq!(raizes_do_filesystem_persistido(&loaded), Some(vec![raiz]));
+        assert_eq!(
+            versao_do_filesystem_efetivo(&HashMap::new(), &loaded),
+            VersaoDoFilesystem::Fixada("2026.8.31".into())
+        );
+    }
+
+    /// #1346: um `mcp.json` antigo, SEM versao, sai byte-identico da provisao
+    /// — a correcao alcanca so instalacao nova; quem ja tem o arquivo e
+    /// avisado pelo diagnostico, nunca reescrito.
+    #[test]
+    #[serial_test::serial]
+    fn provision_nao_reescreve_um_filesystem_sem_versao_existente() {
+        let json = r#"{
+  "mcpServers": {
+    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv/dados"] }
+  }
+}"#;
+        let (dir, path) = temp_mcp_json(json);
+        // SAFETY: teste serializado.
+        unsafe { std::env::remove_var(McpPersistenceService::DISABLE_AUTOPROVISION_ENV) };
+
+        McpPersistenceService::new(&path).provision_filesystem_if_missing(
+            &RaizesDoMcpFilesystem::Workspace(raiz_de_teste(&dir)),
+        );
+
+        let cru = std::fs::read(&path).expect("read back");
+        assert_eq!(cru, json.as_bytes(), "mcp.json existente e intocavel");
+    }
+
+    /// Tabela do diagnostico `mcp.filesystem_pinned`.
+    #[test]
+    fn versao_do_filesystem_classifica_as_formas() {
+        fn cfg(command: Option<&str>, args: &[&str]) -> McpConfig {
+            let mut c = McpConfig::default();
+            c.mcp_servers.insert(
+                "filesystem".into(),
+                McpServerConfig {
+                    command: command.map(str::to_string),
+                    args: args.iter().map(|a| a.to_string()).collect(),
+                    ..McpServerConfig::default()
+                },
+            );
+            c
+        }
+        let nada = HashMap::new();
+        assert_eq!(
+            versao_do_filesystem_efetivo(&nada, &McpConfig::default()),
+            VersaoDoFilesystem::Ausente
+        );
+        assert_eq!(
+            versao_do_filesystem_efetivo(
+                &nada,
+                &cfg(
+                    Some("npx"),
+                    &["-y", "@modelcontextprotocol/server-filesystem", "/a"]
+                )
+            ),
+            VersaoDoFilesystem::SemVersao {
+                args_sugeridos: vec![
+                    "-y".into(),
+                    McpPersistenceService::FILESYSTEM_PACKAGE_SPEC.into(),
+                    "/a".into()
+                ]
+            }
+        );
+        // `@` vazio no fim nao e versao.
+        assert!(matches!(
+            versao_do_filesystem_efetivo(
+                &nada,
+                &cfg(
+                    Some("npx"),
+                    &["-y", "@modelcontextprotocol/server-filesystem@", "/a"]
+                )
+            ),
+            VersaoDoFilesystem::SemVersao { .. }
+        ));
+        assert_eq!(
+            versao_do_filesystem_efetivo(
+                &nada,
+                &cfg(
+                    Some("/usr/bin/npx"),
+                    &["-y", "@modelcontextprotocol/server-filesystem@0.6.2", "/a"]
+                )
+            ),
+            VersaoDoFilesystem::Fixada("0.6.2".into())
+        );
+        // Revisao MCP-8: dist-tag e range flutuam como o pacote nu.
+        for flutua in [
+            "latest",
+            "next",
+            "^1",
+            "~2026.8.31",
+            "*",
+            "1.x",
+            ">=1.0.0",
+            "1.2",
+        ] {
+            let spec = format!("@modelcontextprotocol/server-filesystem@{flutua}");
+            let args = ["-y", spec.as_str(), "/a"];
+            match versao_do_filesystem_efetivo(&nada, &cfg(Some("npx"), &args)) {
+                VersaoDoFilesystem::SemVersao { args_sugeridos } => assert_eq!(
+                    args_sugeridos[1],
+                    McpPersistenceService::FILESYSTEM_PACKAGE_SPEC,
+                    "{flutua}"
+                ),
+                outro => panic!("@{flutua} nao e versao fixada: {outro:?}"),
+            }
+        }
+        for exata in ["2026.8.31", "1.0.0-rc.1", "1.0.0+build.5", "0.6.2-beta-2"] {
+            let spec = format!("@modelcontextprotocol/server-filesystem@{exata}");
+            assert_eq!(
+                versao_do_filesystem_efetivo(&nada, &cfg(Some("npx"), &["-y", spec.as_str()])),
+                VersaoDoFilesystem::Fixada(exata.into()),
+                "{exata}"
+            );
+        }
+        assert_eq!(
+            versao_do_filesystem_efetivo(
+                &nada,
+                &cfg(Some("/usr/local/bin/mcp-server-filesystem"), &["/a"])
+            ),
+            VersaoDoFilesystem::ForaDoNpx
+        );
+        // config.yml vence o mcp.json.
+        let mut yml = HashMap::new();
+        yml.insert(
+            "filesystem".to_string(),
+            serde_json::from_value::<garraia_config::McpServerConfig>(serde_json::json!({
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/b"],
+            }))
+            .expect("entrada de config.yml"),
+        );
+        assert!(matches!(
+            versao_do_filesystem_efetivo(
+                &yml,
+                &cfg(
+                    Some("npx"),
+                    &["-y", "@modelcontextprotocol/server-filesystem@1.0.0"]
+                )
+            ),
+            VersaoDoFilesystem::SemVersao { .. }
+        ));
     }
 }

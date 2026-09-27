@@ -85,13 +85,20 @@ cargo build --release -p garraia
 # Start
 ./target/release/garra start
 
-# Open the chat REPL straight onto a local Ollama model. Bare `garra` does
-# the same with the configured default (qwen3.8:latest). A tag that is not
-# pulled yet prompts to download it; `-y` downloads without asking.
+# Bare `garra` opens the chat REPL. On a clean install that is OpenRouter
+# with `z-ai/glm-5.3-flash` (issue #1180). With no `agent.default_provider`
+# in config, autodetect uses the first cloud provider you have a credential
+# for (Anthropic > OpenAI > OpenRouter) and only falls back to local Ollama
+# when none exists.
+./target/release/garra
+
+# Local Ollama is the second option — ask for it explicitly by naming a tag.
+# A tag that is not pulled yet prompts to download it; `-y` downloads
+# without asking.
 ./target/release/garra --model qwen3.8
 
 # One-shot non-interactive ask — great for scripts and CI
-./target/release/garra ask --provider openrouter --model openrouter/free \
+./target/release/garra ask --provider openrouter \
   --json --timeout-secs 30 "Reply with exactly: OK"
 
 # MCP server over stdio — exposes `garra_ask` to Claude Desktop / Claude Code
@@ -113,9 +120,11 @@ Mirrors of the same script: GitHub release CDN
 track `main`).
 
 The installer downloads the binary for your platform, verifies it against
-the release's `SHA256SUMS`, then chains into init and start. Note: the
-installer names the binary `garraia`, while a cargo build produces
-`garra` — the commands are otherwise identical.
+the release's `SHA256SUMS`, then chains into init and start. It leaves two
+names on your PATH: `garraia` (the release asset) and the alias `garra` (a
+relative symlink to it), so the `garra …` commands used throughout this
+README and in the CLI's own hints work as written; a cargo build produces
+`garra` directly.
 
 Flags (usable through the pipe with `sh -s --`) and their equivalent env
 toggles: `--skip-setup` (`GARRAIA_SKIP_INIT=1` + `GARRAIA_SKIP_START=1`),
@@ -125,7 +134,11 @@ caller wins over the matching flag. For a fully unattended install:
 
 ```bash
 curl -fsSL https://garraia.org/install.sh | sh -s -- --skip-setup
-garraia config set-model --model qwen3.8:latest
+# The project default — OpenRouter primary, local Ollama as the backup.
+# The key is read from stdin, never from argv.
+printf '%s\n' "$OPENROUTER_API_KEY" | garraia config set-routing \
+  --primary-provider openrouter --primary-model z-ai/glm-5.3-flash \
+  --backup-provider ollama --backup-model qwen3.8:latest --api-key-stdin
 garraia start
 ```
 
@@ -156,6 +169,13 @@ confuse the two AppImages: `garraia-linux-x86_64.AppImage` is the
 terminal CLI only. See [docs/installation.md](docs/installation.md)
 §"Garra Desktop on Linux".
 
+Once it is installed, `garra desktop` opens it from the terminal —
+`--status` reports whether it is installed and where, `--no-launch` just
+prints the resolved path for scripts. The CLI only locates and spawns the
+app: it embeds no GUI and takes no Tauri dependency, so headless installs
+(Termux, RunPod, Docker) are unaffected
+([ADR 0021](docs/adr/0021-garraia-desktop-control-center.md)).
+
 </details>
 
 <details>
@@ -167,9 +187,10 @@ irm https://garraia.org/install.ps1 | iex
 
 The Windows sibling of `install.sh`, at behavioral parity with it: detects the
 platform, resolves the latest release, verifies the download against
-`SHA256SUMS`, installs `garraia.exe` under `%LOCALAPPDATA%\Programs\GarraIA`,
-puts it on your user PATH, then chains into init and start. No administrator
-rights needed.
+`SHA256SUMS`, installs `garraia.exe` under `%LOCALAPPDATA%\Programs\GarraIA`
+together with a `garra.cmd` shim (so `garra` works too), puts the directory on
+your user PATH, then chains into init and start. No administrator rights
+needed.
 
 Mirrors (same script, auto-synced): `raw.githubusercontent.com`, jsDelivr, and
 the GitHub release CDN
@@ -216,6 +237,7 @@ and installs `garraia` into `$PREFIX/bin` (on your PATH, no sudo):
 pkg install curl
 curl -fsSL https://garraia.org/install.sh | bash
 garraia doctor    # platform, dirs, config, providers, daemon — sysexits
+garraia doctor whatsapp   # the personal-WhatsApp path end to end: link, key, gateway, access, profile, workspace, MCP, provider
 garraia chat      # cloud provider, or --url http://PC-LAN:8080 for a LAN LLM
 ```
 
@@ -352,7 +374,12 @@ fallback on 429/5xx with exponential backoff and a circuit breaker.
 
 Wired end-to-end today: **Telegram** (streaming, MarkdownV2, bot
 commands, pairing), **Discord** (slash commands, sessions), **Slack**
-(Socket Mode), **WhatsApp** (Meta Cloud API webhooks), **iMessage**
+(Socket Mode), **WhatsApp** (Meta Cloud API webhooks, and — since v0.4.3 —
+personal WhatsApp by linked device: `garra whatsapp` scans a QR code, keeps
+the session encrypted on disk and runs a Node/Baileys bridge over stdio;
+needs Node.js 20+ and npm on that path only —
+[docs/whatsapp.md](docs/whatsapp.md),
+[ADR 0023](docs/adr/0023-whatsapp-dispositivo-vinculado.md)), **iMessage**
 (macOS, chat.db polling + AppleScript). Also: web chat console, an
 **OpenAI-compatible API** (`/v1/chat/completions`) for VS Code
 (Continue et al.) sharing the same session history, and an
@@ -499,6 +526,12 @@ the comparison section above for the evidence trail).
   cap (setrlimit, Unix), startup timeout, auto-restart with exponential
   backoff. These are resource limits, not a sandbox: MCP processes keep
   filesystem/network access.
+- **MCP child environment isolation** — a stdio MCP server is spawned with
+  an environment built from scratch: a minimal allowlist (`PATH`, `HOME`,
+  locale, temp dir) plus that server's own `env` map. Gateway secrets
+  (`GARRAIA_JWT_SECRET`, provider API keys, vault passphrase) never reach
+  a third-party MCP binary. Per-server `inherit_env: true` restores the
+  old behaviour and warns on every connect.
 - **WASM plugin sandbox** — optional (`--features plugins`): per-plugin
   memory caps and execution deadlines via wasmtime.
 - **Heuristic input filtering** — control-character sanitization plus a
@@ -516,6 +549,32 @@ the comparison section above for the evidence trail).
   and serves plain HTTP — both are open hardening items on the roadmap.
   For production, a TLS-terminating reverse proxy in front of the
   loopback bind is the recommended setup.
+
+### Execution profiles
+
+Everything above is the `standard` profile — the posture for a shared
+machine. For a **disposable pod** (RunPod, Docker) that exists precisely so
+the agent can act with full autonomy, declare it — the profile is never
+inferred from container markers, and an invalid value refuses to boot:
+
+```yaml
+execution:
+  profile: isolated-pod      # or GARRAIA_EXECUTION_PROFILE=isolated-pod (wins)
+  pod_root: /workspace       # optional, absolute; MCP filesystem root
+channels:
+  whatsapp_linked:
+    type: whatsapp_linked
+    enabled: true
+    owners: ["5511999998888"]   # only declared owners, only in 1:1 chats
+```
+
+**Full power inside the isolated pod; no implicit access outside the pod.**
+The WhatsApp owner gets the `code` floor (`bash`, `file_write`, MCP tools);
+groups and paired-only contacts never inherit it; the bash risky-command
+gate and file jail stay on; a mounted host filesystem, the Docker socket or
+host secrets are **not** isolated by the profile. Guide:
+[docs/execution-profiles.md](docs/execution-profiles.md),
+[ADR 0024](docs/adr/0024-perfis-de-execucao-isolated-pod.md).
 
 ## Migrating from OpenClaw?
 
@@ -536,9 +595,8 @@ exist). Run `garraia config check` to see which directory and file are
 active. Details in [docs/installation.md](docs/installation.md):
 
 ```yaml
-gateway:
-  host: "127.0.0.1"
-  port: 3888
+# The bind comes from --host/HOST and --port/PORT (default 127.0.0.1:3888);
+# gateway.host/gateway.port are deprecated and never bound the socket (#1261).
 
 llm:
   claude:
@@ -591,7 +649,9 @@ crates/
 ├── garraia-plugins/    # WASM plugin sandbox (wasmtime)
 ├── garraia-embeddings/ # EmbeddingProvider / VectorStore traits
 ├── garraia-learning/   # Self-improving skills (mining, safety gate, versioning)
-└── ...                 # telemetry, media, skills, storage, tools, runtime, common, glob, desktop
+├── garraia-hardware/   # Physical devices: Device trait, R0-R5 risk gate, MQTT/Home Assistant/serial/GPIO adapters
+├── garraia-desktop-core/ # Tauri-free core of the Desktop Control Center (state, detect, supervise, locate)
+└── ...                 # telemetry, media, skills, storage, common, glob, desktop
 apps/
 └── garraia-mobile/     # Flutter client (Riverpod, go_router) — Garra Cloud Alpha
 ```

@@ -50,11 +50,21 @@ Configure the Load Balancer Serverless endpoint with:
 > to the public URL. Hitting `https://ENDPOINT_ID.api.runpod.ai:3888/...`
 > from outside the container will not work.
 
-The `garra start` command honors `PORT` and `HOST` env vars (GAR-603); the
-shipped `Dockerfile` `CMD` already passes `--host 0.0.0.0` so the default
-`docker run` works without any env overrides. If Runpod injects `PORT` or
-`HOST`, the binary picks them up automatically — explicit `--port` / `--host`
-flags still win if you ever add them to the start command.
+The `garraia start` command honors `PORT` and `HOST` env vars (GAR-603); the
+shipped `Dockerfile` `CMD` passes `--host 0.0.0.0`, and that flag wins over a
+`HOST` env var. If Runpod injects `PORT`, the binary picks it up.
+
+**A gateway credential is required (#1261, v0.4.5).** On a non-loopback bind
+`garraia start` refuses to boot without one, and exits 78 with a message that
+says how to fix it. Set `GARRAIA_GATEWAY_API_KEY` in the endpoint's
+environment-variable UI (or its secrets manager) to a long random value, e.g.
+the output of `openssl rand -hex 32`. Clients then send it as
+`Authorization: Bearer <key>`; `/ping`, `/health` and `/api/health` stay open
+for the Load Balancer probes. An endpoint that is open on purpose behind an
+authenticating proxy can instead set
+`gateway.allow_unauthenticated_network_bind: true` in its config file (there
+is no env var for it). See
+[auth-config.md §5.1](auth-config.md#51-the-gateway-bind-address--what-config-check-sees-vs-what-start-binds).
 
 ## Local Docker smoke test
 
@@ -68,6 +78,7 @@ docker build -t garraia:local .
 # Pass an empty .env if you have no secrets to inject.
 docker run --rm -p 3888:3888 \
     -e RUST_LOG=info \
+    -e GARRAIA_GATEWAY_API_KEY="$(openssl rand -hex 32)" \
     garraia:local
 
 # In another shell — both should return HTTP 200.
@@ -91,8 +102,11 @@ curl -fsS https://${ENDPOINT_ID}.api.runpod.ai/ping
 If `/ping` returns `400 {"detail":"timed out waiting for worker"}`, the
 endpoint is reachable but the worker has not become healthy yet. Common causes:
 
-- The container start command launched something other than `garra start`
+- The container start command launched something other than `garraia start`
   (e.g. an interactive REPL — does not bind a listener).
+- `GARRAIA_GATEWAY_API_KEY` is not set: since v0.4.5 the worker refuses to
+  boot on `0.0.0.0` without a gateway credential (#1261) — the worker log
+  shows `refusing to start` and the fix.
 - `PORT` / `PORT_HEALTH` mismatch between the endpoint settings and what
   the container binds to.
 - The image was built from a branch that predates GAR-603 and has no `/ping`
@@ -140,9 +154,13 @@ garraia start
 3. Detect the lack of systemd inside RunPod containers and fall back to
    a `nohup ollama serve >> ~/.garraia/ollama.log 2>&1 &` start, with
    the PID stamped at `~/.garraia/ollama.pid`.
-4. Write `gateway.host: 0.0.0.0` and `port: 3888` (or the value of
-   `PORT` when set) into `~/.config/garraia/config.yml` so the gateway
-   binds to the pod's public interface from the first run.
+4. Mint `gateway.api_key` into `~/.config/garraia/config.yml` (a RunPod pod
+   is server-like) and print how to expose the gateway:
+   `HOST=0.0.0.0 garraia start`. Since v0.4.5 the wizard no longer writes
+   `gateway.host`/`gateway.port`: those keys are deprecated and never fed
+   the bind, which comes from `--host`/`--port` or `HOST`/`PORT` (#1261,
+   [auth-config.md
+   §5.1](auth-config.md#51-the-gateway-bind-address--what-config-check-sees-vs-what-start-binds)).
 5. Skip TTS/STT auto-install but write the endpoint defaults
    (`http://127.0.0.1:7860` for Chatterbox, `http://127.0.0.1:9090` for
    faster-whisper) and print the matching `pip install` commands.
@@ -157,6 +175,54 @@ init` today):
 - `GARRAIA_BOOTSTRAP_LOCAL=0` — skip GPU/local-stack prompts.
 - `GARRAIA_SKIP_INIT=1` / `GARRAIA_SKIP_START=1` — installer-only
   (PR-B).
+
+## Execution profile: full power inside a disposable pod
+
+By default the gateway runs in the `standard` execution profile — the
+posture for a shared machine: fail-closed `ToolGate` floor per mode, native
+file-tool jail, `search` floor on personal WhatsApp. A fresh RunPod GPU pod
+is the opposite case: it exists so the agent can read and write files, run
+shell, install packages and use MCP servers without any risk outside the
+pod. Declare that explicitly with the `isolated-pod` profile
+([ADR 0024](adr/0024-perfis-de-execucao-isolated-pod.md), full guide in
+[`execution-profiles.md`](execution-profiles.md)):
+
+```bash
+# Either in the pod's environment (wins over the file)…
+export GARRAIA_EXECUTION_PROFILE=isolated-pod
+garraia start
+```
+
+```yaml
+# …or in ~/.config/garraia/config.yml inside the pod
+execution:
+  profile: isolated-pod
+  pod_root: /workspace          # optional; MCP filesystem root, absolute
+agent:
+  file_roots: ["/workspace"]    # native file tools see the pod too
+channels:
+  whatsapp_linked:
+    type: whatsapp_linked
+    enabled: true
+    owners: ["5511999998888"]   # only declared owners get the `code` floor, 1:1 only
+```
+
+What changes: the WhatsApp **owner** (declared in `owners`, in a 1:1 chat)
+gets the `code` floor — `bash`, `file_write`, subagents and every registered
+MCP tool — instead of `search`; the auto-provisioned `filesystem` MCP server
+is rooted at `execution.pod_root` (else `<data_dir>/workspace`, never
+`$HOME`). Groups and paired-only contacts stay on `default_mode`. The bash
+risky-command gate, the file jail and `agent.sandbox` stay on.
+
+> **Warning.** The profile is a declaration, not an isolation mechanism. The
+> gateway logs one `WARN` at boot and keeps a permanent `Warning` on the
+> `execution.profile` check of `GET /api/diagnostics`. It does **not**
+> isolate a mounted host filesystem, the Docker/Podman socket, `--privileged`,
+> `--pid=host`, `--network=host`, undeclared mounts or host secrets in the
+> environment. If any of those apply to your container, it is not an isolated
+> pod — keep `standard`. The profile is never inferred from `/.dockerenv` or
+> cgroups; an invalid value refuses to boot. Revert with
+> `execution.profile: standard` or by unsetting the env var.
 
 ## Future work
 

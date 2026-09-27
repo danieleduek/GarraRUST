@@ -26,6 +26,26 @@ curl -fsSL https://garraia.org/install.sh | sh
 > `build-linux-x86_64` runner in `.github/workflows/release.yml` and
 > `MIN_GLIBC` in `install.sh`.
 
+**Two names, one binary.** The installer leaves `garraia` (the release asset)
+and `garra` (a relative symlink to it) in the install directory --
+`~/.local/bin` when that is on your PATH, otherwise `/usr/local/bin`, and
+`$PREFIX/bin` on Termux -- so every `garra ...` command in these docs and in the
+CLI's own hints works as written. A pre-existing `garra` that is a regular file
+(say, a from-source build you copied by hand) is left untouched with a warning;
+a stale symlink is repointed. `garra update` keeps working through the alias:
+it resolves the link first and replaces `garraia`, the one binary it points
+at, so the two names never drift apart.
+
+> **macOS, upgrading from v0.4.3 or older:** run `garraia update` (not
+> `garra update`) once. Those binaries took the path macOS hands them
+> (`_NSGetExecutablePath`, which may be the link itself) and wrote the new
+> version over `garra`, leaving `garraia` behind; from the first version that
+> resolves the link onward, either name is fine. If it already happened
+> (`garra` is a regular file and `garraia --version` is older), delete `garra`
+> and rerun the installer. Linux and Termux were never affected
+> (`/proc/self/exe` is kernel-resolved), nor is Windows (`garra.cmd` runs
+> `garraia.exe` directly).
+
 The same script (auto-synced) is published through alternative channels —
 the release CDN is the most robust against per-IP rate limits (**HTTP 429**
 is common on cloud pods whose egress IP is shared by many users):
@@ -47,9 +67,12 @@ irm https://garraia.org/install.ps1 | iex
 
 `install.ps1` is the Windows sibling of `install.sh` and behaves the same way:
 it detects the platform, resolves the latest release, downloads the binary,
-verifies it against the release's `SHA256SUMS`, installs it as `garraia.exe`,
-adds it to your **user** PATH, and then chains into `garraia init` and
-`garraia start`. It never needs administrator rights.
+verifies it against the release's `SHA256SUMS`, installs it as `garraia.exe`
+next to a `garra.cmd` shim (`"%~dp0garraia.exe" %*` -- so `garra` works too,
+and keeps working if you move the folder), adds the directory to your **user**
+PATH, and then chains into `garraia init` and `garraia start`. It never needs
+administrator rights. A pre-existing `garra.exe`, or a `garra.cmd` the installer
+did not write, is left untouched with a warning.
 
 Same mirrors as the shell installer:
 
@@ -295,30 +318,59 @@ This wizard will (plan 0126):
   values and only adds missing keys), or cancel. Non-interactive runs
   (e.g. `garraia init` in CI) print the legacy hint and exit 0 without
   touching `config.yml`.
-- Offer a provider mode:
-  - **Local-first** (Ollama on this GPU + cloud fallback) — default
-    when an NVIDIA GPU is detected and `GARRAIA_BOOTSTRAP_LOCAL` is not
-    set to `0`.
-  - **Cloud-first** (cloud provider primary + Ollama fallback).
-  - **Cloud-only** (default for CPU/no-GPU machines).
+- Offer a provider mode (issue #1180 — cloud-first on every machine):
+  - **Cloud-first** (OpenRouter + `z-ai/glm-5.3-flash` primary + Ollama
+    fallback) — **the default**, GPU or not. On this path the "install
+    Ollama?" confirm defaults to **no** and the local model picker lands
+    on **"skip the download"**, so nothing is pulled unless you say so.
+  - **Local-first** (Ollama on this GPU primary + cloud fallback) — the
+    **second option**, offered when an NVIDIA GPU is detected and
+    `GARRAIA_BOOTSTRAP_LOCAL` is not set to `0`. Here the local prompts
+    stay preselected, since local is what you just asked for.
+  - **Cloud-only** (no local stack) — the only mode offered on CPU /
+    no-GPU machines.
 - On the cloud branch, let you pick the provider — **OpenRouter**
-  (recommended default), **OpenAI**, or **Anthropic** — and prompt for
+  (the project default), **OpenAI**, or **Anthropic** — and prompt for
   that provider's API key (each preset names its own env var, default
   model, and key-creation URL).
 - On GPU machines (and only after explicit confirmation), install
-  Ollama via the official upstream script and pull
-  `hf.co/MaziyarPanahi/Qwen3-14B-GGUF:Q4_K_M`. NVIDIA drivers and CUDA
+  Ollama via the official upstream script and pull the local model you
+  pick (`qwen3.8:latest`, ~18 GB, is the preselected row on the
+  local-first path; lighter tags and "skip" are offered). NVIDIA drivers and CUDA
   are **never** installed by the wizard — if `nvidia-smi` works, the
   wizard assumes the GPU runtime is already usable.
 - Offer to enable voice (Chatterbox TTS @ `:7860` + faster-whisper STT
   @ `:9090`). Endpoints are written into `config.yml`; install
   instructions for both servers are printed for copy-paste (auto-install
   of those Python stacks is deferred — see [voice.md](voice.md)).
-- Configure the Telegram channel as before.
+- Offer a **primary messaging channel** (#1430). The step is a single list,
+  and the first row — **no channel for now** — is the default, so pressing
+  Enter without reading still connects nothing:
+  - **Telegram**, via a bot token from `@BotFather` (the prompt that was
+    already here).
+  - **WhatsApp**, your personal number, by QR. The row says on its face that
+    this is the *linked device* path through an **unofficial** client; picking
+    it hands off to the very same `garraia whatsapp link` flow, with its
+    consent screen (default **no**), the QR and the "who may talk to me?"
+    question unchanged — see [whatsapp.md](whatsapp.md).
+  - **Both**, which runs Telegram now and WhatsApp at the end.
+
+  The WhatsApp hand-off runs **after** `config.yml` is written, because the
+  link writes into the same `channels.whatsapp_linked` section. A link that
+  fails (no Node.js, QR not scanned, you changed your mind) does not fail
+  `garraia init`: the rest of the configuration is already saved and the
+  wizard just tells you to run `garraia whatsapp link` later. Non-interactive
+  runs never reach this step at all.
 - Store API keys and bot tokens in the encrypted vault.
-- Pick server-friendly defaults: `gateway.host: 0.0.0.0` when running
-  as root or inside a RunPod pod; `127.0.0.1` otherwise. `PORT` env
-  var (Runpod LB Serverless) is honored.
+- Mint `gateway.api_key` when the machine is server-like (root or a RunPod
+  pod) or `HOST` is not loopback, and print how to expose the gateway
+  (`HOST=0.0.0.0 garraia start`). Since v0.4.5 the wizard no longer writes
+  `gateway.host`/`gateway.port` and removes them on a re-run: those keys are
+  deprecated and never fed the bind, which comes from `--host`/`HOST` and
+  `--port`/`PORT` (#1261, [auth-config.md
+  §5.1](auth-config.md#51-the-gateway-bind-address--what-config-check-sees-vs-what-start-binds)).
+  On a non-loopback bind `garraia start` refuses to boot without a gateway
+  credential (`gateway.api_key` or `GARRAIA_GATEWAY_API_KEY`).
 
 Skip toggles:
 
@@ -332,6 +384,14 @@ Skip toggles:
 - `GARRAIA_SKIP_START=1` — same flow but skips the foreground
   `garraia start` after `garraia init` completes. Both toggles set
   together is equivalent to the pre-PR-B installer behavior.
+
+The installers also skip both steps on their own, printing
+`Non-interactive install ...` and the next-steps hint and exiting 0, when
+nobody can answer the wizard: `install.sh` when `/dev/tty` cannot actually
+be opened (a container, a CI runner, `docker build` — the device node is
+there but has no controlling terminal behind it), `install.ps1` when stdin
+has no console behind it; both whenever `CI` is set to a non-empty value,
+since a CI job that provides a pseudo-terminal still has no one to type.
 
 ### 2. Configure
 
@@ -459,7 +519,8 @@ chmod +x garraia-linux-x86_64.AppImage
 ./garraia-linux-x86_64.AppImage --version
 ```
 
-Both packages install `/usr/bin/garraia` plus `LICENSE`/`README.md` under
+Both packages install `/usr/bin/garraia`, the `/usr/bin/garra` symlink to it
+(the short name the docs use), plus `LICENSE`/`README.md` under
 `/usr/share/doc/garraia/`. aarch64 variants (`garraia-linux-aarch64.deb` /
 `.rpm`) exist whenever the best-effort aarch64 binary was built.
 

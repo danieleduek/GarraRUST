@@ -1,7 +1,7 @@
 //! GAR-583 — MCP server exposing `garra ask` as a stdio tool.
 //!
 //! Implements the `Model Context Protocol` (MCP) `ServerHandler` trait
-//! from `rmcp 2.2` and exposes `garra_ask` — LLM-only — which calls
+//! from `rmcp 3.x` and exposes `garra_ask` — LLM-only — which calls
 //! [`crate::ask::ask_oneshot`] **in-process** (no subprocess spawn, no
 //! shell). Designed for Claude Desktop, Claude Code, and any MCP host
 //! that speaks stdio JSON-RPC.
@@ -17,7 +17,8 @@
 //!     `rmcp`'s JSON-RPC channel; the agent machinery (tool
 //!     constructors, shell execution) lives entirely in
 //!     `mcp_agent.rs`, which the audit tests below do NOT scan.
-//!   - Default `openrouter/free`; `openrouter/auto` only opt-in.
+//!   - Default `z-ai/glm-5.3-flash` (issue #1180); `openrouter/auto` and
+//!     `openrouter/free` only opt-in.
 //!   - Response = full `garra.ask.v1` / `garra.agent.v1` envelope as
 //!     MCP text content.
 //!   - Two audit tests enforce the invariants at compile time by
@@ -29,8 +30,8 @@ use anyhow::Result;
 use garraia_config::AppConfig;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
@@ -53,12 +54,22 @@ const ARG_TIMEOUT_SECS_DEFAULT: u64 = 60;
 /// schema's `default` is advisory, so MCP hosts do not synthesize it before
 /// dispatching `tools/call`. The handler applies it explicitly to honor the
 /// advertised contract.
-const PROVIDER_DEFAULT: &str = "openrouter";
+const PROVIDER_DEFAULT: &str = crate::defaults::DEFAULT_CLOUD_PROVIDER;
 
-/// GAR-587 — Default model applied when the MCP caller omits `model`.
-/// Stays at `openrouter/free`; `openrouter/auto` remains opt-in (must be
-/// passed explicitly by the caller).
-const MODEL_DEFAULT: &str = "openrouter/free";
+/// GAR-587 / issue #1180 — Default model applied when the MCP caller omits
+/// `model`. Now the project-wide default from [`crate::defaults`].
+///
+/// **The cost guardrail is intentional, not incidental.** This constant was
+/// `openrouter/free` for one reason: an MCP host can call `garra_ask` in a
+/// loop, unattended, and the default had to be a model that cannot run up a
+/// bill. `z-ai/glm-5.3-flash` is chosen to keep exactly that property — a
+/// flash-tier model cheap enough to be the unattended default — while being
+/// good enough for real work, which `openrouter/free` was not. Whoever
+/// changes this line is changing a spend guardrail: anything pricier stays
+/// an explicit caller choice, and `openrouter/auto` in particular remains
+/// opt-in. Operators who need a hard ceiling still have
+/// `GARRAIA_MCP_MODEL_ALLOWLIST`.
+const MODEL_DEFAULT: &str = crate::defaults::DEFAULT_CLOUD_MODEL;
 
 /// Providers accepted at runtime. Mirrors the `enum` advertised in the
 /// `garra_ask` JSON schema — which MCP hosts treat as advisory, so it must
@@ -251,8 +262,22 @@ fn validate_policy_with_cap(
         ));
     }
     if !policy.model_allowlist.is_empty() && !policy.model_allowlist.iter().any(|m| m == model) {
+        // #1180: the default is applied BEFORE this check (fail-closed, on
+        // purpose), so an operator who pinned the retired default —
+        // `GARRAIA_MCP_MODEL_ALLOWLIST=openrouter/free`, as the Hermes docs
+        // used to say — sees every model-less call land here. When the
+        // rejected model is the server default, say so and name the fix;
+        // an explicit caller choice gets the plain message.
+        let hint = if model == MODEL_DEFAULT {
+            format!(
+                " — this is the server default (issue #1180): add {MODEL_DEFAULT} to \
+                 GARRAIA_MCP_MODEL_ALLOWLIST or pass an allowed model explicitly"
+            )
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "model '{model}' blocked by GARRAIA_MCP_MODEL_ALLOWLIST"
+            "model '{model}' blocked by GARRAIA_MCP_MODEL_ALLOWLIST{hint}"
         ));
     }
     if let Some(cap) = cap
@@ -290,8 +315,9 @@ pub(crate) struct GarraAskArgs {
 /// explicitly to honor the contract advertised by [`garra_ask_tool`].
 ///
 /// Pure function — no I/O, no allocation when both fields are `Some`.
-/// `openrouter/auto` is **only** reachable when the caller passes it
-/// explicitly; an absent `model` never resolves to `auto`.
+/// `openrouter/auto` (and `openrouter/free`) are **only** reachable when the
+/// caller passes them explicitly; an absent `model` never resolves to either
+/// — it resolves to [`MODEL_DEFAULT`].
 pub(crate) fn resolve_overrides(
     provider: Option<String>,
     model: Option<String>,
@@ -349,13 +375,13 @@ pub(crate) fn garra_ask_tool() -> Tool {
             "provider": {
                 "type": "string",
                 "enum": ["ollama", "anthropic", "openai", "openrouter"],
-                "default": "openrouter",
-                "description": "LLM provider. Default 'openrouter'."
+                "default": PROVIDER_DEFAULT,
+                "description": format!("LLM provider. Default '{PROVIDER_DEFAULT}'.")
             },
             "model": {
                 "type": "string",
-                "default": "openrouter/free",
-                "description": "Model name. Default 'openrouter/free' (cheap, suitable for most tasks). Pass 'openrouter/auto' explicitly for complex tasks — never automatic."
+                "default": MODEL_DEFAULT,
+                "description": format!("Model name. Default '{MODEL_DEFAULT}' (cheap flash-tier model, suitable for most tasks — the default is a spend guardrail). Pass a pricier model such as 'openrouter/auto' explicitly for complex tasks — never automatic.")
             },
             "timeout_secs": {
                 "type": "integer",
@@ -433,7 +459,7 @@ impl GarraToolHandler {
     async fn call_agent_tool(
         &self,
         request: CallToolRequestParams,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let raw = request.arguments.unwrap_or_default();
         let args: crate::mcp_agent::GarraAgentArgs = serde_json::from_value(JsonValue::Object(raw))
             .map_err(|e| McpError::invalid_params(format!("invalid arguments: {e}"), None))?;
@@ -449,9 +475,9 @@ impl GarraToolHandler {
                 });
                 let content = vec![ContentBlock::text(text)];
                 if is_ok {
-                    Ok(CallToolResult::success(content))
+                    Ok(CallToolResult::success(content).into())
                 } else {
-                    Ok(CallToolResult::error(content))
+                    Ok(CallToolResult::error(content).into())
                 }
             }
             Err(e) => Err(McpError::invalid_params(e, None)),
@@ -481,18 +507,22 @@ impl ServerHandler for GarraToolHandler {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult {
-            tools: advertised_tools(&self.policy),
-            next_cursor: None,
-            meta: None,
-        })
+        // rmcp 3.x: `ListToolsResult` ganhou os campos SEP-2322 (`result_type`) e
+        // SEP-2549 (`ttl_ms`/`cache_scope`); o construtor `with_all_items`
+        // preenche o padrão da spec (`result_type = COMPLETE`, resto `None`).
+        Ok(ListToolsResult::with_all_items(advertised_tools(
+            &self.policy,
+        )))
     }
 
+    // rmcp 3.x: o retorno passou a ser o enum MRTR-aware `CallToolResponse`;
+    // este handler só produz respostas finais (`Complete`, via
+    // `From<CallToolResult>` — nunca `InputRequired`/`Task`).
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         // `garra_agent` dispatches only behind the operator opt-in; with
         // the flag off it falls through to the unknown-tool branch so the
         // rejection surface is byte-identical to the pre-agent server.
@@ -559,9 +589,9 @@ impl ServerHandler for GarraToolHandler {
         // success`/`error` recebem como `Vec<ContentBlock>`.
         let content = vec![ContentBlock::text(text)];
         if outcome.is_ok() {
-            Ok(CallToolResult::success(content))
+            Ok(CallToolResult::success(content).into())
         } else {
-            Ok(CallToolResult::error(content))
+            Ok(CallToolResult::error(content).into())
         }
     }
 }
@@ -590,8 +620,24 @@ pub async fn run_mcp_server(config: AppConfig) -> Result<()> {
     if policy.tools_enabled() {
         tracing::info!(
             "garra_agent tool ENABLED (opt-in GARRAIA_MCP_ENABLE_TOOLS): full-agent surface \
-             with shell/file/git/web tools; bash is full-auto with only the safety_gate denylist"
+             with file/git/web tools; bash only inside a docker/podman sandbox or on the host \
+             of an explicit execution.profile = isolated-pod (#1272)"
         );
+        // #1272: a mesma decisao que `mcp_agent::build_tools` toma por chamada,
+        // anunciada UMA vez aqui — com o `warn!` e o passo quando o bash fica
+        // de fora.
+        garraia_gateway::bootstrap::anuncia_exposicao_do_bash(
+            "mcp-server",
+            &garraia_gateway::bootstrap::exposicao_do_bash(
+                config.execution.perfil(),
+                &garraia_gateway::bootstrap::sandbox_policy_from(&config.agent.sandbox),
+            ),
+        );
+        // #1225 S2: uma vez por processo, AQUI e nao em `mcp_agent::build_tools`
+        // — aquele roda a cada chamada de `garra_agent`, e `sandbox_policy_from`
+        // junto com ele. Gated na tool: sem `garra_agent` nenhuma tool spawna
+        // neste processo e o aviso seria ruido sobre nada.
+        garraia_gateway::bootstrap::avisa_cobertura_do_sandbox(&config.agent.sandbox);
     }
     let handler = GarraToolHandler::with_policy(Arc::new(config), policy);
     let (stdin, stdout) = rmcp::transport::io::stdio();
@@ -610,6 +656,47 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    /// #1225 S2: o aviso de cobertura do sandbox e por PROCESSO e sai na
+    /// subida do `garra mcp-server` (em `run_mcp_server`, sob `tools_enabled`).
+    /// Ele nao pode morar em `mcp_agent`: `build_tools` roda a cada chamada da
+    /// tool `garra_agent`, e um `warn!` la sairia por chamada em stderr e no
+    /// `garraia.log`. Varre o fonte porque `garraia-cli` nao tem `tracing-test`
+    /// e um dev-dep novo por uma linha nao se paga.
+    #[test]
+    fn aviso_de_cobertura_do_sandbox_sai_na_subida_e_nunca_por_chamada() {
+        let nome = "avisa_cobertura_do_sandbox";
+        let mcp_agent = include_str!("mcp_agent.rs");
+        assert!(
+            !mcp_agent.contains(nome),
+            "mcp_agent.rs roda por chamada de `garra_agent`; o aviso por processo mora em \
+             run_mcp_server"
+        );
+        let chamada = format!("{nome}(&config.agent.sandbox)");
+        let chamadas = include_str!("mcp_server.rs")
+            .lines()
+            .filter(|l| l.contains(&chamada))
+            .count();
+        assert_eq!(
+            chamadas, 1,
+            "run_mcp_server chama {nome} exatamente uma vez"
+        );
+    }
+
+    /// #1272: o anuncio da exposicao do bash e por processo, como o aviso de
+    /// cobertura, e o log de subida nao promete mais bash irrestrito.
+    #[test]
+    fn anuncio_do_bash_sai_na_subida_e_nunca_por_chamada() {
+        let nome = "anuncia_exposicao_do_bash";
+        assert!(!include_str!("mcp_agent.rs").contains(nome));
+        let fonte = include_str!("mcp_server.rs");
+        let producao = fonte.split("#[cfg(test)]").next().unwrap_or(fonte);
+        assert_eq!(producao.matches(&format!("{nome}(")).count(), 1);
+        assert!(
+            !producao.contains(concat!("bash is full", "-auto")),
+            "o log de subida ainda promete bash irrestrito"
+        );
+    }
 
     // ─── Tool descriptor ──────────────────────────────────────────────
 
@@ -655,8 +742,10 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("message")));
     }
 
+    /// Issue #1180 — the advertised schema default is the project-wide
+    /// default model, not `openrouter/free` (and never `openrouter/auto`).
     #[test]
-    fn tool_descriptor_default_model_is_openrouter_free() {
+    fn tool_descriptor_default_model_is_the_project_default() {
         let t = garra_ask_tool();
         let schema = (*t.input_schema).clone();
         let model_default = schema
@@ -664,7 +753,8 @@ mod tests {
             .and_then(|p| p.get("model"))
             .and_then(|m| m.get("default"))
             .and_then(|d| d.as_str());
-        assert_eq!(model_default, Some("openrouter/free"));
+        assert_eq!(model_default, Some("z-ai/glm-5.3-flash"));
+        assert_eq!(model_default, Some(crate::defaults::DEFAULT_CLOUD_MODEL));
     }
 
     /// GAR-587 — schema-side parity with `tool_descriptor_default_model_…`.
@@ -827,7 +917,9 @@ mod tests {
     fn resolve_overrides_applies_defaults_when_args_are_none() {
         let (provider, model) = resolve_overrides(None, None);
         assert_eq!(provider, "openrouter");
-        assert_eq!(model, "openrouter/free");
+        // Issue #1180 — was `openrouter/free`; the guardrail intent moved
+        // to `z-ai/glm-5.3-flash`, it was not dropped.
+        assert_eq!(model, "z-ai/glm-5.3-flash");
     }
 
     /// GAR-587 §5 case #2 — caller-explicit `provider`/`model` MUST
@@ -843,9 +935,11 @@ mod tests {
         assert_eq!(model, "claude-opus-4-7");
     }
 
-    /// GAR-587 §5 case #3 — `openrouter/auto` MUST remain opt-in. Two
-    /// branches: (a) explicit `auto` survives; (b) `None` model never
-    /// promotes itself to `auto` — the default stays `openrouter/free`.
+    /// GAR-587 §5 case #3, amended by issue #1180 — `openrouter/auto` MUST
+    /// remain opt-in, and now `openrouter/free` must be opt-in too. Three
+    /// branches: (a) explicit `auto` survives; (b) an absent model never
+    /// promotes itself to `auto`; (c) it never falls back to `free` either —
+    /// it resolves to the one project default.
     #[test]
     fn resolve_overrides_passes_openrouter_auto_only_when_explicit() {
         // (a) Explicit `auto` is preserved.
@@ -853,10 +947,21 @@ mod tests {
         assert_eq!(provider, "openrouter");
         assert_eq!(model, "openrouter/auto");
 
-        // (b) Absent model never becomes `auto`.
+        // (b) + (c) Absent model becomes neither `auto` nor `free`.
         let (_, model_default) = resolve_overrides(None, None);
         assert_ne!(model_default, "openrouter/auto");
-        assert_eq!(model_default, "openrouter/free");
+        assert_ne!(model_default, "openrouter/free");
+        assert_eq!(model_default, crate::defaults::DEFAULT_CLOUD_MODEL);
+    }
+
+    /// Issue #1180 — `openrouter/free` keeps working as an explicit caller
+    /// choice. Demoting it from "the default" must not make it unreachable;
+    /// operators who pinned it via `GARRAIA_MCP_MODEL_ALLOWLIST` still work.
+    #[test]
+    fn resolve_overrides_still_accepts_openrouter_free_when_explicit() {
+        let (provider, model) = resolve_overrides(None, Some("openrouter/free".to_string()));
+        assert_eq!(provider, "openrouter");
+        assert_eq!(model, "openrouter/free");
     }
 
     /// GAR-587 — mixed-fill case (provider explicit, model omitted) and
@@ -866,7 +971,7 @@ mod tests {
     fn resolve_overrides_handles_partial_overrides() {
         let (provider, model) = resolve_overrides(Some("ollama".to_string()), None);
         assert_eq!(provider, "ollama");
-        assert_eq!(model, "openrouter/free");
+        assert_eq!(model, crate::defaults::DEFAULT_CLOUD_MODEL);
 
         let (provider, model) = resolve_overrides(None, Some("gpt-4o-mini".to_string()));
         assert_eq!(provider, "openrouter");
@@ -936,7 +1041,9 @@ mod tests {
         assert!(caps.completions.is_none(), "completions must stay off");
         assert!(caps.prompts.is_none(), "prompts must stay off");
         assert!(caps.resources.is_none(), "resources must stay off");
-        assert!(caps.tasks.is_none(), "tasks must stay off");
+        // rmcp 3.x: `tasks` (SEP-2663) saiu do struct `ServerCapabilities` e
+        // virou uma extensão (SEP-1724) em `extensions` — o assert acima de
+        // `extensions.is_none()` já garante "tasks must stay off".
     }
 
     /// GAR-583 §4 invariant #2 — production code MUST NOT register
@@ -999,6 +1106,35 @@ mod tests {
         let err = validate_policy(&cfg, &policy, "openrouter", "openrouter/auto", 60)
             .expect_err("auto must be blocked when allowlist is set");
         assert!(err.contains("GARRAIA_MCP_MODEL_ALLOWLIST"), "{err}");
+    }
+
+    /// #1180 — the default is applied before the allowlist, so whoever pinned
+    /// the retired default (`GARRAIA_MCP_MODEL_ALLOWLIST=openrouter/free`)
+    /// sees every model-less call rejected here. The rejection must stay
+    /// (fail-closed), and the message must say the model is the server
+    /// default and how to fix it. An explicit non-default model gets the
+    /// plain message — no hint about a default the caller did not rely on.
+    #[test]
+    fn allowlist_rejection_of_the_server_default_names_the_fix() {
+        let policy = ServerPolicy::from_values(Some("openrouter/free"), None, None);
+        let cfg = AppConfig::default();
+
+        let err = validate_policy(&cfg, &policy, "openrouter", MODEL_DEFAULT, 60)
+            .expect_err("the default outside the allowlist must still be rejected");
+        assert!(err.contains("GARRAIA_MCP_MODEL_ALLOWLIST"), "{err}");
+        assert!(err.contains("server default"), "{err}");
+        assert!(err.contains("#1180"), "{err}");
+        assert!(err.contains(MODEL_DEFAULT), "{err}");
+
+        let err = validate_policy(&cfg, &policy, "openrouter", "openrouter/auto", 60)
+            .expect_err("an explicit model outside the allowlist is rejected too");
+        assert!(err.contains("GARRAIA_MCP_MODEL_ALLOWLIST"), "{err}");
+        assert!(!err.contains("server default"), "{err}");
+
+        // Same body serves `garra_agent`; the hint follows it there.
+        let err = validate_agent_policy(&cfg, &policy, "openrouter", MODEL_DEFAULT, 300)
+            .expect_err("agent tool shares the allowlist");
+        assert!(err.contains("server default"), "{err}");
     }
 
     #[test]

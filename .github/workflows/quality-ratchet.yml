@@ -14,6 +14,13 @@ name: Quality Ratchet
 #     marks coverage as `not_collected_this_run`.
 #   - Fork PRs: comment posting is skipped (head.repo.full_name guard, same
 #     pattern as the `coverage` job in ci.yml).
+#   - Per-PR signal (#1254): on `pull_request` the metrics of the merge-base
+#     (`pull_request.base.sha`) are collected in a separate worktree and fed to
+#     `compare.py --base`, so the comment says what THIS PR changed instead of
+#     repeating the same diff against a stale `.quality/baseline.json`. On
+#     `push` to main there is no base and the report is the historical one.
+#     `--base` never changes the exit code. Event inputs reach the shell via
+#     `env:`, never interpolated into `run:`.
 
 on:
   pull_request:
@@ -45,6 +52,14 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.x"
+
+      # #1228 (slice E): the comment upsert used below has its own tests.
+      # Separate pytest invocation: every scripts/*/tests suite is a package
+      # named `tests`, and collecting two of them in one run breaks.
+      - name: Tests of scripts/ci (comment upsert)
+        run: |
+          python3 -m pip install --quiet pytest
+          python3 -m pytest scripts/ci/tests -q
 
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends jq
@@ -98,15 +113,45 @@ jobs:
           jq '.' current-metrics.json
           echo "::endgroup::"
 
+      - name: "Collect merge-base metrics (pull_request only — #1254)"
+        # The checkout is the PR merge commit, so current-metrics.json already
+        # includes main. Measuring `base.sha` (the tip of the target branch at
+        # event time) in its own worktree isolates what this PR adds. The
+        # collector honours GARRAIA_REPO_ROOT (`cd` before any `git`/`cargo`),
+        # while the parsers still come from the PR's own scripts/quality/, so
+        # both snapshots are produced by the same tooling. fetch-depth is 1,
+        # hence the explicit fetch of the SHA before the worktree is created.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "$BASE_SHA"
+          git worktree add --detach /tmp/base "$BASE_SHA"
+          GARRAIA_REPO_ROOT=/tmp/base bash scripts/quality/collect-metrics.sh > base-metrics.json
+          echo "::group::base-metrics.json"
+          jq '.' base-metrics.json
+          echo "::endgroup::"
+
       - name: Compare against baseline (report-only — always exit 0)
         # PR-1: --mode report-only. The flag is the SINGLE source of truth for
         # "report-only vs enforce" — we explicitly do NOT use `continue-on-error`.
+        # `--base` only adds the per-PR delta column and verdict (#1254); it is
+        # passed on pull_request only and never affects the exit code.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          set -euo pipefail
+          base_args=()
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base_args=(--base base-metrics.json)
+          fi
           python3 scripts/quality/compare.py \
             --mode report-only \
             .quality/baseline.json \
             current-metrics.json \
-            --report quality-report.md
+            --report quality-report.md \
+            ${base_args[@]+"${base_args[@]}"}
 
       - name: Upload quality-report artifact
         uses: actions/upload-artifact@v7
@@ -115,6 +160,7 @@ jobs:
           path: |
             quality-report.md
             current-metrics.json
+            base-metrics.json
           retention-days: 90
           if-no-files-found: error
 
@@ -126,11 +172,19 @@ jobs:
       - name: Post quality-report.md as PR comment
         # Skip on push events AND on fork PRs (same fork-safe guard as the
         # coverage job in ci.yml — Michel ajuste #3).
+        #
+        # #1228 (slice E): edits ONE comment in place on every push instead of
+        # adding a new one. `upsert_pr_comment.py` finds it by the marker
+        # `<!-- quality-ratchet-comment -->` (written by compare.py) AND by the
+        # author `github-actions[bot]`, so a human comment quoting the marker
+        # is never overwritten. Event data reaches the shell via `env:`.
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          # The marker `<!-- quality-ratchet-comment -->` is already written
-          # inside quality-report.md by compare.py. We pass the file as-is.
-          gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file quality-report.md
+          set -euo pipefail
+          python3 scripts/ci/upsert_pr_comment.py \
+            --repo "$REPO" --pr "$PR_NUMBER" \
+            --marker '<!-- quality-ratchet-comment -->' --body-file quality-report.md

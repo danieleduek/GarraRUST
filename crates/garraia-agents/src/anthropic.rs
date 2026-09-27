@@ -8,7 +8,7 @@ use tracing::{debug, info, instrument};
 
 use crate::providers::{
     ChatMessage, ChatRole, ContentBlock, LlmProvider, LlmRequest, LlmResponse, MessagePart,
-    StreamEvent, Usage,
+    StreamEvent, Usage, erro_de_envio,
 };
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
@@ -31,8 +31,13 @@ impl AnthropicProvider {
     ) -> Self {
         // connect_timeout only: responses stream for minutes, but a dead
         // host must fail fast instead of hanging the caller indefinitely.
+        // Redirects off by default (issue #1248, rule 14): an LLM endpoint
+        // never legitimately 302s to another host, and following one would
+        // bypass the SSRF gate. A pinned client from `with_client` already
+        // has this; the default covers providers built from config at boot.
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -113,7 +118,9 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Agent(format!("falha na requisição à Anthropic: {e}")))?;
+            // #1249: rede caida e classe propria (`Error::Transport`), nao
+            // mais texto que o runtime tenta reconhecer por casamento.
+            .map_err(|e| erro_de_envio("falha na requisição à Anthropic", &e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -152,7 +159,8 @@ impl LlmProvider for AnthropicProvider {
             .json(&body_value)
             .send()
             .await
-            .map_err(|e| Error::Agent(format!("falha na requisição streaming à Anthropic: {e}")))?;
+            // #1249: idem no braco de streaming.
+            .map_err(|e| erro_de_envio("falha na requisição streaming à Anthropic", &e))?;
 
         if !response.status().is_success() {
             let status = response.status();

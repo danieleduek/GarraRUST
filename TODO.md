@@ -5,12 +5,364 @@ Status operacional do backlog do GarraIA/GarraRUST. Este arquivo complementa
 foi concluído, o que ficou parcial ou adiado, decisões tomadas e próximos passos
 curtos para a próxima sessão autônoma.
 
-**Atualizado:** 2026-09-09 (America/New_York)
+**Atualizado:** 2026-09-26 (America/New_York)
 
 > O Linear foi descontinuado em 2026-08-18; o planejamento vive no tracker
 > interno. Menções a "Done in Linear", "In Review" ou "issues Linear" nas seções
 > históricas abaixo são registro da época, não estado atual. IDs `GAR-xxx`
 > permanecem como identificadores históricos.
+
+## Concluído em 2026-09-26 — trem v0.4.6: acesso ao WhatsApp de ponta a ponta, honestidade do runtime e dogfood
+
+Ciclo de 26 issues (P0/P1 quase todo) fechado num único trem de merge (PR #1510,
+branch `train/v046-f`), no padrão 2026-09-20: PRs carregadas por merge commits
+para que o GitHub marque cada uma como merged com um único ciclo de CI.
+
+- **Acesso ao WhatsApp de ponta a ponta.** Access Policy v2 com modos
+  explícitos (#1388), acesso default de desconhecidos pela CLI (#1399), página
+  WhatsApp Access com preview antes de confirmar sobre o motor único (#1402),
+  Test WhatsApp no console com o motor do `garraia doctor whatsapp` (#1420),
+  telefone validado igual na API admin e na CLI (#1403) — PRs #1505/#1511.
+  Matriz por principal ganha web e memória (#1411, PR #1507); audit dos
+  comandos legados de permissão e o wizard oferecendo política logo após o
+  pareamento (#1414/#1429, PR #1506); grupos ligados/desligados a quente valem
+  já e políticas independentes por grupo com prova de concorrência
+  (#1412/#1423, PR #1512); `access.groups.enabled` declarado vence o
+  `reply_in_groups` legado (#1501, PR #1509).
+- **Honestidade do runtime.** Registro de capacidades como fonte única para
+  `garra_status`, `/api/diagnostics` e o modelo (#1381 via PR #1508,
+  exercitado pela #1505); o registro diz quando falta contexto e relata
+  raiz/repositório (#1416, PR #1508); system prompt impede inferir ausência a
+  partir de invisibilidade e `garra_status` diz a verdade sobre raízes
+  (#1387); `unify workspace policy` — um só jail por sessão governa file tools
+  nativas e MCP filesystem (#1383).
+- **Confiabilidade.** Circuit breaker por sessão/ferramenta no único ponto de
+  despacho — falha determinística pausa até o fim do turno, timeout abre
+  cooldown com backoff exponencial 15s→120s, erro genérico só após três
+  iguais (#1417); registro local de confiabilidade de tools/MCP/canais, nada
+  sai da máquina (#1438, fatias do trem); ledger CodeQL renumerado por
+  conteúdo (#1504, PR #1504).
+- **Dogfood como gate.** `docs/releasing.md` §1.5: matriz D1–D10 obrigatória
+  antes de todo tag (#1439); automação Linux de D1/D9
+  (`scripts/dogfood/linux-clean-install.sh`, #1426); fatia de dados da
+  retenção de memória/ledger (`garraia-config::retention` + `garraia-db::
+  retention`, #1436); cofre no link — plano da chave sem efeito colateral e
+  aperto dos modos do diretório da conta (#1431); teste Playwright do
+  WhatsApp Doctor semeando admin serial.
+- **Página dedicada em vez de schema genérico.** #1432 resolvida pela página
+  WhatsApp Access (o mecanismo genérico de schema no Settings Registry volta
+  quando houver segunda superfície que o precise).
+
+### Issues fechadas nesta rodada
+
+#1381, #1383, #1387, #1388, #1399, #1402, #1403, #1411, #1412, #1414, #1416,
+#1417, #1420, #1423, #1426, #1428, #1429, #1431, #1432, #1436, #1438, #1439.
+
+### Ficam abertas — decisão de escopo para o ciclo seguinte
+
+| Issue | Estado |
+| --- | --- |
+| #1433 (página global Agents & Permissions) | Padrão provado pela página WhatsApp Access; generalização depende de decisão de escopo |
+| #1434 (presets de permissão) | Base pronta: modos + Access Policy v2 (#1388) |
+| #1435 (import/export de políticas) | Política v2 já vive em arquivo próprio separado do cofre |
+
+### Fatias adiadas dentro de issues fechadas (backlog nomeado)
+
+| De | O que falta |
+| --- | --- |
+| #1431 | UX do wizard consumindo o plano da chave (`SessionKey::plan`) |
+| #1436 | Página + `PATCH /admin/api/retention` do console (a fatia de dados já delega para os mesmos achados) |
+| #1438 | Endpoint autenticado que expõe o snapshot do registro |
+| #1428 | Cenários comportamentais com modelo real — linha D10 do gate, manual por design |
+
+## Concluído em 2026-09-22 — release v0.4.5: bash fail-closed, aprovação nos canais, onboarding do WhatsApp
+
+- **`bash` sem humano no laço** (#1272 via #1352): em `standard` o `garraia mcp-server` e o gateway só registram `bash` e `run_tests` dentro de sandbox `docker`/`podman` válido; `isolated-pod` explícito roda no host do pod. Container com `--cap-drop ALL`, `--pids-limit 512`, `--user`/`--userns=keep-id`; git endurecido em `git_diff`/`code_review`; `file_write` recusa `.git`. Amendment 2026-09-21 do ADR 0024.
+- **Sandbox nas tools de repositório** (#1225 via #1353): `run_tests`, `git_diff`, `code_review`, `repo_search` por argv (`wrap_argv` + `sandbox_spawn`); S5 (ssh + container remoto) won't-do, com motivo no threat model §5.13.
+- **Boot** (#1261 via #1354, #1365; #1247 via #1355): bind exposto sem credencial recusa com exit 78; env `GARRAIA_GATEWAY_API_KEY`; opt-out só no arquivo; `gateway.host`/`gateway.port` deprecados; `config check` em todo boot, recusa só pela allowlist `BLOQUEIA_O_BOOT` (TLS pela metade), escotilha `GARRAIA_ALLOW_INVALID_CONFIG=1`.
+- **Aprovação GAR-187** (#1343 via #1348 e #1366; #1340 via #1342): registro de pedidos pendentes por `(canal, sessão)` com remetente derivado pelo servidor, 5 min, uma vez; pedido sem marcador (#1373); telefone mascarado no log.
+- **WhatsApp pessoal** (#1345 via #1356; #1373; #1368): `link` pergunta quem pode falar, `garraia whatsapp allow`, releitura a quente; ponte regravada no boot com `npm ci` só quando a árvore não é provada; `last4` sem sufixo de aparelho; erro de bridge morto com a cauda do stderr.
+- **MCP `filesystem`** (#1346 via #1357): versão fixa, recuperação única do cache `_npx`, `/api/mcp/health` com servidores que falharam.
+- **`garra_status`** (#1347 via #1351 e #1367): modos com whitelist, canais do `/api/channels`, `withheld` em turno restrito; streaming aplica prompt e `max_tokens` do modo.
+- **Runs** (#1227 via #1326 e #1361): `garraia runs list`, `runs.retention_days`, `GET /api/runs`; s7 (`runs resume`) won't-do, motivo em `docs/configuration.md`.
+- **Limpeza** (#1226 via #1350, #1358): `garraia-tools` e `garraia-runtime` removidas (22 crates); `tool_program` no snapshot.
+- **Runtime e CLI**: aviso de loop antes de abortar (#1295 via #1349); `max-power` sem runtime aninhado, offline de verdade, ajuda e erro de corpo (#1228 via #1362, #1364); smoke de instalação limpa da v0.4.4: TTY do `install.sh` (#1369), log do daemon em append, SIGPIPE e cauda do `/admin/api/logs` (#1371), sessão REST após restart (#1372), chave do provider ligada à própria entrada `llm:` (#1370).
+- **Infra**: gate `Changelog presence` e comentários de PR editados no lugar (#1362); Swagger UI vendored (#1359); `freeze-baseline.py --adopt-current-file-metrics` (#1360) e o re-baseline auditado (#1254); upload do AppImage aarch64 conferido no CI (#1344); `skills/assemble-team.md`: um target por worktree (#1374).
+
+### Limites documentados, sem issue de acompanhamento
+
+- `temperature` do modo não chega ao provider (`docs/src/modes.md`).
+- Sessão REST encerrada antes da 0.4.5 não tem `api_logout` e volta a ser lida (fragmento da #1372).
+- `bash` no sandbox ainda é linha de shell (`wrap_command` + `sh_quote`); nenhum caminho tem `--read-only` nem limite de memória (threat model, prioridade 9).
+- O gateway (`garraia_config::provider_keys`) resolve config > env sem olhar a `base_url`; a regra da #1370 vale só na CLI.
+- `garraia.log` sem rotação; `/admin/api/logs` lê só a cauda.
+
+## Concluído em 2026-09-21 — release v0.4.4: WhatsApp em instalação nova e perfis de execução
+
+- **WhatsApp pessoal numa instalação nova**: a recusa `FerramentaMcpRegistrada`
+  saiu (#1327 via #1330); instaladores criam o alias `garra` e o `update.rs`
+  resolve o symlink no macOS (#1328 via #1331); toda instrução do fluxo nomeia o
+  executável que está rodando (`garraia-common::executavel`).
+- **Perfis de execução** (#1329 via #1338, [ADR 0024](docs/adr/0024-perfis-de-execucao-isolated-pod.md)):
+  `standard` (default) e `isolated-pod` (explícito por `execution.profile` ou
+  `GARRAIA_EXECUTION_PROFILE`, nunca por detecção de container). Dono declarado
+  do WhatsApp (`owners`) ganha o piso `code` só em 1:1; MCP `filesystem` sem
+  `$HOME`. Auditoria `security-auditor` APPROVE (6 minors corrigidos) + revisão
+  adversarial em quatro lentes (15 achados confirmados, todos corrigidos).
+- **`tool_program`** (#1226 S-B): entrou por #1336 (merge da automação, sem
+  revisão); revisão pós-merge em três lentes achou 11 pontos, todos fechados em
+  #1337, que também fechou o **#1339** (aprovação GAR-187 amarrada ao pedido
+  que pausou o turno: saída comum de tool, recusa do gate e resposta do provider
+  não carregam mais marcador aprovável). Cada correção provada por mutação.
+- **`config check` e o bind** (#1261): #1325 (merge da automação) caía no
+  valor do arquivo; #1335 corrigiu para o default do clap. A #1261 foi
+  **reaberta**: fechou por `Closes` sem registrar as decisões R5 do dono.
+- **CI**: Security Gate com orçamento no step e cache só do registry (#1332 via
+  #1333); Dependabot patch-and-minor (#1334).
+
+### Fica aberto, com bloqueio nomeado
+
+| Item | Bloqueio |
+| --- | --- |
+| #1261 | R5 do dono: opção 2 (recusar bind exposto sem credencial) e destino das chaves `gateway.host`/`gateway.port` do arquivo. Consequência registrada: configs do wizard com `host: 0.0.0.0` passam a sair 2 no `config check --strict`. |
+| #1326 (`garra runs list`, #1227 s4) | Adiada: sanitizar controle de terminal em `goal`/`id`, redigir `error_snippet`, alerta CodeQL #175, e ack do dono na #1227 sobre o gate de design. |
+| #1226 | S-C: docs de `tool_program` entregues em #1337; falta a decisão explícita de não pôr `tool_program` no `allowed` de `search`/`architect`. S-D e resto da S-E seguem. |
+| #1340 | Dimensão temporal da aprovação (pré-existente): um "ok" tardio ainda aprova um pedido já recusado dentro da janela de 6 mensagens. Muda a semântica de retomada da GAR-187 em todos os canais — fatia própria. |
+| #1225, #1227, #1228, #1247, #1254, #1272, #1295 | Inalterados desde a v0.4.3 (ver seção abaixo). |
+
+### Processo
+
+- A automação (sessões na conta do dono) mergeou #1324, #1325 e #1336 durante
+  o ciclo, sem revisão; #1325 fechou uma issue com decisão R5 reservada e #1336
+  era R4 com `security-auditor` obrigatório. Regra reforçada nos comentários:
+  issue com "decisão do dono" recebe `Refs`, nunca `Closes`.
+- Disco da máquina local encheu duas vezes com caches de build de agentes
+  (ENOSPC e `Bus error` no linker). Limpeza de `target*` do scratchpad e dos
+  `shared-target-*` de revisões encerradas entra no fim de cada onda.
+
+## Concluído em 2026-09-21 — release v0.4.3: WhatsApp pessoal, faixa de segurança, dois trens de merge
+
+Estado de partida (2026-09-20, 22:25): 14 issues, 9 PRs (1 draft), 2 alertas
+CodeQL (#173 falso-positivo com entrada no ledger, #174 real), 0 Dependabot,
+0 secret scanning, `main` verde em v0.4.2 + 81 commits.
+
+- **PR #1314 fechado como superseded**: os 15 arquivos de `bridge/whatsapp/`
+  já estavam em `main` (#1256/#1265) e `main` estava à frente do branch.
+- **Trem 1 (#1317)**: as 8 PRs abertas (#1305 #1307 #1309 #1311 #1312 #1313
+  #1315 #1316) revisadas uma a uma e mergeadas com merge commit num único
+  branch — cada SHA de cabeça fica alcançável de `main`, e o GitHub marca a PR
+  como merged. Conflito único (#1313 × #1305 em `chat.rs`) resolvido mantendo
+  os dois blocos; alerta CodeQL 115 reancorado pelo conteúdo (1703). O #1309
+  entrou em `main` por **auto-merge** (squash) enquanto o trem estava na fila:
+  `origin/main` foi mergeado nos trens e o auto-merge desligado nas outras 7.
+- **Trem 2 (#1318)**: 10 correções implementadas em worktrees isoladas e
+  revisadas por três lentes independentes (correção, segurança/fail-closed,
+  testes + regras), com 4 rodadas de fix antes de entrar — #1295 item 2
+  (diagnóstico do loop via `summarize_tool_input`, nunca o JSON cru), #1297
+  (rustyline; histórico em disco só com `--persist`/`--resume`), #1276 item 2
+  (redação de base64 percent-encoded e `\/`), #1254 (delta vs merge-base;
+  `.quality/baseline.json` intocado), #1227 s2 (lease do scheduler) e s3
+  (`DbRunLedger` sobre o Mutex tokio), #1225 S2 (cobertura honesta do
+  sandbox) / S3 (`ssh` fail-closed) / S4 (smoke com Docker real no CI),
+  #1226 S-E (`execute_program` deprecated). Validação local: 87 suítes,
+  2791 testes, 0 falhas; Docker 5/5.
+- **Docs**: wiki `Novidades-v0.4.3` + `Whats-New-v0.4.3`; README/README.pt-BR
+  (24 crates, WhatsApp pessoal entregue), SECURITY.md (32 tabelas FORCE RLS),
+  Dockerfile (label de versão morto removido), `docs/architecture.md` (24
+  crates), comparação Hermes/OpenClaw, Referência da CLI completa, MSRV 1.95
+  na wiki, SOUL.md com o snapshot rotulado.
+- **Segurança & quality**: #174 corrigido em código (allowlist de nome de
+  asset, #1315); #173 é falso-positivo com entrada no ledger — o #1316 corrige
+  a comparação por span e o dismissal é aplicado pelo
+  `codeql-apply-dismissals.yml` depois do merge.
+- **v0.4.3 cortada** a partir de `main` com 89 fragmentos de changelog
+  agregados por `assemble.py --write`; `pubspec.yaml` sobe junto (0.4.3+7).
+  Tag `v0.4.3` empurrado por `git push` a partir da máquina local — o
+  `send-pack` cortado da v0.4.2 era do proxy das sessões cloud — para o
+  merge commit `05537bd`; `release.yml` e `deploy.yml` dispararam pelo push.
+- **Automação da release, o que saiu e o que não saiu.** A GitHub Release
+  publicou 43 assets (os 7 binários crus com `.sha256`, archives, MSI/NSIS,
+  desktop `.deb`/AppImage, APK, `install.sh`/`install.ps1`, `SHA256SUMS`;
+  corpo vindo da prosa do CHANGELOG). Duas falhas, ambas corrigidas para a
+  frente no PR #1323: (a) o **Deploy** (imagem ghcr) caiu no builder porque o
+  Dockerfile não copiava `bridge/` e o `garraia-channels` embute o bridge
+  WhatsApp com `include_str!` — a imagem `v0.4.3` foi republicada por
+  `workflow_dispatch` do branch `release/v0.4.3-docker` (= `05537bd` + só os
+  dois commits de fix), sem mover o tag; (b) o job **`package-linux`** caiu no
+  passo do AppImage aarch64 (`cd "$RUNNER_TEMP"` antes de caminhos relativos —
+  a primeira release com o binário ARM64 presente expôs o bug), e por isso a
+  v0.4.3 **saiu sem** `garraia-linux-x86_64.{deb,rpm,AppImage}`. Não se
+  redisparou o `release.yml`: o `softprops/action-gh-release@v3` sobrescreve
+  assets de mesmo nome e os binários crus têm de ficar byte-idênticos (regra
+  15). Best-effort por política (`docs/releasing.md`); volta na próxima.
+
+### Issues fechadas nesta rodada
+
+#1301 (#1307), #1298 (#1305), #1297 (#1318).
+
+### Issues que ficam abertas — cada uma com bloqueio nomeado
+
+| Issue | Entregue | O que falta e quem decide |
+|---|---|---|
+| #1225 | S1–S4 | S2 estrutural (rotear `run_tests`/`git_diff`/`code_review`/`repo_search` pelo sandbox) e S5 — R4, fatia própria; S6 (OpenShell/Crabbox) é decisão do dono |
+| #1226 | S-A, S-E | S-B (`tool_program` intrínseca, R4 com security-auditor) é feature nova — fora da janela de release; S-C/S-D dependem dela |
+| #1227 | s0–s3 | s4+ (`garra runs list`, retenção, API, resume) aguardam a decisão de design registrada na issue |
+| #1228 | relatos de dogfood | processo — o dono fecha quando o relato bastar |
+| #1247 | caminho 1 (docs) | caminhos 2/3 (gate de boot) — decisão do dono; a própria issue propõe o 2 para a v0.4.4 |
+| #1254 | critério 3 (sinal distinguível) | re-baseline é R5 — dono |
+| #1261 | caminho 3 (docs) | fail-closed no bind e destino das chaves mortas do arquivo — R5 |
+| #1272 | doc honesta + sandbox wired | default do `agent.sandbox` no MCP e jail do `bash` — R4/R5 |
+| #1276 | itens 1 e 2 | re-medir contra sessão WhatsApp real pareada — gate manual |
+| #1295 | item 2 | item 1 (warn-once) muda a semântica do guarda — dono |
+| #1299 | #1304, #1305 | detecção antes da chamada exige a preferência `provider.only` da conta, que a API do OpenRouter não expõe |
+
+### Lições operacionais desta rodada
+
+- **Auto-merge ligado numa PR + checks estritos = squash em série competindo
+  com qualquer trem.** Verificar `autoMergeRequest` no início da rodada e
+  desligar nas PRs que vão entrar por trem.
+- **Trem de merge com merge commits** faz o GitHub marcar cada PR carregada
+  como merged; oito ciclos de CI em série viraram um.
+- **Worktree do Workflow nasce em `main`, não no HEAD corrente**: passar o SHA
+  base por `args` e mandar o agente fazer `checkout -b` explícito; conferir
+  `merge-base` antes de montar o trem.
+- **Revisão adversarial em três lentes pagou**: pegou `signal-hook` OFF
+  instalando um segundo handler de SIGINT no rustyline (o oposto do que o
+  comentário afirmava), dump de input cru no erro do loop, um Warning
+  incondicional que quebrava `config check --strict` e um `warn!` por chamada
+  no caminho do `garra mcp-server`.
+
+## Concluído em 2026-09-15 — repo zerado (só `main`): M1 do desktop, Dependabot, épico #1181 fechado
+
+Estado de partida: 1 issue, 6 PRs e 7 branches. Estado de chegada: 0 issues,
+0 PRs, só `main` — mesmo padrão de 2026-08-18 e 2026-09-07.
+
+- **PR #1205 (`garra desktop`, M1 do épico #1181) mergeado** (`043401a`):
+  subcomando `garra desktop [--status] [--no-launch]`, resolução em
+  `garraia_desktop_core::locate`, exit codes 0/69/70, zero Tauri na CLI,
+  `desktop.yml` passa a disparar em `crates/garraia-desktop-core/**`.
+- **Cinco PRs do Dependabot mergeados em série**: #1199 (wasmtime-wasi
+  48.0.2), #1201 (grupo patch-and-minor: toml, uuid, console, ipnet), #1203
+  (lopdf 0.45.0), #1204 (dirs 7.0.0 — major, mas o diff do crate é uma linha
+  em `preference_dir`, função que este repo não chama) e #1202 (poise 0.7.0 —
+  nenhum `poise::` referenciado em `garraia-channels`). Todos verdes no CI da
+  head atualizada; nenhum recebeu commit manual (Dependabot para de rebasear
+  branch editada).
+- **Épico #1181 (Desktop Control Center) fechado por decisão do dono.** M0
+  (#1195) e M1 (#1205) entregues; **M2–M7 passam a ser rastreados no
+  `ROADMAP.md` §4.1** ("Control Center -- M2..M7"), com risco, pré-requisitos
+  e o critério de "não quebrou nada" copiados do corpo do épico. O ADR 0021
+  continua a decisão de arquitetura; a issue deixa de ser o tracker.
+
+### Lições operacionais desta limpeza
+
+- **A proteção de `main` exige branch atualizada** (strict status checks):
+  um PR verde mas `behind` não mergeia, e **cada merge em `main` põe todos
+  os outros PRs `behind` de novo**. Com N PRs abertos são N ciclos de CI em
+  série (~1 h cada); não adianta atualizar todos de uma vez. Para lotes do
+  Dependabot, mergear do menor risco para o maior.
+- Auto-delete de head branch está ligado: a branch some no merge. Se sobrar
+  órfã, `branch-cleanup.yml` via `workflow_dispatch` (`confirm=true`) apaga
+  tudo exceto `main` e heads de PR aberto — `git push --delete` daqui é
+  cortado pelo proxy.
+
+### Follow-up opcional (não bloqueante)
+
+- `crates/garraia-media/Cargo.toml`: o comentário sobre o `lopdf` diz "drop
+  `default-features = false` once a lopdf release > 0.44.0 ships the fix"
+  (J-F-Liu/lopdf#518 / #527). Com o 0.45.0 em `main`, vale reavaliar num PR
+  próprio, com o teste de PDF (#1208) como guarda.
+
+## Concluído em 2026-09-13 — epic de hardware fechado + release v0.4.2
+
+- **#1131 (hardware skills) fechada** (PR #1170): adapters e presets viram
+  conteúdo empacotável. `garraia-skills` ganhou `kind` + `provides` no
+  frontmatter e varredura recursiva (`hardware/<slug>/SKILL.md`, sem seguir
+  symlink, com teto de profundidade); `garraia-hardware` ganhou a feature
+  `skills` com o `CatalogoDeSkills` e as duas regras que o manifesto não
+  escolhe — lista fechada de transportes (outro carrega inerte) e risco
+  efetivo = `max(adapter, skill)`, ou seja, um skill só sobe risco. Seis
+  skills oficiais em `skills/hardware/`; Zigbee e Matter como preset sobre o
+  Home Assistant, nunca stack própria. Modbus e ROS2 ficam de fora até
+  existir adapter no core.
+- **#1124 (epic garraia-hardware) fechada** (PR #1171): as sete slices estão
+  entregues. `docs/hardware.md` amarra a plataforma inteira (camadas, north
+  star passo a passo, risco R0-R5 e as três invariantes); ADR 0020 ganhou
+  seção de desfecho; ROADMAP marca a Fase 7 correspondente.
+- **v0.4.2 cortada** a partir de `main` com 47 fragmentos de changelog
+  agregados (`scripts/changelog/assemble.py --write`). Versão do workspace e
+  do `pubspec.yaml` do mobile bumpadas juntas.
+
+### Como a v0.4.2 foi tagueada — e o que isso implica
+
+**A tag saiu por `workflow_dispatch`, não por push**: o proxy de egresso da
+sessão autônoma corta o `git push origin v0.4.2` (`send-pack: unexpected
+disconnect`, quatro tentativas com backoff). Foi usado o caminho alternativo
+que o `docs/releasing.md` §2 já documenta — Actions → Release → Run workflow
+em `main` com `version=v0.4.2` —, e o `softprops/action-gh-release` criou a
+tag no commit do run (`fd8f487`).
+
+Consequência conhecida desse modo, e por isso registrada aqui: uma tag criada
+pelo `GITHUB_TOKEN` **não dispara** workflows de tag-push, então o
+`deploy.yml` (imagem ghcr) precisou de dispatch manual com `tag=v0.4.2`.
+Nesse modo a imagem sai com `v0.4.2` + `latest` + sha, **sem** as derivadas
+semver. Confirmado na publicação (digests lidos direto do registry):
+
+| Tag | Digest | Situação |
+|---|---|---|
+| `v0.4.2` | `sha256:64d9acd…` | nova, multi-arch (linux/amd64 + linux/arm64) |
+| `latest` | `sha256:64d9acd…` | aponta para a v0.4.2 |
+| `0.4.2` | — | não existe |
+| `0.4` | `sha256:bc3caf…` | **obsoleta** — ficou na release anterior |
+
+A linha do `0.4` é a que morde: é uma tag **móvel**, ela não deixou de
+existir, apenas parou de andar. Quem fizer `docker pull
+ghcr.io/michelbr84/garraia:0.4` hoje recebe a versão anterior sem nenhum
+aviso. Até ser corrigida, `v0.4.2` e `latest` são as tags confiáveis desta
+release.
+
+Quem for cortar a próxima release de uma máquina com saída de rede livre deve
+preferir o push da tag: o `deploy.yml` dispara sozinho, as derivadas semver
+voltam a ser geradas e o `0.4` volta a andar.
+
+Release publicada com 53 assets, incluindo os seis binários crus e o
+`<asset>.sha256` irmão de cada um — o que o `garra update` exige
+(`crates/garraia-cli/src/update.rs:42-48` e `:127`).
+
+### Verificação pendente do release (mesma limitação das anteriores)
+
+Instalação limpa e `garra update` 0.4.1 → 0.4.2 continuam **não testados
+nesta sessão**: o container não alcança `garraia.org` nem
+`objects.githubusercontent.com`.
+
+## Concluído em 2026-09-11 — varredura autopilot: DNS órfãos, CodeQL e higiene
+
+- **#1099 (bug) fechada**: 5 CNAMEs da zona `garraia.org` (`chatterbox`, `api`,
+  `llm`, `n8n`, `video`) apontavam para o Cloudflare Tunnel **deletado**
+  `ccda170d-…` → HTTP 530 eterno (deleção de túnel não cascata no DNS).
+  Removidos via API Cloudflare com decisão do dono. Restam na zona, para
+  decisão futura: `api-dev`/`cloud-api`/`dev-api`/`gw-dev` (túneis também
+  deletados) e `api-cloud`/`cloud` (túnel `garra-dev` down — pode ser máquina
+  local que liga às vezes). `docs/voice.md` (PR #1115) já declara voz como
+  serviço local; `RuntimeMode.cloud` do mobile falha agora com DNS error
+  (mais rápido que 530) e continua overridável via `--dart-define`.
+- **#1142 (CI/CodeQL) fechada**: PR #1154 corrigiu os sentinelas `all`; run
+  34652716700 provou 160 alertas em todos os estados com **0 em
+  `admin/recovery.rs`** — os 3 FPs nunca materializaram, nada a dispensar no
+  ledger; #1136 já mergeado.
+- **Skill `/max-power`** (trabalho de sessão anterior esquecido no working
+  tree) entrou via PR próprio.
+- **Higiene do TODO (itens antigos fechados)**:
+  - bloco `KNOWN_PRE_PS1_TAG="v0.3.3"` + argumento extra do probe
+    `release-cdn/install.ps1` removidos do `install-endpoints.yml` (o próprio
+    workflow pedia após release ≥ v0.3.4; estamos na v0.4.1);
+  - `.claude/commands/garra-routine.md` migrado de Linear (descontinuado
+    2026-08-18) para o tracker interno (issues GitHub) e nota do trigger
+    desativado;
+  - `docs/deployment/config.turboquant.yml` criado — o
+    `docker-compose.turboquant.yml` montava um config que não existia;
+  - comentário "16 binários" do `ci.yml:528` verificado: correto hoje (16
+    binários em `crates/garraia-auth/tests/`).
 
 ## Lancada 2026-09-09 — v0.4.1: canais e seguranca
 
@@ -165,9 +517,14 @@ Todos conferidos contra o código em 2026-09-07:
 - **Arquivos grandes** (Quality Ratchet, report-only): `me.rs` 6366,
   `chat.rs` 2653, `server.rs` 1572, `memory_cmd.rs` 1579 linhas. O
   `memory_cmd.rs` cruzou 1500 no #1017, desta sessão.
-- **`garra about`** escreve ANSI incondicional em saída redirecionada.
+- ~~**`garra about`** escreve ANSI incondicional em saída redirecionada~~ —
+  resolvido: `about_text(style)` deriva cor e desenho do mesmo dono do #942
+  (`ui::Capabilities::detect()`), com testes afirmando o caminho plain.
 - **O `session_id` logado é controlado pelo cliente** e pode conter PII.
-- **`openclaw_bridge.rs`** segue no disco (`garraia-agents/src/tools/`).
+- ~~**`openclaw_bridge.rs`** segue no disco (`garraia-agents/src/tools/`)~~ —
+  removido: nunca registrado no `tools/mod.rs` nem referenciado (morte desde
+  2026-04-06); recuperável do histórico se tool-sharing do OpenClaw entrar no
+  roadmap.
 
 ## Concluído 2026-09-04/05 — segundo lote de campo (#920-#925), 4 PRs
 
@@ -795,7 +1152,9 @@ foram mergeados (ver `plans/README.md` para hash e data de cada um).
   Adiado por ser o maior slice aberto da Fase 2 e pré-requisito do GAR-646.
 - GAR-374 / Object storage S3-compatible validation: adiado por depender de
   MinIO/S3/R2/GCS ou CI com serviço externo configurado (o `S3Compatible`
-  existe atrás da feature `storage-s3`; nenhum job de CI exercita MinIO).
+  existe atrás da feature `storage-s3`). Desde #1230 o step `storage-s3` do
+  job `clippy` exercita MinIO real (testcontainer com a imagem do quay.io e
+  `GARRAIA_REQUIRE_DOCKER=1`); o que segue adiado é S3/R2/GCS de produção.
 - GAR-410 / CredentialVault final: adiado por ser item crítico de segurança e
   amplo. O que já existe: leitura de secrets centralizada em
   `garraia-config::auth` (plan 0046) e refactor do `admin/secrets.rs` (plan
@@ -806,8 +1165,11 @@ foram mergeados (ver `plans/README.md` para hash e data de cada um).
   `benches/agent-framework-comparison/results/2026-08-28-vm/` e alimenta a
   tabela do README; só o run de referência no droplet 1 vCPU / 1 GB segue
   adiado por depender de infra externa.
-- Execução async/provider-backed das native skills GarraMaxPower: adiada para
-  slice próprio após decidir o fechamento do épico GAR-492.
+- Execução async/provider-backed das native skills GarraMaxPower: ✅ Done —
+  seam `SkillCompleter` (inversão de dependência, sem edge skills→agents) +
+  `run_provider_backed` + `AgentTeam::run_with_completer` + `garra max-power`
+  com provider resolvido pela mesma chain do `garra chat`; degrada para o
+  modo determinístico offline quando não há provider (com hint explícito).
 
 ## Pendências abertas
 
@@ -815,32 +1177,32 @@ foram mergeados (ver `plans/README.md` para hash e data de cada um).
   2026-09-02 apenas onde havia evidência clara (path:line). Itens sem evidência
   ficaram `[ ]`.
 - Débitos de código encontrados na auditoria de 2026-09-02 (viram itens, não
-  patches na PR de docs):
-  - `sessions.db` cai em `~/.garraia/data/` (`crates/garraia-gateway/src/server.rs:232-241`)
-    enquanto `memory.db` e `memoria/fatos.json` usam o config dir XDG —
-    unificar via `ConfigLoader::default_config_dir()`.
-  - Feature `tls` sem passthrough no binário `garraia`
-    (`crates/garraia-cli/Cargo.toml`) — adicionar `tls = ["garraia-gateway/tls"]`
-    como já existe para `mcp-http`; até lá o README documenta
-    `--features garraia-gateway/tls`.
-  - `docker-compose.turboquant.yml` monta `docs/deployment/config.turboquant.yml`,
-    que não existe no repo.
-  - `benches/agent-framework-comparison/results/2026-08-28-vm/README.md:12`
-    cita checkout `ea06286` enquanto `environment.txt:44` registra `f34cbfa`.
-  - Comentário "16 binários" em `ci.yml:437` (são 15 arquivos em
-    `crates/garraia-auth/tests/`).
+  patches na PR de docs) — **limpos 2026-09-15 (PR de débitos):**
+  - ~~`sessions.db` cai em `~/.garraia/data/`~~ ✅ — `server.rs` agora usa
+    `AppConfig::resolved_data_dir()` (fonte única, mesmo `memory.db`/`admin.db`).
+  - ~~Feature `tls` sem passthrough no binário `garraia`~~ ✅ — resolvido pelo
+    PR #1213 (`tls = ["garraia-gateway/tls"]`).
+  - `docker-compose.turboquant.yml` monta `docs/deployment/config.turboquant.yml` — **resolvido 2026-09-11**: config criado (provider `llamacpp` keyless apontando para o serviço `llama-turboquant:8080`).
+  - ~~`benches/agent-framework-comparison/results/2026-08-28-vm/README.md:12`
+    cita checkout `ea06286`~~ ✅ — corrigido para `f34cbfa` (o que
+    `environment.txt:42` registra).
+  - ~~Comentário "16 binários" em `ci.yml`~~ ✅ — corrigido para 15 (contagem
+    real de `crates/garraia-auth/tests/*.rs`; `common/` é módulo, não binário).
   - `MemoryConfig` não tem `auto_extract`/`extraction_interval`/`max_facts`
-    (a extração roda em todo turno, sem knob) — as docs que prometiam essas
-    chaves foram corrigidas; decidir se viram configuração real.
-  - `.claude/commands/garra-routine.md` (linhas 2/16/44/79) ainda instrui
-    consultar o Linear.
-- `install-endpoints.yml:133-150`: remover o bloco de tolerância
-  `KNOWN_PRE_PS1_TAG="v0.3.3"` e o argumento extra do probe
-  `release-cdn/install.ps1` — o próprio workflow pede isso após a primeira
-  release ≥ v0.3.4 (v0.3.4 e v0.3.5 já publicam `install.ps1`).
+    (a extração roda em todo turno, sem knob) — **resolvido 2026-09-15**: chaves
+    `memory.auto_extract` (default `true`) e `memory.max_facts` (teto por turno,
+    maior confidence) implementadas com gate no `AgentRuntime` + wiring no
+    bootstrap; `extraction_interval` deliberadamente não implementado (menor
+    ganho, exige contador por sessão).
+  - ~~`.claude/commands/garra-routine.md` ainda instrui consultar o Linear~~ ✅ —
+    já atualizado (linha 16 documenta a descontinuação do Linear; nenhuma
+    instrução remanescente de consultar o Linear).
+- ~~`install-endpoints.yml`: tolerância `KNOWN_PRE_PS1_TAG="v0.3.3"`~~ ✅ —
+  bloco já removido do workflow (nenhuma ocorrência); só resta o marker de
+  frescor com nota sobre tolerâncias futuras.
 - `GAR-492`: decidir no tracker interno se o épico fecha como MVP completo ou
-  se abre follow-ups (execução provider-backed das native skills, dogfood em
-  bug real com relatório de review).
+  se abre follow-ups — **execução provider-backed das native skills ✅ Done**
+  (PR #1218); resta o dogfood em bug real com relatório de review.
 
 ## Decisões tomadas
 
@@ -870,9 +1232,9 @@ foram mergeados (ver `plans/README.md` para hash e data de cada um).
 3. Re-triage do RUSTSEC-2026-0253 (`lru` via aws-sdk-s3) até 2026-11-14 —
    o ignore em `deny.toml`/`.cargo/audit.toml` expira em 2026-11-15 e ainda
    cita o owner antigo (`#812 / GAR-896`; hoje tracker interno #162).
-4. Limpar o bloco `KNOWN_PRE_PS1_TAG` do `install-endpoints.yml` (ver
-   Pendências) e ajustar `.claude/commands/garra-routine.md` para o tracker
-   interno.
+4. ~~Limpar o bloco `KNOWN_PRE_PS1_TAG` do `install-endpoints.yml` e ajustar
+   `.claude/commands/garra-routine.md` para o tracker interno~~ — **feito
+   2026-09-11** (ver bloco de conclusão no topo).
 5. Desktop (ROADMAP §4.1): chave de assinatura + `latest.json` para o
    `tauri-plugin-updater`; DMG notarizado; AppImage aarch64
    (`--runtime-file` + segundo pin de runtime).

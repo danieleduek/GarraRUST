@@ -1,14 +1,13 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use garraia_agents::ChatMessage;
 use garraia_channels::{WhatsAppChannel, WhatsAppOnMessageFn};
 use garraia_config::AppConfig;
-use garraia_security::{Allowlist, PairingManager};
 use tracing::{info, warn};
 
 use crate::state::SharedState;
 
-use super::config::{default_allowlist_path, resolve_api_key};
+use super::config::{channel_gates, resolve_api_key};
 
 /// Build WhatsApp channels from config. Must be called after state is
 /// wrapped in `Arc` so the message callback can capture a `SharedState`.
@@ -79,13 +78,9 @@ pub fn build_whatsapp_channels(
             continue;
         };
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        // #1189: gates compartilhados com o AppState -- instancias
+        // proprias fazem o `/pair` nunca casar com o `claim()`.
+        let (allowlist, pairing) = channel_gates(state);
 
         let state_for_cb = Arc::clone(state);
         let allowlist_for_cb = Arc::clone(&allowlist);
@@ -163,9 +158,14 @@ pub fn build_whatsapp_channels(
                     // definido" e a politica de ferramenta nao valia, so no Telegram
                     // valia. Assimetria silenciosa e pior que ausencia: o usuario
                     // acredita na restricao.
-                    let exec = state
-                        .exec_context_for(&session_id, Some(&from_number))
-                        .await;
+                    let exec = crate::approval_scope::com_escopo(
+                        state
+                            .exec_context_for_msg(&session_id, Some(&from_number), Some(&text))
+                            .await,
+                        "whatsapp",
+                        &session_id,
+                        &from_number,
+                    );
 
                     let response = if let Some(delta_sender) = delta_tx {
                         state

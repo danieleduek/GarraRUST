@@ -14,7 +14,7 @@ stdout is the answer (or a `garra.ask.v1` JSON envelope when `--json`).
 |---------|--------|------|
 | `garra ask "ping"` | resposta como texto puro | `0` |
 | `garra ask --json "ping"` | linha JSON `garra.ask.v1` | `0` |
-| `garra ask --provider openrouter "ping"` | usa modelo do `config.yml` (precedência GAR-576) | `0` |
+| `garra ask --provider openrouter "ping"` | usa modelo do `config.yml`, ou o padrão `z-ai/glm-5.3-flash` (precedência GAR-576) | `0` |
 | `garra ask --provider openrouter --model openrouter/auto "ping"` | usa `openrouter/auto` explícito | `0` |
 | `echo "ping" \| garra ask` | lê stdin (cap 64 KiB) quando arg posicional ausente | `0` |
 | `garra ask ""` (arg vazio) | erro claro em stderr (ou JSON em stdout se `--json`) | `2` |
@@ -25,9 +25,9 @@ stdout is the answer (or a `garra.ask.v1` JSON envelope when `--json`).
 
 | Flag | Default | Descrição |
 |------|---------|-----------|
-| `--provider`, `-p <kind>` | autodetect | `ollama` \| `anthropic` \| `openai` \| `openrouter` |
+| `--provider`, `-p <nome>` | autodetect | `ollama` \| `llamacpp` \| `anthropic` \| `openai` \| `openrouter`, ou o nome de uma entrada `llm:` (ex.: `lmstudio`) |
 | `--model`, `-m <name>` | resolve via config (GAR-576) | sobrescreve modelo (precedência absoluta) |
-| `--url`, `-u <url>` | — | endpoint custom (LM Studio, vLLM, etc.) |
+| `--url`, `-u <url>` | — | endpoint custom (LM Studio, vLLM, etc.); chave só de `LLM_API_KEY` ou da entrada `llm:` com a mesma `base_url` |
 | `--json` | `false` | emit JSON envelope em stdout |
 | `--timeout-secs <N>` | `60` | range `[1, 600]`; excede → exit `124` |
 | `--system-prompt <STR>` | minimum default | sobrescreve system prompt inline |
@@ -42,7 +42,7 @@ stdout is the answer (or a `garra.ask.v1` JSON envelope when `--json`).
   "ok": true,
   "answer": "GAR-ASK-OK",
   "provider": "openrouter",
-  "model": "openrouter/free",
+  "model": "z-ai/glm-5.3-flash",
   "latency_ms": 1234
 }
 ```
@@ -88,11 +88,20 @@ Para provider:
 
 1. `--provider <X>` (precedência absoluta).
 2. `config.agent.default_provider`.
-3. Cadeia autodetect (Ollama health → Anthropic env → OpenAI env → OpenRouter env).
+3. Cadeia autodetect (Anthropic → OpenAI → OpenRouter com credencial, depois Ollama).
+
+Endpoint e credencial saem **sempre da mesma entrada**: `-p openai` usa
+`llm.openai.base_url` com `llm.openai.api_key` — nunca a chave de uma
+entrada com o endereço de outra, nem a chave de uma entrada apontando para
+outro lugar enviada ao host padrão do provider. A variável de ambiente do
+tipo (`OPENAI_API_KEY` etc., inclusive a de um `.env` no diretório
+corrente) só vai para o host padrão: uma entrada com `base_url` própria e
+sem `api_key` não a recebe. Detalhes em
+[`docs/configuration.md` §"Endpoint and credential"](configuration.md#endpoint-and-credential-always-the-same-entry).
 
 ## Exemplos
 
-### Smoke barato (recomendado para CI / testes)
+### Smoke sem custo (escolha explícita para CI / testes)
 
 ```bash
 garra ask --provider openrouter --model openrouter/free \
@@ -123,13 +132,13 @@ via Telegram, Discord, Slack, WhatsApp e API REST.
 
 ```bash
 cat README.md | garra ask --json --provider openrouter \
-  --system-prompt "Resuma em 3 bullets." -m openrouter/free
+  --system-prompt "Resuma em 3 bullets."
 ```
 
 ### Em scripts / Claude Code / MCP
 
 ```bash
-RESULT=$(garra ask --json --provider openrouter -m openrouter/free \
+RESULT=$(garra ask --json --provider openrouter \
   --timeout-secs 30 "$prompt")
 ANSWER=$(echo "$RESULT" | jq -r '.answer // .error.message')
 ```
@@ -167,7 +176,7 @@ PRs separados manterão escopo limpo:
 - ~~MCP server wrapper expondo `ask` como tool MCP~~ — entregue por
   GAR-583, veja [`docs/cli-mcp-server.md`](cli-mcp-server.md).
 - `--session <id>` para continuação de conversa.
-- Automatic `openrouter/free → openrouter/auto` fallback.
+- Upgrade automático do modelo padrão para um mais caro.
 
 ## Ver também
 

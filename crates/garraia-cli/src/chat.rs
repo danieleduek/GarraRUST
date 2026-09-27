@@ -5,20 +5,27 @@
 
 use garraia_agents::exec_context::ExecContext;
 use std::future::Future;
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, Write as _};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use garraia_agents::{
-    AgentRuntime, AnthropicProvider, BashTool, ChatMessage, ChatRole, CodeReviewTool, FileReadTool,
-    FileWriteTool, ListDirTool, LlamaCppProvider, LlmProvider, MessagePart, OllamaProvider,
-    OpenAiProvider, RepoSearchTool, RunTestsTool, WebFetchTool, WebSearchTool,
-    normalize_ollama_tag, tools::git_diff_tool::GitDiffTool,
+    AgentRuntime, BashTool, ChatMessage, ChatRole, CodeReviewTool, DeviceExecuteTool,
+    DeviceListTool, DeviceReadTool, DeviceToolsConfig, FileJail, FileReadTool, FileWriteTool,
+    ListDirTool, LlmProvider, MessagePart, OllamaProvider, OpenAiProvider, RepoSearchTool,
+    RunTestsTool, ValidacaoDeModelo, WebFetchTool, WebSearchTool, normalize_ollama_tag,
+    tools::git_diff_tool::GitDiffTool,
 };
 use garraia_config::AppConfig;
 use garraia_db::SessionStore;
+use garraia_gateway::bootstrap::{
+    avisa_cobertura_do_sandbox, sandbox_policy_from, spawn_hardware_adapters,
+};
+use garraia_hardware::DeviceRegistry;
 use tokio::sync::mpsc;
 
+use crate::defaults::{DEFAULT_CLOUD_PROVIDER, DEFAULT_LOCAL_PROVIDER};
+use crate::provider_binding;
 use crate::ui::error_card::ErrorCard;
 use crate::ui::panel;
 use crate::ui::tool_log::{Busca, ToolLog};
@@ -26,6 +33,38 @@ use crate::ui::{TerminalRenderer, UiEvent};
 use garraia_agents::TurnEvent;
 
 use std::path::Path;
+
+// ── #1298: /model transacional ──────────────────────────────────────────────
+
+/// O que o REPL faz com o resultado de `validar_modelo` antes de tocar o
+/// estado do `/model`. A troca só acontece nos efeitos `Aplicar*` — `Ausente`
+/// recusa com o estado anterior intacto, e a política inteira fica numa
+/// função pura para o teste fixar sem precisar de provider de verdade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EfeitoTrocaDeModelo {
+    /// Listado na curada: aplica como troca validada.
+    Aplicar,
+    /// Fora da curada mas no catálogo completo: aplica, e a confirmação diz
+    /// de onde o nome veio — o `/models` não vai listá-lo, e isso não é bug.
+    AplicarComNotaDeCatalogo,
+    /// O catálogo real não tem o modelo: recusa e mantém provider/model.
+    RecusarEManterEstado,
+    /// Provider sem catálogo (ex.: Anthropic): aplica, mas nunca como
+    /// sucesso validado — a confirmação carrega a ressalva.
+    AplicarSemValidacao,
+}
+
+/// Política pura do `/model` (#1298): cada `ValidacaoDeModelo` tem um único
+/// efeito. Falha de validação (o `Err` do provider) não passa por aqui — o
+/// handler a trata como recusa fail-closed antes de chegar à política.
+fn efeito_da_validacao(v: &ValidacaoDeModelo) -> EfeitoTrocaDeModelo {
+    match v {
+        ValidacaoDeModelo::Listado => EfeitoTrocaDeModelo::Aplicar,
+        ValidacaoDeModelo::ListadoForaDaCurada => EfeitoTrocaDeModelo::AplicarComNotaDeCatalogo,
+        ValidacaoDeModelo::Ausente => EfeitoTrocaDeModelo::RecusarEManterEstado,
+        ValidacaoDeModelo::SemListagem => EfeitoTrocaDeModelo::AplicarSemValidacao,
+    }
+}
 
 /// ANSI color helpers
 const GREEN: &str = "\x1b[32m";
@@ -44,6 +83,10 @@ const COMANDOS: &[(&str, &str)] = &[
     ("/tool", "Saidas de ferramenta guardadas nesta sessao"),
     ("/tool <n>", "A saida inteira de uma chamada"),
     ("/history", "Historico da conversa"),
+    (
+        "/resume [id]",
+        "Retomar a sessao mais recente (ou um id) — o alvo e sempre a ultima atividade",
+    ),
     ("/logs", "Onde fica o log, e como segui-lo"),
     ("/models", "Modelos que este provider lista"),
     ("/model <nome>", "Trocar de modelo sem reiniciar"),
@@ -80,16 +123,42 @@ fn project_summary(cwd: &str) -> String {
 }
 
 /// Scan the current directory for project markers and build a context summary.
+///
+/// Correção do **contexto de projeto** (feedback "contexto de projeto"):
+/// o resumo antigo listava qualquer entrada do topo — incluindo diretórios
+/// de build/dependência (`target/`, `node_modules/`, `dist/`) — e não dizia
+/// **que projeto é este** nem **em que ramo** o agente está. Agora:
+///
+/// - diretórios de build/dependência são filtrados da listagem;
+/// - o nome do projeto vem do primeiro heading do `README.md` (quando há);
+/// - o ramo git atual entra no contexto (mesma leitura de `HEAD` usada no
+///   painel `/contexto` — sem spawnar `git`, sem varrer a árvore).
 fn scan_directory_context(cwd: &str) -> String {
     let p = Path::new(cwd);
     let markers = project_summary(cwd);
 
-    // List top-level files (up to 15) for context
+    // List top-level files (up to 15) for context, skipping noise dirs.
+    const NOISE_DIRS: &[&str] = &[
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        "out",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".next",
+        ".turbo",
+        "vendor",
+        "coverage",
+    ];
     let mut files: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(p) {
         for entry in entries.flatten().take(30) {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with('.') {
+            let is_noise_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && NOISE_DIRS.contains(&name.as_str());
+            if !name.starts_with('.') && !is_noise_dir {
                 files.push(name);
             }
             if files.len() >= 15 {
@@ -102,17 +171,38 @@ fn scan_directory_context(cwd: &str) -> String {
         return String::new();
     }
 
-    let mut result = markers;
-    if !files.is_empty() {
-        if !result.is_empty() {
-            result.push_str(" | ");
-        }
-        result.push_str(&format!("Arquivos: {}", files.join(", ")));
+    let mut parts: Vec<String> = Vec::new();
+    if !markers.is_empty() {
+        parts.push(markers);
     }
-    result
+    // Project identity: first heading of the README, when present.
+    if let Ok(readme) = std::fs::read_to_string(p.join("README.md")) {
+        let name = readme.lines().map(str::trim).find_map(|l| {
+            l.strip_prefix("# ")
+                .map(str::trim_start)
+                .map(str::to_string)
+        });
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            parts.push(format!("Projeto: {name}"));
+        }
+    }
+    // Current git branch (same HEAD read as the /contexto panel).
+    if let Some(ramo) = crate::ui::git_branch(p) {
+        parts.push(format!("Ramo: {ramo}"));
+    }
+    if !files.is_empty() {
+        parts.push(format!("Arquivos: {}", files.join(", ")));
+    }
+    parts.join(" | ")
 }
 
-/// Helper to resolve the API key checking env var, explicit config, and "main" config.
+/// Helper to resolve a NON-LLM API key (today only Brave's, for `web_search`)
+/// checking env var, explicit config, and "main" config.
+///
+/// LLM providers do not come through here any more: their endpoint and
+/// credential are bound together by [`provider_binding`], because this
+/// helper returns a key with no idea of which host it belongs to — which is
+/// how `-p openai` ended up sending a custom endpoint's key to api.openai.com.
 fn get_api_key(config: &AppConfig, provider_name: &str, env_var: &str) -> Option<String> {
     if !env_var.is_empty()
         && let Ok(key) = std::env::var(env_var)
@@ -142,7 +232,11 @@ fn get_api_key(config: &AppConfig, provider_name: &str, env_var: &str) -> Option
 /// `review` is the provider + model `code_review` runs its second LLM call
 /// on; `None` skips it, which is what the tests do because building a real
 /// provider needs a backend. `brave_key` gates `web_search` exactly like the
-/// gateway does. `schedule_heartbeat` / `schedule_recurring` need a
+/// gateway does. `config` feeds `spawn_hardware_adapters`: com
+/// `hardware.mqtt` ou `hardware.home_assistant`
+/// configurado o CLI abre o mesmo transporte e o mesmo store de presenca do
+/// gateway (`AppConfig::hardware_db_path`). `schedule_heartbeat` /
+/// `schedule_recurring` need a
 /// `SessionStore` the chat does not open — they stay gateway-only, on
 /// purpose and said here rather than silently.
 ///
@@ -154,23 +248,75 @@ fn get_api_key(config: &AppConfig, provider_name: &str, env_var: &str) -> Option
 /// ferramentas que depende de uma flag. Fica para um slice proprio.
 fn register_cli_tools(
     runtime: &AgentRuntime,
+    config: &AppConfig,
     review: Option<(Arc<dyn LlmProvider>, String)>,
     brave_key: Option<String>,
     bash_allowlist: Vec<String>,
 ) {
-    runtime.register_tool(Box::new(FileReadTool::new(None)));
-    runtime.register_tool(Box::new(FileWriteTool::new(None)));
+    // #1244: na CLI quem roda o binario e o dono da maquina, e o diretorio
+    // corrente e a escolha explicita dele — dai o CWD ser raiz aqui e nao no
+    // gateway, que atende pedido de terceiro. `agent.file_roots` soma.
+    let file_jail = FileJail::from_config_roots_plus_cwd(&config.agent.file_roots);
+    runtime.register_tool(Box::new(FileReadTool::new(file_jail.clone())));
+    runtime.register_tool(Box::new(FileWriteTool::new(file_jail.clone())));
+    // #1225: mesma policy de sandbox do gateway, pela MESMA funcao
+    // (`sandbox_policy_from`) — o `garra chat` nao pode divergir do servidor
+    // sobre onde um comando roda. Sem `agent.sandbox` no config a policy e
+    // `Off` e nada muda.
+    //
+    // As duas correcoes sao ortogonais e ficam as duas: o jail decide ONDE o
+    // arquivo pode estar, a policy decide ONDE o comando roda. O `bash`
+    // continua fora do jail de proposito — ver #1272.
+    let mut bash_tool = BashTool::new_with_confirmation(Some(30)).with_allowlist(bash_allowlist);
+    // #1225 S2: a mesma policy vale para as tools que spawnam programa.
+    let politica = sandbox_policy_from(&config.agent.sandbox);
+    bash_tool.set_sandbox_policy(politica.clone());
+    // #1225 S2: uma vez por processo — `register_cli_tools` roda uma vez na
+    // subida do `garra chat`. Fora de `sandbox_policy_from` porque no MCP a
+    // policy e reconstruida por chamada.
+    avisa_cobertura_do_sandbox(&config.agent.sandbox);
+    runtime.register_tool(Box::new(bash_tool));
     runtime.register_tool(Box::new(
-        BashTool::new_with_confirmation(Some(30)).with_allowlist(bash_allowlist),
+        GitDiffTool::new(None, None).com_sandbox(politica.clone()),
     ));
-    runtime.register_tool(Box::new(GitDiffTool::new(None, None)));
-    runtime.register_tool(Box::new(ListDirTool::new(None)));
-    runtime.register_tool(Box::new(RepoSearchTool::new(None, None)));
+    runtime.register_tool(Box::new(ListDirTool::new(file_jail.clone(), None)));
+    runtime.register_tool(Box::new(
+        RepoSearchTool::new(None, None).com_sandbox(politica.clone()),
+    ));
     // Runs whatever the project's test script says; confirmed like `bash`.
-    runtime.register_tool(Box::new(RunTestsTool::new_with_confirmation(None)));
+    // O `working_dir` do modelo fica no mesmo jail das file tools.
+    runtime.register_tool(Box::new(
+        RunTestsTool::new_with_confirmation(None)
+            .com_sandbox(politica.clone())
+            .com_jail(file_jail),
+    ));
     runtime.register_tool(Box::new(WebFetchTool::new(None)));
+    // ADR 0020 / epic #1124: tools de hardware. O CLI é interativo — sempre
+    // com canal de confirmação (R3/R4 pedem "sim" na própria conversa). O
+    // registry nasce vazio; com `hardware.mqtt` configurado, o adapter sobe
+    // pela MESMA função do gateway (fonte única do wiring — resolução de
+    // senha, client id, store de presença e catálogo de skills (#1250)
+    // idênticos, inclusive os warns).
+    // Sem adapter, `device_list` lista nada (#1128 liga o boot via config).
+    let device_registry = Arc::new(DeviceRegistry::new());
+    let boot = spawn_hardware_adapters(config, device_registry.clone());
+    let device_config = Arc::new({
+        let mut cfg = DeviceToolsConfig::new(device_registry);
+        if let Some(state) = boot.state {
+            cfg = cfg.com_estado(state);
+        }
+        if let Some(fonte) = boot.sinonimos {
+            cfg = cfg.com_sinonimos(fonte);
+        }
+        cfg
+    });
+    runtime.register_tool(Box::new(DeviceListTool::new(device_config.clone())));
+    runtime.register_tool(Box::new(DeviceReadTool::new(device_config.clone())));
+    runtime.register_tool(Box::new(DeviceExecuteTool::new(device_config)));
     if let Some((provider, model)) = review {
-        runtime.register_tool(Box::new(CodeReviewTool::new(provider, model, None)));
+        runtime.register_tool(Box::new(
+            CodeReviewTool::new(provider, model, None).com_sandbox(politica),
+        ));
     }
     if let Some(key) = brave_key {
         runtime.register_tool(Box::new(WebSearchTool::new(key)));
@@ -194,7 +340,10 @@ const RESUME_LIMIT: usize = 100;
 /// O mesmo `sessions.db` que o gateway abre (`server.rs`): quem retoma no
 /// chat uma conversa que comecou num canal encontra as mensagens no lugar
 /// onde elas ja estavam.
-const SESSIONS_DB: &str = "sessions.db";
+///
+/// `pub(crate)` porque o `runs_cmd` (#1227 slice 4) le o ledger do **mesmo**
+/// arquivo: duplicar o nome la abriria espaco para os dois divergirem.
+pub(crate) const SESSIONS_DB: &str = "sessions.db";
 
 /// Abre o `SessionStore` **apenas** quando a sessao vai usa-lo.
 ///
@@ -217,21 +366,51 @@ fn open_chat_store(
     let path = data_dir.join(SESSIONS_DB);
     let store = SessionStore::open(&path)
         .with_context(|| format!("nao foi possivel abrir {}", path.display()))?;
+    // #1227 (slice 1): abrir o banco tambem e uma subida — runs `running`
+    // de uma queda anterior viram `interrupted` com ids no log (nunca
+    // `goal`), igual ao gateway.
+    garraia_db::agent_runs::log_interrupted_runs(&store);
     Ok(Some(store))
 }
 
-/// Grava um turno (pergunta + resposta) no store.
+/// Quem aprova, no CLI, um pedido de confirmacao pausado (#1343).
 ///
+/// O processo e a fronteira de usuario: quem digita no terminal desta
+/// sessao e o mesmo humano que leu o pedido. O remetente e uma constante, e
+/// o escopo fica preso a `session_id` — `/resume` para outra sessao troca o
+/// escopo, e um restart zera o registro (ele vive em memoria no runtime).
+pub(crate) const REMETENTE_CLI: &str = "local-tty";
+
+/// O canal do CLI no registro de aprovacoes pendentes.
+pub(crate) const CANAL_CLI: &str = "cli";
+
+/// O `ExecContext` de um turno do `garraia chat`.
+///
+/// #980: o diretorio do projeto resolve caminho relativo das ferramentas de
+/// arquivo (**nao e sandbox** — ver `ExecContext::working_dir`). #1343: o
+/// escopo de aprovacao faz o "sim" do turno seguinte rodar o pedido pausado,
+/// uma vez.
+fn exec_do_turno(cwd: &str, session_id: &str) -> ExecContext {
+    let mut exec = ExecContext::with_working_dir(Some(cwd.to_string()));
+    exec.approval_scope = garraia_agents::ApprovalScope::new(CANAL_CLI, session_id, REMETENTE_CLI);
+    exec
+}
+
+/// Grava um turno (pergunta + resposta) no store.
 /// `direction` segue o vocabulario que o gateway ja usa em `persist_turn` —
 /// `"user"` e `"assistant"` —, porque e o que `load_history` e a hidratacao
 /// do gateway leem de volta. Nada de schema novo: sao as duas mesmas
 /// chamadas, so que feitas pelo CLI.
-fn append_turn(
-    store: &SessionStore,
-    session_id: &str,
-    user_text: &str,
-    assistant_text: &str,
-) -> Result<()> {
+///
+/// #1300: a gravacao e fracionada, nao atomica de proposito. A pergunta
+/// grava ANTES do turno rodar (`persist_user_turn`) e a resposta/marcador
+/// grava no fim (`persist_assistant_turn`). Um crash duro no meio deixa a
+/// pergunta sola no banco — e exatamente isso que o `--resume latest`
+/// seguinte recupera. O `append_turn` de antes gravava o par so DEPOIS do
+/// turno completo, entao timeout, Ctrl+C, provider caindo ou kill -9
+/// apagavam o turno do ponto de vista do resume: a sessao restaurada
+/// terminava na pergunta anterior, e o trabalho recente sumia.
+fn persist_user_turn(store: &SessionStore, session_id: &str, user_text: &str) -> Result<()> {
     store.upsert_session(
         session_id,
         "cli",
@@ -239,10 +418,62 @@ fn append_turn(
         &serde_json::json!({ "origem": "garra chat" }),
     )?;
     let meta = serde_json::json!({ "channel_id": "cli", "user_id": "local" });
-    let agora = chrono::Utc::now();
-    store.append_message(session_id, "user", user_text, agora, &meta)?;
-    store.append_message(session_id, "assistant", assistant_text, agora, &meta)?;
+    store.append_message(session_id, "user", user_text, chrono::Utc::now(), &meta)?;
     Ok(())
+}
+
+/// Grava o lado do assistant: resposta completa ou o marcador de
+/// interrupcao de `marcador_de_interrupcao`. A sessao ja existe — o
+/// `persist_user_turn` do mesmo turno a criou.
+fn persist_assistant_turn(
+    store: &SessionStore,
+    session_id: &str,
+    assistant_text: &str,
+) -> Result<()> {
+    let meta = serde_json::json!({ "channel_id": "cli", "user_id": "local" });
+    store.append_message(
+        session_id,
+        "assistant",
+        assistant_text,
+        chrono::Utc::now(),
+        &meta,
+    )?;
+    Ok(())
+}
+
+/// O que o fim de um turno diz de si, para o historico hidratado contar a
+/// verdade. Timeout, Ctrl+C e erro gravam um marcador como mensagem do
+/// assistant; so o turno completo fica sem nada. O `--resume` seguinte
+/// hidrata o marcador como texto normal — o modelo retomado ve que a ultima
+/// resposta NAO aconteceu, em vez de ler uma conversa que termina em
+/// resposta inventada pela ausencia.
+fn marcador_de_interrupcao<T, E>(outcome: &TurnOutcome<T, E>) -> Option<&'static str> {
+    match outcome {
+        TurnOutcome::TimedOut => Some("[turno interrompido: timeout]"),
+        TurnOutcome::Cancelled => Some("[turno interrompido: cancelado]"),
+        TurnOutcome::Done(Err(_)) => Some("[turno interrompido: erro]"),
+        TurnOutcome::Done(Ok(_)) => None,
+    }
+}
+
+/// Decide o id inicial da sessao. Id explicito do `--resume` vence;
+/// `latest` (o valor quando a flag vem sem argumento) cai para o alvo do
+/// banco (`latest_session_id`); sem alvo, o id novo entra com a marca de
+/// "comecou nova" para o chamador avisar — primeiro uso com `--resume` e
+/// boot legitimo, nao erro.
+fn id_inicial_da_sessao(
+    resume: Option<&str>,
+    latest: Option<String>,
+    novo: String,
+) -> (String, bool) {
+    match resume {
+        Some("latest") => match latest {
+            Some(id) => (id, false),
+            None => (novo, true),
+        },
+        Some(id) => (id.to_string(), false),
+        None => (novo, true),
+    }
 }
 
 /// Le o historico gravado de uma sessao, em ordem cronologica.
@@ -297,6 +528,18 @@ fn tool_help(name: &str) -> Option<&'static str> {
         "web_fetch" => "Baixa o conteudo de uma URL publica (enderecos internos sao recusados).",
         "web_search" => "Busca na web (Brave) e devolve titulos, links e trechos.",
         "code_review" => "Revisa um diff ou arquivo e aponta problemas e melhorias.",
+        // ADR 0020 / epic #1124: os tres entram no prompt com as tools —
+        // sem linha aqui, o prompt lista quem nao descreve e o teste que
+        // confere a tabela contra o registro falha.
+        "device_list" => {
+            "Lista os dispositivos fisicos registrados e o estado online/offline de cada um."
+        }
+        "device_read" => {
+            "Le uma capability de um dispositivo fisico (ex.: a temperatura do sensor da sala)."
+        }
+        "device_execute" => {
+            "Executa uma capability em um dispositivo fisico (ex.: ligar a luz); o risco (R0-R5) decide se pede confirmacao."
+        }
         _ => return None,
     })
 }
@@ -381,19 +624,28 @@ fn decide_default_provider(
             reason: "agent.default_provider key not present in llm map",
         };
     };
-    let provider_kind = cfg.provider.as_str();
+    let provider_kind = cfg.provider.trim();
 
-    let cfg_has_key = cfg.api_key.as_deref().is_some_and(|k| !k.is_empty());
+    // Same emptiness rule as `provider_binding::bind_entry`, so the decision
+    // and the construction cannot disagree about whether a key exists.
+    let cfg_has_key = cfg.api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
+    // The kind's env var only counts when the entry talks to the kind's
+    // default host — `bind_entry` never sends it to the entry's own
+    // `base_url`, and the decision must not count a key the build will not
+    // use.
+    let env_reaches_entry =
+        provider_binding::env_credential_allowed(provider_kind, cfg.base_url.as_deref());
     let credential_ok = match provider_kind {
         // Local — health-checked by the caller. `llamacpp` talks to a local
         // llama-server (default http://localhost:8080), keyless like ollama.
         "ollama" | "llamacpp" => true,
-        "anthropic" => env_has_anthropic_key || cfg_has_key,
+        "anthropic" => cfg_has_key || (env_has_anthropic_key && env_reaches_entry),
         // OpenAI-compatible local backends (e.g. LM Studio) commonly omit
-        // the api_key and rely on `base_url` reachability. Treat them as
-        // credential-ok for the purposes of routing.
-        "openai" => cfg.base_url.is_some() || env_has_openai_key || cfg_has_key,
-        "openrouter" => env_has_openrouter_key || cfg_has_key,
+        // the api_key and rely on `base_url` reachability. Treat an entry
+        // pointing at its own endpoint as credential-ok for routing (it gets
+        // the keyless placeholder); the OpenAI API itself needs a key.
+        "openai" => cfg_has_key || !env_reaches_entry || env_has_openai_key,
+        "openrouter" => cfg_has_key || (env_has_openrouter_key && env_reaches_entry),
         _ => {
             return DefaultProviderDecision::FallThroughToChain {
                 reason: "unknown provider kind in agent.default_provider",
@@ -407,7 +659,17 @@ fn decide_default_provider(
         };
     }
 
-    let model = resolve_provider_model(config, provider_kind, None)
+    // The default entry's OWN model first: `resolve_provider_model` looks up
+    // `llm.<kind>` before anything else, so with `default_provider: lmstudio`
+    // (kind `openai`) next to an `llm.openai` it used to send llm.openai's
+    // model name to the LM Studio endpoint.
+    let model = cfg
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| resolve_provider_model(config, provider_kind, None))
         .unwrap_or_else(|| hardcoded_default_model(provider_kind));
 
     DefaultProviderDecision::UseDefault {
@@ -417,6 +679,54 @@ fn decide_default_provider(
     }
 }
 
+/// #1180 — one stop of the legacy autodetect chain, the heuristic that runs
+/// when `agent.default_provider` is absent or unusable (a fresh clone, an
+/// `install.sh --skip-setup`, a hand-written config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutodetectCandidate {
+    Anthropic,
+    OpenAi,
+    OpenRouter,
+    Ollama,
+}
+
+/// #1180 decision 2 — "the cloud is always the first option, unless the user
+/// asks otherwise". This function is where that sentence is true in code.
+///
+/// The chain used to try Ollama **first**, unconditionally: a box with
+/// `OPENROUTER_API_KEY` exported and a stray `ollama serve` running would
+/// silently answer from the local model, contradicting both the issue and
+/// `README.md`. Now the providers whose credentials actually exist come
+/// first, in the order they already had among themselves
+/// (Anthropic → OpenAI → OpenRouter), and Ollama is what is left when none
+/// of them does — which is exactly the local fallback #1180 wants to keep.
+///
+/// Ollama is always in the returned list, always last: it is the only
+/// provider that needs no credential, so it is the only one that can be the
+/// unconditional end of the chain. Its health check still has to pass; the
+/// caller falls through to an offline Ollama handle if it does not.
+///
+/// Pure on purpose — `detect_provider` itself needs a daemon and a network,
+/// so the ordering is tested here instead of there.
+fn autodetect_order(
+    has_anthropic_credential: bool,
+    has_openai_credential: bool,
+    has_openrouter_credential: bool,
+) -> Vec<AutodetectCandidate> {
+    let mut order = Vec::with_capacity(4);
+    if has_anthropic_credential {
+        order.push(AutodetectCandidate::Anthropic);
+    }
+    if has_openai_credential {
+        order.push(AutodetectCandidate::OpenAi);
+    }
+    if has_openrouter_credential {
+        order.push(AutodetectCandidate::OpenRouter);
+    }
+    order.push(AutodetectCandidate::Ollama);
+    order
+}
+
 /// GAR-576 — Last-resort fallback model name per provider kind, used
 /// only when neither the CLI flag nor `config.llm` supplies one.
 ///
@@ -424,35 +734,26 @@ fn decide_default_provider(
 /// both route through here rather than repeating the literals inline, so the
 /// two paths cannot disagree about what "the default" means.
 pub(crate) fn hardcoded_default_model(provider_kind: &str) -> String {
+    // The two project defaults (issue #1180) are keyed by the shared
+    // constants rather than by a literal, so a rename in `crate::defaults`
+    // cannot leave this table pointing at a provider kind that no longer
+    // exists.
     match provider_kind {
-        // `qwen3.8:latest` == `qwen3.8:27b` (Q4_K_M, ~18 GB, 262 144-token
-        // context, vision + tools). Kept byte-identical to
-        // `garraia_agents::ollama::DEFAULT_MODEL`.
-        "ollama" => "qwen3.8:latest",
+        // The local *second* option — see `crate::defaults`.
+        crate::defaults::DEFAULT_LOCAL_PROVIDER => crate::defaults::DEFAULT_LOCAL_MODEL,
         // llama-server serves whatever model it was started with; the
         // OpenAI-compatible API accepts any string here — `default` matches
         // `garraia_agents::llama_cpp::DEFAULT_MODEL` byte-for-byte.
         "llamacpp" => "default",
         "anthropic" => "claude-sonnet-4-5-20250929",
         "openai" => "gpt-4o",
-        "openrouter" => "openrouter/auto",
+        // The official project default. Never `openrouter/auto`: `auto`
+        // stays reachable only when the user passes it explicitly.
+        crate::defaults::DEFAULT_CLOUD_PROVIDER => crate::defaults::DEFAULT_CLOUD_MODEL,
         "echo" => "echo-stub",
         _ => "auto",
     }
     .to_string()
-}
-
-/// Base URL do `llamacpp` — precedência `--url` > `config.llm["llamacpp"]`.
-///
-/// Retorna `None` quando nenhuma fonte fornece URL e o provider usa o
-/// default interno (`http://localhost:8080`). Extraído como função pura
-/// para que a precedência seja afirmável em teste (o provider devolvido
-/// pelo arm é um `Arc<dyn LlmProvider>` sem downcast).
-fn resolve_llamacpp_base_url(config: &AppConfig, url_override: Option<&str>) -> Option<String> {
-    url_override
-        .filter(|u| !u.is_empty())
-        .map(|u| u.to_string())
-        .or_else(|| config.llm.get("llamacpp").and_then(|c| c.base_url.clone()))
 }
 
 /// GAR-576 — Construct an [`LlmProvider`] from a config-resolved default.
@@ -460,170 +761,112 @@ fn resolve_llamacpp_base_url(config: &AppConfig, url_override: Option<&str>) -> 
 /// Returns `None` when construction is infeasible (e.g. Ollama daemon
 /// unreachable, or required api_key absent at build time); the caller
 /// then falls through to the legacy autodetect chain.
+///
+/// Endpoint AND credential come from the `llm.<config_key>` entry itself
+/// ([`provider_binding::bind_entry`]). This used to read the key from
+/// `llm.<kind>` instead, so `default_provider: lmstudio` (kind `openai`)
+/// next to an `llm.openai` sent llm.openai's key to the LM Studio endpoint,
+/// and an `anthropic` default dropped its `base_url` entirely.
 async fn try_build_default_provider(
-    config: &AppConfig,
-    provider_kind: &str,
+    config_key: &str,
     cfg: &garraia_config::LlmProviderConfig,
     model: &str,
+    env: provider_binding::Env<'_>,
 ) -> Option<Arc<dyn LlmProvider>> {
     // GAR-576: return ONLY the trait object — the display strings
     // (config_key, model) are formed at the call site from inputs that
     // never pass through this function. That keeps CodeQL's cleartext-
     // logging dataflow analysis from conservatively tainting the model
-    // name through this scope, which also calls `get_api_key`.
-    match provider_kind {
-        "ollama" => {
-            let ollama = OllamaProvider::new(Some(model.to_string()), cfg.base_url.clone());
-            if !ollama.health_check().await.unwrap_or(false) {
-                return None;
-            }
-            Some(Arc::new(ollama) as Arc<dyn LlmProvider>)
-        }
-        "llamacpp" => {
-            let llama = LlamaCppProvider::new(Some(model.to_string()), cfg.base_url.clone(), None);
-            if !llama.health_check().await.unwrap_or(false) {
-                return None;
-            }
-            Some(Arc::new(llama) as Arc<dyn LlmProvider>)
-        }
-        "anthropic" => {
-            let key = get_api_key(config, "anthropic", "ANTHROPIC_API_KEY")?;
-            let ap = AnthropicProvider::new(&key, Some(model.to_string()), None);
-            Some(Arc::new(ap) as Arc<dyn LlmProvider>)
-        }
-        "openai" => {
-            // OpenAI-compatible local backends (e.g. LM Studio) usually
-            // omit the api_key; accept "not-needed" when `base_url` is set.
-            let key = get_api_key(config, "openai", "OPENAI_API_KEY").or_else(|| {
-                if cfg.base_url.is_some() {
-                    Some("not-needed".to_string())
-                } else {
-                    None
-                }
-            })?;
-            let op = OpenAiProvider::new(&key, Some(model.to_string()), cfg.base_url.clone());
-            Some(Arc::new(op) as Arc<dyn LlmProvider>)
-        }
-        "openrouter" => {
-            let key = get_api_key(config, "openrouter", "OPENROUTER_API_KEY")?;
-            let base = cfg
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
-            // GAR-582: name the provider "openrouter" so AgentRuntime's
-            // lookup-by-name resolves correctly. Without this, the runtime
-            // emits `WARN Provider 'openrouter' not found, falling back to default`.
-            let op = OpenAiProvider::new(&key, Some(model.to_string()), Some(base))
-                .with_name("openrouter");
-            Some(Arc::new(op) as Arc<dyn LlmProvider>)
-        }
-        _ => None,
+    // name through this scope, which also resolves the api_key.
+    let binding = provider_binding::bind_entry(config_key, cfg, env);
+    let provider = provider_binding::build_provider(&binding, model, None, None).ok()?;
+    // Local daemons are health-checked: a dead one must not win over the
+    // autodetect chain.
+    if matches!(binding.kind(), "ollama" | "llamacpp")
+        && !provider.health_check().await.unwrap_or(false)
+    {
+        return None;
     }
+    Some(provider)
 }
 
-/// GAR-579 — Build a provider from an explicit `--provider <kind>` flag.
+/// Model for an explicitly named provider: `--model` > the bound entry's own
+/// model > `resolve_provider_model` (legacy scan by kind) > the per-kind
+/// hardcoded default.
+fn explicit_model(
+    config: &AppConfig,
+    binding: &provider_binding::ProviderBinding,
+    model_override: Option<&str>,
+) -> String {
+    model_override
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| binding.model().map(str::to_string))
+        .or_else(|| resolve_provider_model(config, binding.kind(), None))
+        .unwrap_or_else(|| hardcoded_default_model(binding.kind()))
+}
+
+/// GAR-579 — Build a provider from an explicit `--provider <name>` flag.
 ///
 /// Returns the same `(display_name, model, Arc<dyn LlmProvider>)` triple
-/// that `detect_provider` returns. Honors `model_override` first, then
-/// `config.llm[*].model` via `resolve_provider_model`, then a hardcoded
-/// per-kind fallback. Unknown `kind` is an error; missing api_key for a
+/// that `detect_provider` returns. Honors `model_override` first, then the
+/// bound entry's model, then `resolve_provider_model`, then a hardcoded
+/// per-kind fallback. An unknown name is an error; a missing api_key for a
 /// cloud provider is an error.
 ///
-/// `url_override` is the CLI `--url` flag. Today only the `llamacpp` arm
-/// consumes it (the keyless local providers are exactly where an ad-hoc
-/// URL matters most); the cloud arms keep their fixed endpoints.
+/// `name` is a provider kind (`openai`, `anthropic`, …) or an alias defined
+/// under `llm:` (`lmstudio` with `provider: openai`) — the MCP policy already
+/// accepted aliases, this is where they now resolve. Endpoint and
+/// credential come from the same entry ([`provider_binding::bind_named`]):
+/// `-p openai` used to read `llm.openai.api_key` and drop
+/// `llm.openai.base_url`, sending the key of a custom OpenAI-compatible
+/// endpoint to https://api.openai.com (v0.4.4 clean-install smoke).
 ///
-/// Shared by `chat::run_chat` and `ask::run_ask` so the explicit-provider
-/// path lives in exactly one place.
+/// `url_override` is the CLI `--url` flag. Only the keyless `llamacpp`
+/// consumes it; on a keyed provider it would ship the entry's key to an
+/// ad-hoc address.
+///
+/// Shared by `chat::run_chat`, `ask::run_ask` and the MCP tools so the
+/// explicit-provider path lives in exactly one place.
 pub(crate) fn select_explicit_provider(
     config: &AppConfig,
-    kind: &str,
+    name: &str,
     model_override: Option<&str>,
     url_override: Option<&str>,
 ) -> Result<(String, String, Arc<dyn LlmProvider>)> {
-    match kind {
-        "ollama" => {
-            let model = resolve_provider_model(config, "ollama", model_override)
-                .unwrap_or_else(|| hardcoded_default_model("ollama"));
-            let ollama = OllamaProvider::new(Some(model.clone()), None);
-            Ok((
-                "ollama".to_string(),
-                model,
-                Arc::new(ollama) as Arc<dyn LlmProvider>,
-            ))
-        }
-        "llamacpp" => {
-            let model = resolve_provider_model(config, "llamacpp", model_override)
-                .unwrap_or_else(|| hardcoded_default_model("llamacpp"));
-            let base_url = resolve_llamacpp_base_url(config, url_override);
-            let llama = LlamaCppProvider::new(Some(model.clone()), base_url, None);
-            Ok((
-                "llamacpp".to_string(),
-                model,
-                Arc::new(llama) as Arc<dyn LlmProvider>,
-            ))
-        }
-        "anthropic" => {
-            let key = get_api_key(config, "anthropic", "ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY not set and not found in config")?;
-            let model = resolve_provider_model(config, "anthropic", model_override)
-                .unwrap_or_else(|| hardcoded_default_model("anthropic"));
-            let ap = AnthropicProvider::new(&key, Some(model.clone()), None);
-            Ok((
-                "anthropic".to_string(),
-                model,
-                Arc::new(ap) as Arc<dyn LlmProvider>,
-            ))
-        }
-        "openai" => {
-            let key = get_api_key(config, "openai", "OPENAI_API_KEY")
-                .context("OPENAI_API_KEY not set and not found in config")?;
-            let model = resolve_provider_model(config, "openai", model_override)
-                .unwrap_or_else(|| hardcoded_default_model("openai"));
-            let op = OpenAiProvider::new(&key, Some(model.clone()), None);
-            Ok((
-                "openai".to_string(),
-                model,
-                Arc::new(op) as Arc<dyn LlmProvider>,
-            ))
-        }
-        "openrouter" => {
-            let key = get_api_key(config, "openrouter", "OPENROUTER_API_KEY")
-                .context("OPENROUTER_API_KEY not set and not found in config")?;
-            let model = resolve_provider_model(config, "openrouter", model_override)
-                .unwrap_or_else(|| hardcoded_default_model("openrouter"));
-            // GAR-582: name the provider "openrouter" so AgentRuntime's
-            // lookup-by-name resolves correctly (avoids WARN at request time).
-            let op = OpenAiProvider::new(
-                &key,
-                Some(model.clone()),
-                Some("https://openrouter.ai/api/v1".to_string()),
-            )
-            .with_name("openrouter");
-            Ok((
-                "openrouter".to_string(),
-                model,
-                Arc::new(op) as Arc<dyn LlmProvider>,
-            ))
-        }
-        // Dev/CI only: o EchoProvider keyless (feature `dev-echo-provider`)
-        // fica acessível também por `ask`/`mcp-server`, não só pelo gateway —
-        // é o que permite smoke-testar o pipeline `garra_ask` sem API key.
-        #[cfg(feature = "dev-echo-provider")]
-        "echo" => {
-            let model = resolve_provider_model(config, "echo", model_override)
-                .unwrap_or_else(|| hardcoded_default_model("echo"));
-            let echo = garraia_agents::EchoProvider::new(Some(model.clone()));
-            Ok((
-                "echo".to_string(),
-                model,
-                Arc::new(echo) as Arc<dyn LlmProvider>,
-            ))
-        }
-        other => anyhow::bail!(
-            "Provider desconhecido: {other}. Use: ollama, llamacpp, anthropic, openai, openrouter"
-        ),
-    }
+    select_explicit_provider_with_env(
+        config,
+        name,
+        model_override,
+        url_override,
+        &provider_binding::process_env,
+    )
+}
+
+/// [`select_explicit_provider`] with the environment injected, so tests pin
+/// the env-var fallback without touching the process environment.
+fn select_explicit_provider_with_env(
+    config: &AppConfig,
+    name: &str,
+    model_override: Option<&str>,
+    url_override: Option<&str>,
+    env: provider_binding::Env<'_>,
+) -> Result<(String, String, Arc<dyn LlmProvider>)> {
+    let Some(binding) = provider_binding::bind_named(config, name, env) else {
+        anyhow::bail!(
+            "Provider desconhecido: {name}. Use: ollama, llamacpp, anthropic, openai, openrouter \
+             (ou o nome de uma entrada em llm: no config.yml)"
+        );
+    };
+    let model = explicit_model(config, &binding, model_override);
+    // An OpenAI-compatible alias registers under its own name (GAR-582), so
+    // a lookup by that name resolves. The other kinds cannot be renamed and
+    // register as their kind; callers that look the provider up by name
+    // (the MCP agent) therefore ask for `provider.provider_id()`, never for
+    // the name that was typed.
+    let provider_id = (!provider_binding::is_buildable_kind(name)).then_some(name);
+    let provider = provider_binding::build_provider(&binding, &model, provider_id, url_override)?;
+    Ok((name.to_string(), model, provider))
 }
 
 /// Base URL of the local Ollama daemon. Extracted so the autodetect chain
@@ -795,20 +1038,44 @@ async fn offer_pull_ollama_model(
 /// over every configured model, and — when it names a tag the local Ollama
 /// daemon has installed — it also selects the provider (see
 /// [`try_local_ollama_model`]).
+/// A chave que o [`detect_provider`] devolve quando nada respondeu: nenhum
+/// provider configurado, nenhuma chave no ambiente e nenhum Ollama local com
+/// saude. Quem precisa distinguir "achei um provider" de "sobrou o palpite"
+/// (o `max-power`, que tem caminho offline) compara com ela.
+pub(crate) const OLLAMA_ULTIMO_RECURSO: &str = "ollama (offline)";
+
 pub async fn detect_provider(
     config: &AppConfig,
     url_override: Option<&str>,
     model_override: Option<&str>,
     assume_yes: bool,
 ) -> (String, String, Arc<dyn LlmProvider>) {
+    detect_provider_with_env(
+        config,
+        url_override,
+        model_override,
+        assume_yes,
+        &provider_binding::process_env,
+    )
+    .await
+}
+
+/// [`detect_provider`] with the environment injected, so tests pin every
+/// env-var fallback without touching the process environment.
+async fn detect_provider_with_env(
+    config: &AppConfig,
+    url_override: Option<&str>,
+    model_override: Option<&str>,
+    assume_yes: bool,
+    env: provider_binding::Env<'_>,
+) -> (String, String, Arc<dyn LlmProvider>) {
     // 0. If a custom URL is provided, use OpenAI-compatible provider (LM Studio, vLLM, etc.)
     if let Some(url) = url_override {
         let base = url.trim_end_matches('/').to_string();
-        // Try multiple env vars for the API key (LM Studio may require auth)
-        let key = std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
-            .or_else(|_| std::env::var("GARRAIA_EMBEDDING_API_KEY"))
-            .unwrap_or_else(|_| "not-needed".to_string());
+        // An ad-hoc address gets `LLM_API_KEY` or the key of the `llm:` entry
+        // that describes that same address — never `OPENAI_API_KEY` or
+        // `GARRAIA_EMBEDDING_API_KEY`, which belong to other endpoints.
+        let key = provider_binding::credential_for_ad_hoc_url(config, &base, env);
         let provider = OpenAiProvider::new(
             &key,
             None, // model will be set from --model flag or default
@@ -853,7 +1120,7 @@ pub async fn detect_provider(
     // autodetect chain below. This prevents a stale `OPENAI_API_KEY` loaded
     // from cwd `.env` (via `dotenvy::dotenv()` in main.rs) from hijacking the
     // provider when the operator explicitly configured a different default.
-    let env_has = |name: &str| std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false);
+    let env_has = |name: &str| env(name).is_some_and(|v| !v.is_empty());
     let decision = decide_default_provider(
         config,
         env_has("OPENAI_API_KEY"),
@@ -862,90 +1129,86 @@ pub async fn detect_provider(
     );
     if let DefaultProviderDecision::UseDefault {
         config_key,
-        provider_kind,
+        provider_kind: _,
         model,
     } = decision
-        // `--model` outranks the configured default. With `None` this
-        // reproduces `decide_default_provider`'s own lookup exactly.
-        && let model = resolve_provider_model(config, &provider_kind, model_override)
+        // `--model` outranks the configured default.
+        && let model = model_override
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
             .unwrap_or(model)
         && let Some(cfg) = config.llm.get(&config_key)
-        && let Some(provider) =
-            try_build_default_provider(config, &provider_kind, cfg, &model).await
+        && let Some(provider) = try_build_default_provider(&config_key, cfg, &model, env).await
     {
         // GAR-576: form the display tuple here from the (untainted)
         // strings returned by `decide_default_provider` — they never
-        // pass through the function that calls `get_api_key`.
+        // pass through the function that resolves the api_key.
         return (config_key, model, provider);
         // If construction fails (e.g. Ollama health-check fails) the
         // outer `if-let` chain shorts out and we fall through to the
         // legacy autodetect chain below.
     }
 
-    // Every branch below resolves its model through `resolve_provider_model`,
-    // so `--model` is honored whichever provider wins — and the returned
+    // Every branch below resolves its model through `explicit_model`, so
+    // `--model` is honored whichever provider wins — and the returned
     // provider object always carries the model it will actually be asked for.
     let ollama_url = ollama_base_url();
+    let model = resolve_provider_model(config, DEFAULT_LOCAL_PROVIDER, model_override)
+        .unwrap_or_else(|| hardcoded_default_model(DEFAULT_LOCAL_PROVIDER));
 
-    // 1. Try Ollama first (local, offline)
-    let model = resolve_provider_model(config, "ollama", model_override)
-        .unwrap_or_else(|| hardcoded_default_model("ollama"));
-    let ollama = OllamaProvider::new(Some(model.clone()), Some(ollama_url.clone()));
-    if ollama.health_check().await.unwrap_or(false) {
-        return (
-            "ollama".to_string(),
-            model,
-            Arc::new(ollama) as Arc<dyn LlmProvider>,
-        );
+    // #1180 decision 2 — the cloud is the first option unless the user asked
+    // for something else. The credentials are resolved up front (cheap: env
+    // var + `config.llm` lookup, no network, no vault) because the ORDER of
+    // the chain depends on which of them exist, and that ordering decision
+    // lives in a pure function so it can be tested without a daemon.
+    //
+    // Each candidate is bound WHOLE — endpoint and credential from the same
+    // `llm:` entry. The chain used to take only the key (`llm.<kind>` or
+    // `llm.main`) and pair it with the kind's default host, dropping the
+    // entry's `base_url`: a proxy key went to api.openai.com / api.anthropic.com
+    // / openrouter.ai. An `llm.<kind>` that declares another `provider:` no
+    // longer erases the candidate — see `bind_autodetect`.
+    let anthropic = provider_binding::bind_autodetect(config, "anthropic", env);
+    let openai = provider_binding::bind_autodetect(config, "openai", env);
+    let openrouter = provider_binding::bind_autodetect(config, DEFAULT_CLOUD_PROVIDER, env);
+
+    for candidate in autodetect_order(anthropic.is_some(), openai.is_some(), openrouter.is_some()) {
+        let (name, binding) = match candidate {
+            AutodetectCandidate::Anthropic => ("anthropic", anthropic.as_ref()),
+            AutodetectCandidate::OpenAi => ("openai", openai.as_ref()),
+            AutodetectCandidate::OpenRouter => (DEFAULT_CLOUD_PROVIDER, openrouter.as_ref()),
+            AutodetectCandidate::Ollama => {
+                let ollama = OllamaProvider::new(Some(model.clone()), Some(ollama_url.clone()));
+                if ollama.health_check().await.unwrap_or(false) {
+                    return (
+                        DEFAULT_LOCAL_PROVIDER.to_string(),
+                        model,
+                        Arc::new(ollama) as Arc<dyn LlmProvider>,
+                    );
+                }
+                continue;
+            }
+        };
+        let Some(binding) = binding else {
+            continue;
+        };
+        let model = explicit_model(config, binding, model_override);
+        // An `llm.openrouter` declaring `provider: openai` registers under
+        // the entry's name, like an alias on the explicit path (GAR-582).
+        let provider_id = (binding.kind() != name).then_some(name);
+        let Ok(provider) = provider_binding::build_provider(binding, &model, provider_id, None)
+        else {
+            continue;
+        };
+        return (name.to_string(), model, provider);
     }
 
-    // 2. Try Anthropic (cloud)
-    if let Some(key) = get_api_key(config, "anthropic", "ANTHROPIC_API_KEY") {
-        let model = resolve_provider_model(config, "anthropic", model_override)
-            .unwrap_or_else(|| hardcoded_default_model("anthropic"));
-        let provider = AnthropicProvider::new(&key, Some(model.clone()), None);
-        return (
-            "anthropic".to_string(),
-            model,
-            Arc::new(provider) as Arc<dyn LlmProvider>,
-        );
-    }
-
-    // 3. Try OpenAI (cloud)
-    if let Some(key) = get_api_key(config, "openai", "OPENAI_API_KEY") {
-        let model = resolve_provider_model(config, "openai", model_override)
-            .unwrap_or_else(|| hardcoded_default_model("openai"));
-        let provider = OpenAiProvider::new(&key, Some(model.clone()), None);
-        return (
-            "openai".to_string(),
-            model,
-            Arc::new(provider) as Arc<dyn LlmProvider>,
-        );
-    }
-
-    // 4. Try OpenRouter (cloud fallback)
-    if let Some(key) = get_api_key(config, "openrouter", "OPENROUTER_API_KEY") {
-        let model = resolve_provider_model(config, "openrouter", model_override)
-            .unwrap_or_else(|| hardcoded_default_model("openrouter"));
-        // GAR-582: name the provider "openrouter" so AgentRuntime's
-        // lookup-by-name resolves correctly (avoids WARN at request time).
-        let provider = OpenAiProvider::new(
-            &key,
-            Some(model.clone()),
-            Some("https://openrouter.ai/api/v1".to_string()),
-        )
-        .with_name("openrouter");
-        return (
-            "openrouter".to_string(),
-            model,
-            Arc::new(provider) as Arc<dyn LlmProvider>,
-        );
-    }
-
-    // 5. Fallback: Ollama with no health check (user will see error on first message)
+    // Last resort: Ollama with no health check (user will see the error on
+    // the first message). Nothing else is left to try — this is the only
+    // provider that needs no credential at all.
     let ollama = OllamaProvider::new(Some(model.clone()), Some(ollama_url));
     (
-        "ollama (offline)".to_string(),
+        OLLAMA_ULTIMO_RECURSO.to_string(),
         model,
         Arc::new(ollama) as Arc<dyn LlmProvider>,
     )
@@ -1129,6 +1392,11 @@ fn render_turn_event(
 }
 
 /// Run the interactive chat REPL.
+///
+/// Devolve o codigo de saida do processo: `0` para `/exit` e Ctrl+D, `130`
+/// quando o Ctrl+C no prompt chega pelo editor de linha (#1297) — o mesmo
+/// codigo que o vigia de SIGINT sempre deu no caminho sem editor. `Err` fica
+/// para falha de verdade (I/O, provider), como antes.
 pub async fn run_chat(
     config: AppConfig,
     provider_override: Option<String>,
@@ -1138,7 +1406,7 @@ pub async fn run_chat(
     assume_yes: bool,
     persist: bool,
     resume: Option<String>,
-) -> Result<()> {
+) -> Result<i32> {
     // An explicit `--provider` short-circuits detection entirely; otherwise
     // `detect_provider` owns both the provider *and* the model, so the two can
     // no longer disagree (previously `--model` without `--provider` swapped
@@ -1214,6 +1482,7 @@ pub async fn run_chat(
     runtime.register_provider(provider);
     register_cli_tools(
         &runtime,
+        &config,
         Some(review),
         get_api_key(&config, "brave", "BRAVE_API_KEY"),
         config.agent.bash_allowlist.clone(),
@@ -1248,13 +1517,25 @@ pub async fn run_chat(
     // `--resume` fica `None` — nenhum banco aberto, nenhum arquivo criado —
     // e o chat segue vivendo apenas na memoria, como sempre viveu.
     let store = open_chat_store(&config, persist, resume.as_deref())?;
+    // Um renderer para a sessao inteira; cada turno o rearma com a animacao
+    // daquele turno (#942). O rotulo `Garra` e a ordem de escrita passam a ser
+    // responsabilidade dele — ver ADR 0017.
+    let mut renderer = TerminalRenderer::new(caps, None);
     // Retomar e adotar o id que veio da linha de comando; comecar do zero e
     // sortear um. Nos dois casos o id aparece na tela (abaixo) justamente
     // para poder ser digitado de volta no `--resume`.
-    let session_id = match resume.as_deref() {
-        Some(id) => id.to_string(),
-        None => format!("cli-{}", uuid::Uuid::new_v4()),
-    };
+    //
+    // #1300: `--resume` sem valor (ou `--resume latest`) aponta para a
+    // ultima atividade do canal CLI — o turno interrompido de minutos atras,
+    // nao uma sessao antiga qualquer. Sem alvo, comeca nova e avisa abaixo.
+    let (mut session_id, comecou_nova) = id_inicial_da_sessao(
+        resume.as_deref(),
+        store
+            .as_ref()
+            .and_then(|s| s.latest_session_id("cli").ok())
+            .flatten(),
+        format!("cli-{}", uuid::Uuid::new_v4()),
+    );
     // Ja vem cheio quando ha `--resume`; a carga acontece abaixo, depois do
     // renderer existir, para a contagem sair pela mesma moldura das outras
     // mensagens da sessao.
@@ -1265,10 +1546,6 @@ pub async fn run_chat(
     // Semente do indicador de atividade: roda a mensagem de abertura a
     // cada turno, para dois envios seguidos não começarem com a mesma frase.
     let mut turn_index: usize = 0;
-    // Um renderer para a sessao inteira; cada turno o rearma com a animacao
-    // daquele turno (#942). O rotulo `Garra` e a ordem de escrita passam a ser
-    // responsabilidade dele — ver ADR 0017.
-    let mut renderer = TerminalRenderer::new(caps, None);
 
     // Aviso e carga da persistencia (#1088). Fica aqui, e nao junto da
     // abertura do store, porque a contagem de turnos recuperados sai pela
@@ -1276,7 +1553,17 @@ pub async fn run_chat(
     // que ignoraria `NO_COLOR` e pipe.
     if let Some(ref store) = store {
         let db = config.resolved_data_dir().join(SESSIONS_DB);
-        if resume.is_some() {
+        if resume.is_some() && comecou_nova {
+            // `--resume latest` sem alvo: primeiro uso (ou banco limpo) e
+            // boot legitimo — avisa e segue, sem derrubar o programa.
+            renderer.handle(
+                UiEvent::Warning(&format!(
+                    "Nenhuma sessao anterior encontrada em {} — comecando sessao nova: {session_id}",
+                    db.display()
+                )),
+                &mut io::stdout(),
+            );
+        } else if resume.is_some() {
             let carregadas = load_history(store, &session_id, RESUME_LIMIT)?;
             // Cada turno comeca com uma pergunta. Contar `user` e mais
             // honesto que `len / 2` quando a hidratacao do gateway deixou
@@ -1342,6 +1629,35 @@ pub async fn run_chat(
         }
     }
 
+    // De onde vem cada linha (#1297). Editor de linha (setas, historico,
+    // edicao) so quando ha um humano num terminal — stdin, stdout e stderr
+    // —; pipe e CI seguem no `read_line` byte a byte de sempre. A decisao e
+    // uma so, no boot, e o `Capabilities::detect` acima nao serve para ela:
+    // `NO_COLOR` e `TERM=dumb` tiram a cor, nao as setas.
+    let usar_editor = {
+        use std::io::IsTerminal as _;
+        crate::chat_input::editor_de_linha_cabe(
+            io::stdin().is_terminal(),
+            io::stdout().is_terminal(),
+            io::stderr().is_terminal(),
+        )
+    };
+    // Historico em disco so quando a sessao e persistida (#1088): sem
+    // `--persist`/`--resume` nada e escrito, e o que se digita e tao sensivel
+    // quanto a resposta. `store.is_some()` e exatamente esse criterio. As
+    // setas funcionam do mesmo jeito; o historico so nao sobrevive ao
+    // processo.
+    let historico = store
+        .is_some()
+        .then(|| crate::chat_input::caminho_do_historico(&crate::garraia_dir()));
+    let mut leitor = crate::chat_input::LeitorDeLinha::abrir(usar_editor, historico);
+    // Historico que nao abre e aviso, nao erro: o chat vale mais que as setas.
+    for aviso in leitor.drenar_avisos() {
+        renderer.handle(UiEvent::Warning(&aviso), &mut io::stdout());
+    }
+    let prompt_cru = style.user_prompt_plain();
+    let prompt = style.user_prompt();
+
     // Dono único do SIGINT.
     //
     // `tokio::signal::ctrl_c()` instala um handler que substitui o
@@ -1355,6 +1671,21 @@ pub async fn run_chat(
     // Com um dono único os dois casos ficam corretos:
     //   - durante o turno  -> cancela o turno e devolve o prompt;
     //   - ocioso no prompt -> encerra a sessão, como sempre encerrou.
+    //
+    // O editor de linha (#1297) nao muda quem e o dono — o rustyline entra
+    // com a feature `signal-hook`, e e ELA que o impede de instalar o proprio
+    // `sigaction(SIGINT)` a cada `readline` (sem ela haveria um segundo
+    // handler disputando com este, e um `kill -INT` no prompt nunca chegaria
+    // aqui) —, muda por onde o Ctrl+C do teclado chega quando o prompt esta
+    // ocioso: em raw mode o terminal nao gera SIGINT (`ISIG` desligado), a
+    // tecla vira `Leitura::Interrompida` no loop abaixo, e o loop encerra com
+    // o mesmo 130 de sempre. Durante o turno o terminal ja voltou ao modo
+    // canonico, o Ctrl+C vira SIGINT e cai aqui, no cancelamento. O braco
+    // "ocioso" desta task continua valendo para o caminho sem editor e para
+    // um SIGINT externo (`kill -INT`) com o editor ligado — e nesse ultimo
+    // caso o terminal esta em raw mode, cujo guard de restauracao o `exit`
+    // pularia, deixando o shell do usuario sem eco. Por isso a fotografia dos
+    // atributos, devolvida antes de sair.
     let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
     let turn_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Uma so fonte para a despedida, usada aqui e no `/exit`. Com cor quando
@@ -1368,6 +1699,10 @@ pub async fn run_chat(
         let cancel = std::sync::Arc::clone(&cancel);
         let turn_active = std::sync::Arc::clone(&turn_active);
         let despedida = despedida.clone();
+        let terminal_original = leitor
+            .com_editor()
+            .then(crate::chat_input::fotografar_terminal)
+            .flatten();
         tokio::spawn(async move {
             loop {
                 if tokio::signal::ctrl_c().await.is_err() {
@@ -1381,6 +1716,9 @@ pub async fn run_chat(
                     // A despedida sai pelo estilo detectado: dentro da task
                     // nao ha `&mut renderer`, entao o texto e montado antes e
                     // movido para ca ja pronto (#940).
+                    if let Some(estado) = terminal_original.as_ref() {
+                        crate::chat_input::restaurar_terminal(estado);
+                    }
                     println!("\n{despedida}");
                     let _ = io::stdout().flush();
                     std::process::exit(130);
@@ -1388,19 +1726,28 @@ pub async fn run_chat(
             }
         });
     }
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
 
+    let mut codigo_de_saida = 0;
     loop {
-        // Prompt
-        print!("{}", style.user_prompt());
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        if reader.read_line(&mut input)? == 0 {
-            // EOF (Ctrl+D)
-            println!("\n{despedida}");
-            break;
+        let input = match leitor.ler(&prompt_cru, &prompt)? {
+            crate::chat_input::Leitura::Linha(linha) => linha,
+            crate::chat_input::Leitura::Fim => {
+                // EOF (Ctrl+D) encerra como `/exit`. O leitor ja deixou o
+                // cursor numa linha nova, nos dois caminhos.
+                println!("{despedida}");
+                break;
+            }
+            crate::chat_input::Leitura::Interrompida => {
+                // Ctrl+C no prompt ocioso, entregue pelo editor em raw mode.
+                // Mesmo desfecho do vigia acima: despedida e 130 — so que
+                // pelo `return`, com o terminal ja restaurado pelo editor.
+                println!("{despedida}");
+                codigo_de_saida = 130;
+                break;
+            }
+        };
+        for aviso in leitor.drenar_avisos() {
+            renderer.handle(UiEvent::Warning(&aviso), &mut io::stdout());
         }
 
         let input = input.trim().to_string();
@@ -1718,6 +2065,107 @@ pub async fn run_chat(
                 );
                 continue;
             }
+            // #1300: `/resume` retoma a SESSAO MAIS RECENTE — que, com a
+            // persistencia adiantada da pergunta, e o turno interrompido de
+            // minutos atras, nao uma sessao antiga. Com id, retoma esse id.
+            _ if input == "/resume" || input.starts_with("/resume ") => {
+                let Some(s) = store.as_ref() else {
+                    renderer.handle(
+                        UiEvent::Warning(
+                            "Sem persistencia nesta sessao: /resume precisa do banco de sessoes.",
+                        ),
+                        &mut io::stdout(),
+                    );
+                    renderer.handle(
+                        UiEvent::Hint("Reinicie com: garraia chat --resume  (ou --resume <id>)"),
+                        &mut io::stdout(),
+                    );
+                    continue;
+                };
+                let arg = input["/resume".len()..].trim();
+                let alvo = if arg.is_empty() {
+                    match s.latest_session_id("cli") {
+                        Ok(alvo) => alvo,
+                        Err(e) => {
+                            renderer.handle(
+                                UiEvent::Warning(&format!(
+                                    "Nao consegui achar a ultima sessao ({e}). Estado mantido."
+                                )),
+                                &mut io::stdout(),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    Some(arg.to_string())
+                };
+                let Some(alvo) = alvo else {
+                    renderer.handle(
+                        UiEvent::Warning(
+                            "Nenhuma sessao anterior encontrada no banco desta sessao.",
+                        ),
+                        &mut io::stdout(),
+                    );
+                    continue;
+                };
+                if alvo == session_id {
+                    renderer.handle(
+                        UiEvent::Hint(&format!("Ja esta na sessao {alvo}.")),
+                        &mut io::stdout(),
+                    );
+                    continue;
+                }
+                match load_history(s, &alvo, RESUME_LIMIT) {
+                    Err(e) => renderer.handle(
+                        UiEvent::Warning(&format!(
+                            "Nao consegui carregar {alvo} ({e}). Estado mantido."
+                        )),
+                        &mut io::stdout(),
+                    ),
+                    Ok(carregadas) if carregadas.is_empty() => renderer.handle(
+                        UiEvent::Warning(&format!(
+                            "A sessao {alvo} nao tem historico. Estado mantido: {session_id}."
+                        )),
+                        &mut io::stdout(),
+                    ),
+                    Ok(carregadas) => {
+                        let turnos = carregadas
+                            .iter()
+                            .filter(|m| matches!(m.role, ChatRole::User))
+                            .count();
+                        // O fim da conversa hidratada diz se o ultimo turno
+                        // acabou interrompido — o resumo que a issue pede:
+                        // o que ficou pendente e por que parou.
+                        let interrompido = carregadas.last().and_then(|m| match &m.content {
+                            MessagePart::Text(t) if t.starts_with("[turno interrompido: ") => Some(
+                                t.trim_start_matches("[turno interrompido: ")
+                                    .trim_end_matches(']')
+                                    .to_string(),
+                            ),
+                            _ => None,
+                        });
+                        history = carregadas;
+                        session_id = alvo.clone();
+                        turn_index = turnos;
+                        renderer.handle(
+                            UiEvent::Hint(&format!(
+                                "Retomando {alvo}: {turnos} turno(s) recuperado(s)."
+                            )),
+                            &mut io::stdout(),
+                        );
+                        if let Some(motivo) = interrompido {
+                            renderer.handle(
+                                UiEvent::Warning(&format!(
+                                    "O ultimo turno desta sessao terminou interrompido ({motivo}); \
+                                     a pergunta dele esta no fim do historico."
+                                )),
+                                &mut io::stdout(),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             _ if input.starts_with("/model ") => {
                 let new_model = input[7..].trim();
                 if new_model.is_empty() {
@@ -1731,36 +2179,99 @@ pub async fn run_chat(
                 } else {
                     new_model.to_string()
                 };
-                // Advisory only: an unknown name is not fatal (the provider
-                // may serve models it does not list), but silently talking to
-                // a nonexistent model is a bad surprise.
-                if let Some(p) = runtime.default_provider()
-                    && let Ok(models) = p.available_models().await
-                    && !models.is_empty()
-                    && !models.contains(&resolved)
-                {
-                    // Migrado do `println!` com cor incondicional para o
-                    // renderer (#941): assim este aviso respeita `NO_COLOR` e
-                    // pipe como o resto da interface, que era exatamente a
-                    // divida que o plano de migracao da ADR 0017 registra.
-                    renderer.handle(
-                        UiEvent::Warning(&format!(
-                            "'{resolved}' nao aparece em /models deste provider."
-                        )),
-                        &mut io::stdout(),
-                    );
+                // #1298: a troca é transacional. Valida contra o catálogo
+                // REAL do provider (`validar_modelo`, não a lista curada que
+                // o ADR 0022 já provou insuficiente — `z-ai/glm-5.3-flash`
+                // vive fora dela) ANTES de tocar o estado. Qualquer falha —
+                // modelo ausente, provider indisponível, erro de rede — recusa
+                // fail-closed e deixa o estado anterior intacto.
+                let efeito = match runtime.default_provider() {
+                    Some(p) => match p.validar_modelo(&resolved).await {
+                        Ok(v) => efeito_da_validacao(&v),
+                        Err(e) => {
+                            renderer.handle(
+                                UiEvent::Warning(&format!(
+                                    "Nao consegui validar '{resolved}' no provider {provider_name}: {e}. Estado mantido."
+                                )),
+                                &mut io::stdout(),
+                            );
+                            renderer.handle(
+                                UiEvent::Hint("Tente de novo, ou use /models para ver o que o provider lista."),
+                                &mut io::stdout(),
+                            );
+                            continue;
+                        }
+                    },
+                    None => {
+                        renderer.handle(
+                            UiEvent::Warning(&format!(
+                                "Sem provider ativo para validar '{resolved}'. Estado mantido: provider {provider_name}, model {model_name}."
+                            )),
+                            &mut io::stdout(),
+                        );
+                        continue;
+                    }
+                };
+                let nota_de_catalogo = "  (encontrado no catalogo completo do OpenRouter, fora da lista curada de /models)";
+                let ressalva_sem_listagem =
+                    "  (provider nao expoe catalogo — troca aplicada sem validacao)";
+                match efeito {
+                    EfeitoTrocaDeModelo::RecusarEManterEstado => {
+                        renderer.handle(
+                            UiEvent::Warning(&format!(
+                                "'{resolved}' nao existe no catalogo de {provider_name}. Estado mantido: provider {provider_name}, model {model_name}."
+                            )),
+                            &mut io::stdout(),
+                        );
+                        renderer.handle(
+                            UiEvent::Hint(
+                                "Tente: /models para ver os nomes que este provider anuncia.",
+                            ),
+                            &mut io::stdout(),
+                        );
+                    }
+                    EfeitoTrocaDeModelo::Aplicar => {
+                        model_name = resolved;
+                        renderer.handle(
+                            UiEvent::Hint(&format!("Modelo alterado para: {model_name}")),
+                            &mut io::stdout(),
+                        );
+                        renderer.handle(
+                            UiEvent::Hint(&format!(
+                                "  (o provider continua {provider_name} — para trocar, reinicie com --provider ou --model)"
+                            )),
+                            &mut io::stdout(),
+                        );
+                    }
+                    EfeitoTrocaDeModelo::AplicarComNotaDeCatalogo => {
+                        model_name = resolved;
+                        renderer.handle(
+                            UiEvent::Hint(&format!("Modelo alterado para: {model_name}")),
+                            &mut io::stdout(),
+                        );
+                        renderer.handle(UiEvent::Hint(nota_de_catalogo), &mut io::stdout());
+                        renderer.handle(
+                            UiEvent::Hint(&format!(
+                                "  (o provider continua {provider_name} — para trocar, reinicie com --provider ou --model)"
+                            )),
+                            &mut io::stdout(),
+                        );
+                    }
+                    EfeitoTrocaDeModelo::AplicarSemValidacao => {
+                        model_name = resolved;
+                        renderer.handle(
+                            UiEvent::Hint(&format!("Modelo alterado para: {model_name}")),
+                            &mut io::stdout(),
+                        );
+                        renderer.handle(UiEvent::Hint(ressalva_sem_listagem), &mut io::stdout());
+                        renderer.handle(
+                            UiEvent::Hint(&format!(
+                                "  (o provider continua {provider_name} — para trocar, reinicie com --provider ou --model)"
+                            )),
+                            &mut io::stdout(),
+                        );
+                    }
                 }
-                model_name = resolved;
-                renderer.handle(
-                    UiEvent::Hint(&format!("Modelo alterado para: {model_name}")),
-                    &mut io::stdout(),
-                );
-                renderer.handle(
-                    UiEvent::Hint(&format!(
-                        "  (o provider continua {provider_name} — para trocar, reinicie com --provider ou --model)"
-                    )),
-                    &mut io::stdout(),
-                );
                 continue;
             }
             "/models" => {
@@ -1820,6 +2331,21 @@ pub async fn run_chat(
         // `stream_turn`, que o escreve junto do primeiro token. O indicador de
         // atividade ocupa esta linha enquanto o modelo pensa, e limpá-la
         // apagaria o rótulo se ele já estivesse na tela.
+        //
+        // #1300: a pergunta grava AGORA, antes do turno — não depois. Era o
+        // centro do bug do `/resume`: só o turno COMPLETO tocava o disco,
+        // então timeout, Ctrl+C, provider caindo ou um kill no meio deixavam
+        // a sessão restaurada terminando na pergunta anterior. Falha de
+        // gravação avisa e o turno segue — persistência não pode derrubar a
+        // conversa (#1088).
+        if let Some(ref store) = store
+            && let Err(e) = persist_user_turn(store, &session_id, &input)
+        {
+            renderer.handle(
+                UiEvent::Warning(&format!("Pergunta nao gravada: {e}")),
+                &mut io::stdout(),
+            );
+        }
         renderer.begin_turn(caps.spinner(turn_index));
         turn_index = turn_index.wrapping_add(1);
 
@@ -1837,7 +2363,7 @@ pub async fn run_chat(
         // de texto e nao pagam nada por isto.
         // Ligado a uma variavel porque o `call` e um future que vive alem
         // desta expressao — um temporario seria descartado antes do `await`.
-        let exec = ExecContext::with_working_dir(Some(cwd.clone()));
+        let exec = exec_do_turno(&cwd, &session_clone);
         let call = runtime.process_message_streaming_with_events(
             &session_clone,
             &input,
@@ -1869,6 +2395,20 @@ pub async fn run_chat(
         .await;
         turn_active.store(false, std::sync::atomic::Ordering::SeqCst);
 
+        // #1300: os tres fins inacabados gravam o marcador de interrupcao
+        // como mensagem do assistant, antes do cartao na tela. O
+        // `--resume` seguinte hidrata pergunta + marcador — o alvo do
+        // resume e a sessao desta conversa, nao uma antiga qualquer.
+        if let Some(ref store) = store
+            && let Some(marcador) = marcador_de_interrupcao(&outcome)
+            && let Err(e) = persist_assistant_turn(store, &session_id, marcador)
+        {
+            renderer.handle(
+                UiEvent::Warning(&format!("Marcador de interrupcao nao gravado: {e}")),
+                &mut stdout,
+            );
+        }
+
         match outcome {
             TurnOutcome::TimedOut => {
                 let cartao = ErrorCard::timeout_local(timeout_secs);
@@ -1893,14 +2433,16 @@ pub async fn run_chat(
                 println!();
 
                 // #1088: gravar e opcional e nao pode derrubar a conversa —
-                // disco cheio ou banco travado avisa e segue. Tambem nao e
-                // o caso de `save_session_summary`: sem um resumidor no CLI
-                // (ele mora no gateway) nao ha resumo honesto para gravar.
+                // disco cheio ou banco travado avisa e segue. A pergunta ja
+                // foi gravada no inicio do turno (#1300); aqui entra so o
+                // lado do assistant. Tambem nao e o caso de
+                // `save_session_summary`: sem um resumidor no CLI (ele mora
+                // no gateway) nao ha resumo honesto para gravar.
                 if let Some(ref store) = store
-                    && let Err(e) = append_turn(store, &session_id, &input, &full_response)
+                    && let Err(e) = persist_assistant_turn(store, &session_id, &full_response)
                 {
                     renderer.handle(
-                        UiEvent::Warning(&format!("Turno nao gravado: {e}")),
+                        UiEvent::Warning(&format!("Resposta nao gravada: {e}")),
                         &mut stdout,
                     );
                 }
@@ -1937,7 +2479,55 @@ pub async fn run_chat(
         println!();
     }
 
-    Ok(())
+    Ok(codigo_de_saida)
+}
+
+#[cfg(test)]
+mod testes_1225_s2 {
+    use super::*;
+
+    /// #1225 S2b: a policy de `agent.sandbox` chega as tools de programa
+    /// pelo ponto de registro de PRODUCAO. `mode = all` sem backend recusa
+    /// todo spawn sem consultar binario nenhum do host — deterministico, e
+    /// antes da S2b esta config deixava as tools rodarem no host.
+    async fn roda_recusada(
+        tool: std::sync::Arc<dyn garraia_agents::Tool>,
+        input: serde_json::Value,
+    ) {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ctx = garraia_agents::ToolContext {
+            session_id: "wiring-1225".into(),
+            user_id: None,
+            is_heartbeat: false,
+            approval: Default::default(),
+            working_dir: Some(dir.path().to_string_lossy().into_owned()),
+            project_id: None,
+        };
+        let out = tool.execute(&ctx, input).await;
+        let texto = match out {
+            Ok(o) => {
+                assert!(o.is_error, "{}: {o:?}", tool.name());
+                o.content
+            }
+            Err(e) => e.to_string(),
+        };
+        assert!(texto.contains("nenhum backend"), "{}: {texto}", tool.name());
+    }
+
+    #[tokio::test]
+    async fn sandbox_do_config_chega_as_tools_de_programa_do_chat() {
+        let mut config = AppConfig::default();
+        config.agent.sandbox.mode = garraia_config::SandboxMode::All;
+        let runtime = AgentRuntime::new();
+        register_cli_tools(&runtime, &config, None, None, Vec::new());
+        for (nome, input) in [
+            ("repo_search", serde_json::json!({"query": "x"})),
+            ("git_diff", serde_json::json!({"operation": "status"})),
+        ] {
+            let tool = runtime.find_tool(nome).expect("registrada");
+            roda_recusada(tool, input).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1950,6 +2540,62 @@ mod tests {
     use super::*;
     use garraia_config::{AgentConfig, AppConfig, LlmProviderConfig};
     use std::collections::HashMap;
+
+    // ── contexto de projeto (scan_directory_context) ────────────────────────
+
+    #[test]
+    fn contexto_filtra_diretorios_de_build_e_dependencia() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for dir in ["target", "node_modules", "dist", "src"] {
+            std::fs::create_dir_all(tmp.path().join(dir)).expect("mkdir");
+        }
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").expect("write");
+        let ctx = scan_directory_context(tmp.path().to_str().expect("utf8"));
+        assert!(ctx.contains("src"), "src deve aparecer: {ctx}");
+        assert!(!ctx.contains("target"), "target deve ser filtrado: {ctx}");
+        assert!(
+            !ctx.contains("node_modules"),
+            "node_modules deve ser filtrado: {ctx}"
+        );
+        assert!(!ctx.contains("dist"), "dist deve ser filtrado: {ctx}");
+    }
+
+    #[test]
+    fn contexto_inclui_nome_do_projeto_do_readme() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("README.md"),
+            "# Meu Projeto\n\nTexto.\n\n## Instalação\n",
+        )
+        .expect("write");
+        std::fs::write(tmp.path().join("main.py"), "print(1)\n").expect("write");
+        let ctx = scan_directory_context(tmp.path().to_str().expect("utf8"));
+        assert!(ctx.contains("Projeto: Meu Projeto"), "got: {ctx}");
+        // Só o PRIMEIRO heading vira nome — "## Instalação" não.
+        assert!(!ctx.contains("Instalação"), "got: {ctx}");
+    }
+
+    #[test]
+    fn contexto_inclui_ramo_git_quando_existe() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let git_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("refs").join("heads")).expect("mkdir");
+        std::fs::write(
+            git_dir.join("HEAD"),
+            "ref: refs/heads/feat/contexto-projeto\n",
+        )
+        .expect("write");
+        std::fs::write(tmp.path().join("app.rs"), "fn main() {}\n").expect("write");
+        let ctx = scan_directory_context(tmp.path().to_str().expect("utf8"));
+        assert!(ctx.contains("Ramo: feat/contexto-projeto"), "got: {ctx}");
+    }
+
+    #[test]
+    fn contexto_vazio_fora_de_projeto() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ctx = scan_directory_context(tmp.path().to_str().expect("utf8"));
+        assert!(ctx.is_empty(), "got: {ctx}");
+    }
 
     /// Apelidos aceitos no `match` que **de proposito** nao aparecem no
     /// `/help`: listar `/sair`, `/limpar` e `/historico` ao lado de `/exit`,
@@ -2303,9 +2949,94 @@ mod tests {
         let decision = decide_default_provider(&cfg, false, true, false);
         match decision {
             DefaultProviderDecision::UseDefault { model, .. } => {
-                assert_eq!(model, "openrouter/auto");
+                assert_eq!(model, "z-ai/glm-5.3-flash");
             }
             other => panic!("expected UseDefault with hardcoded model, got {other:?}"),
+        }
+    }
+
+    // ─── #1180: a ordem do autodetect ─────────────────────────────────────
+
+    /// O caso exato do relatorio de revisao do #1180: clone novo, nenhum
+    /// `agent.default_provider` no config, `OPENROUTER_API_KEY` exportada.
+    /// `decide_default_provider` devolve `FallThroughToChain` e quem decide
+    /// passa a ser a cadeia legada — que tentava Ollama ANTES da nuvem e
+    /// contradizia a decisao 2 da issue.
+    #[test]
+    fn autodetect_tenta_nuvem_antes_do_ollama() {
+        let cfg = AppConfig::default();
+        assert!(
+            matches!(
+                decide_default_provider(&cfg, false, true, false),
+                DefaultProviderDecision::FallThroughToChain { .. }
+            ),
+            "sem agent.default_provider quem decide e a cadeia legada"
+        );
+
+        let ordem = autodetect_order(false, false, true);
+        assert_eq!(
+            ordem,
+            vec![AutodetectCandidate::OpenRouter, AutodetectCandidate::Ollama],
+            "com OPENROUTER_API_KEY o openrouter tem que vir ANTES do ollama"
+        );
+    }
+
+    /// A ordem relativa entre os provedores de nuvem e a que ja existia
+    /// (Anthropic > OpenAI > OpenRouter) — o #1180 so moveu o Ollama para o
+    /// fim, nao reembaralhou a nuvem.
+    #[test]
+    fn autodetect_preserva_a_ordem_entre_os_provedores_de_nuvem() {
+        assert_eq!(
+            autodetect_order(true, true, true),
+            vec![
+                AutodetectCandidate::Anthropic,
+                AutodetectCandidate::OpenAi,
+                AutodetectCandidate::OpenRouter,
+                AutodetectCandidate::Ollama,
+            ]
+        );
+        assert_eq!(
+            autodetect_order(true, false, true),
+            vec![
+                AutodetectCandidate::Anthropic,
+                AutodetectCandidate::OpenRouter,
+                AutodetectCandidate::Ollama,
+            ]
+        );
+    }
+
+    /// O fallback local que a issue quer PRESERVAR: sem nenhuma credencial
+    /// de nuvem, o Ollama continua sendo o que sobra — e continua sendo
+    /// tentado. Ele tambem entra em toda lista, sempre por ultimo, porque e
+    /// o unico provedor que nao precisa de credencial nenhuma.
+    #[test]
+    fn autodetect_mantem_o_ollama_como_o_que_sobra() {
+        assert_eq!(
+            autodetect_order(false, false, false),
+            vec![AutodetectCandidate::Ollama],
+            "sem credencial de nuvem o local segue sendo a saida"
+        );
+        for (a, o, r) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let ordem = autodetect_order(a, o, r);
+            assert_eq!(
+                ordem.last(),
+                Some(&AutodetectCandidate::Ollama),
+                "ollama tem que ser o ultimo em toda combinacao ({a},{o},{r})"
+            );
+            assert_eq!(
+                ordem
+                    .iter()
+                    .filter(|c| **c == AutodetectCandidate::Ollama)
+                    .count(),
+                1,
+                "ollama entra uma vez so"
+            );
         }
     }
 
@@ -2322,9 +3053,27 @@ mod tests {
             "claude-sonnet-4-5-20250929"
         );
         assert_eq!(hardcoded_default_model("openai"), "gpt-4o");
-        assert_eq!(hardcoded_default_model("openrouter"), "openrouter/auto");
+        // Issue #1180: the official default. `openrouter/auto` and
+        // `openrouter/free` are explicit-only from here on.
+        assert_eq!(hardcoded_default_model("openrouter"), "z-ai/glm-5.3-flash");
         assert_eq!(hardcoded_default_model("echo"), "echo-stub");
         assert_eq!(hardcoded_default_model("something-else"), "auto");
+    }
+
+    /// Issue #1180 — `chat.rs` must agree with the single source of truth
+    /// in `crate::defaults`, which the wizard and the MCP server read too.
+    /// Without this, the table above could be edited in isolation and the
+    /// four surfaces would drift apart again.
+    #[test]
+    fn hardcoded_defaults_match_the_shared_constants() {
+        assert_eq!(
+            hardcoded_default_model(crate::defaults::DEFAULT_CLOUD_PROVIDER),
+            crate::defaults::DEFAULT_CLOUD_MODEL
+        );
+        assert_eq!(
+            hardcoded_default_model(crate::defaults::DEFAULT_LOCAL_PROVIDER),
+            crate::defaults::DEFAULT_LOCAL_MODEL
+        );
     }
 
     /// The Ollama default must be byte-identical to the provider crate's own
@@ -2405,22 +3154,42 @@ mod tests {
         assert_eq!(name, "llamacpp");
         assert_eq!(model, "custom");
 
-        // Precedência do base_url, afirmável pela função pura do arm:
-        // config alimenta quando não há `--url`; `--url` vence quando há;
-        // string vazia conta como ausente (não apaga a config).
-        assert_eq!(
-            resolve_llamacpp_base_url(&cfg, None).as_deref(),
-            Some("http://pc:8080")
-        );
-        assert_eq!(
-            resolve_llamacpp_base_url(&cfg, Some("http://box:9090")).as_deref(),
-            Some("http://box:9090")
-        );
-        assert_eq!(
-            resolve_llamacpp_base_url(&cfg, Some("")).as_deref(),
-            Some("http://pc:8080")
-        );
-        assert_eq!(resolve_llamacpp_base_url(&AppConfig::default(), None), None);
+        // A precedência do base_url (`--url` > config > default) é afirmada
+        // com pedido de verdade em
+        // `llamacpp_url_flag_beats_the_config_base_url_and_empty_flag_keeps_it`.
+    }
+
+    /// `--url` vence a base_url da config; `--url` vazio conta como ausente
+    /// (não apaga a config). Afirmado por onde o pedido CHEGA, não por uma
+    /// função auxiliar que o provider poderia deixar de usar.
+    #[tokio::test]
+    async fn llamacpp_url_flag_beats_the_config_base_url_and_empty_flag_keeps_it() {
+        use crate::provider_binding::mock_endpoint::MockEndpoint;
+        for (flag_aponta_para_b, flag_vazia) in [(false, false), (true, false), (false, true)] {
+            let a = MockEndpoint::start().await;
+            let b = MockEndpoint::start().await;
+            let cfg = config_with(&[(
+                "llamacpp",
+                make_llm_cfg("llamacpp", Some("m"), None, Some(&a.uri())),
+            )]);
+            let flag = if flag_aponta_para_b {
+                Some(b.uri())
+            } else if flag_vazia {
+                Some(String::new())
+            } else {
+                None
+            };
+            let (_, _, provider) =
+                select_explicit_provider(&cfg, "llamacpp", None, flag.as_deref()).unwrap();
+            texto_da_chamada(&provider).await;
+            let (esperado, outro) = if flag_aponta_para_b {
+                (&b, &a)
+            } else {
+                (&a, &b)
+            };
+            assert_eq!(esperado.paths().await.len(), 1, "flag={flag:?}");
+            assert!(outro.paths().await.is_empty(), "flag={flag:?}");
+        }
     }
 
     /// Provider desconhecido lista `llamacpp` junto dos demais no bail —
@@ -2435,6 +3204,496 @@ mod tests {
         let msg = format!("{err}");
         for kind in ["ollama", "llamacpp", "anthropic", "openai", "openrouter"] {
             assert!(msg.contains(kind), "mensagem `{msg}` não cita `{kind}`");
+        }
+    }
+
+    // ─── base_url + credencial da MESMA entrada (smoke v0.4.4, O1) ──────
+
+    fn pedido_minimo() -> garraia_agents::LlmRequest {
+        garraia_agents::LlmRequest {
+            model: String::new(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: MessagePart::Text("oi".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(16),
+            temperature: None,
+            tools: Vec::new(),
+        }
+    }
+
+    /// Uma chamada de verdade; o texto so traz o SENTINEL se o pedido chegou
+    /// ao endpoint falso — o host padrao do provider nao o conhece.
+    async fn texto_da_chamada(provider: &Arc<dyn LlmProvider>) -> String {
+        let resposta = provider
+            .complete(&pedido_minimo())
+            .await
+            .unwrap_or_else(|e| panic!("chamada ao provider falhou: {e}"));
+        resposta
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                garraia_agents::ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `-p <provider>` com `base_url` configurada: para CADA provider
+    /// explicito, o pedido chega na base_url configurada, com a chave daquela
+    /// entrada, e a resposta vem de la (nada vai ao host padrao). Era o
+    /// `ask_explicit.out` do smoke: `-p openai` mandava `llm.openai.api_key`
+    /// para https://api.openai.com.
+    #[tokio::test]
+    async fn explicit_provider_calls_the_configured_base_url_for_every_kind() {
+        use crate::provider_binding::mock_endpoint::{MockEndpoint, SENTINEL};
+        // (nome passado em -p, tipo da entrada, chave, sufixo da base, caminho esperado)
+        let rows: [(&str, &str, Option<&str>, &str, &str); 6] = [
+            (
+                "openai",
+                "openai",
+                Some("k-openai"),
+                "/v1",
+                "/v1/chat/completions",
+            ),
+            (
+                "openrouter",
+                "openrouter",
+                Some("k-openrouter"),
+                "/api/v1",
+                "/api/v1/chat/completions",
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                Some("k-anthropic"),
+                "",
+                "/v1/messages",
+            ),
+            ("ollama", "ollama", None, "", "/api/chat"),
+            ("llamacpp", "llamacpp", None, "", "/v1/chat/completions"),
+            // Alias em llm: (aceito pela policy do MCP): usa o tipo declarado.
+            (
+                "lmstudio",
+                "openai",
+                Some("k-lmstudio"),
+                "/v1",
+                "/v1/chat/completions",
+            ),
+        ];
+        for (name, kind, key, suffix, expected_path) in rows {
+            let mock = MockEndpoint::start().await;
+            let base = format!("{}{suffix}", mock.uri());
+            let cfg = config_with(&[(name, make_llm_cfg(kind, Some("m"), key, Some(&base)))]);
+            let (display, model, provider) = select_explicit_provider(&cfg, name, None, None)
+                .unwrap_or_else(|e| panic!("-p {name}: {e:#}"));
+            assert_eq!(display, name);
+            assert_eq!(model, "m", "-p {name}: modelo da propria entrada");
+            let texto = texto_da_chamada(&provider).await;
+            assert_eq!(
+                texto, SENTINEL,
+                "-p {name}: resposta nao veio da base_url configurada"
+            );
+            assert_eq!(
+                mock.paths().await,
+                vec![expected_path.to_string()],
+                "-p {name}"
+            );
+            if let Some(key) = key {
+                assert_eq!(mock.credentials().await, vec![key.to_string()], "-p {name}");
+            }
+        }
+    }
+
+    /// Negativo: a chave da entrada A nunca vai para o endpoint da entrada B,
+    /// nem pelo caminho explicito nem pelo do `agent.default_provider`.
+    #[tokio::test]
+    async fn key_of_entry_a_is_never_sent_to_entry_b() {
+        use crate::provider_binding::mock_endpoint::MockEndpoint;
+        let a = MockEndpoint::start().await;
+        let b = MockEndpoint::start().await;
+        let entries = [
+            (
+                "openai",
+                make_llm_cfg(
+                    "openai",
+                    Some("m"),
+                    Some("chave-a"),
+                    Some(&format!("{}/v1", a.uri())),
+                ),
+            ),
+            (
+                "lmstudio",
+                make_llm_cfg(
+                    "openai",
+                    Some("m"),
+                    Some("chave-b"),
+                    Some(&format!("{}/v1", b.uri())),
+                ),
+            ),
+        ];
+
+        // -p lmstudio → so B, so com a chave de B.
+        let cfg = config_with(&entries);
+        let (_, _, p) = select_explicit_provider(&cfg, "lmstudio", None, None)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        texto_da_chamada(&p).await;
+        // -p openai → so A, so com a chave de A.
+        let (_, _, p) = select_explicit_provider(&cfg, "openai", None, None)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        texto_da_chamada(&p).await;
+        assert_eq!(a.credentials().await, vec!["chave-a".to_string()]);
+        assert_eq!(b.credentials().await, vec!["chave-b".to_string()]);
+
+        // Caminho do default_provider: `default_provider: lmstudio` com um
+        // `llm.openai` ao lado. Antes, a chave de `llm.openai` ia para B.
+        let a = MockEndpoint::start().await;
+        let b = MockEndpoint::start().await;
+        let cfg = config_with_default(
+            "lmstudio",
+            &[
+                (
+                    "openai",
+                    make_llm_cfg(
+                        "openai",
+                        Some("m"),
+                        Some("chave-a"),
+                        Some(&format!("{}/v1", a.uri())),
+                    ),
+                ),
+                (
+                    "lmstudio",
+                    make_llm_cfg(
+                        "openai",
+                        Some("m"),
+                        Some("chave-b"),
+                        Some(&format!("{}/v1", b.uri())),
+                    ),
+                ),
+            ],
+        );
+        let entry = cfg.llm.get("lmstudio").cloned().expect("entrada");
+        let p = try_build_default_provider("lmstudio", &entry, "m", &|_: &str| None)
+            .await
+            .expect("default provider construivel");
+        texto_da_chamada(&p).await;
+        assert!(a.credentials().await.is_empty(), "A nao pode receber nada");
+        assert_eq!(b.credentials().await, vec!["chave-b".to_string()]);
+    }
+
+    /// Autodetect (sem `agent.default_provider`): cada nuvem entra no
+    /// encadeamento vinculada INTEIRA. Antes o encadeamento pegava so a chave
+    /// de `llm.<tipo>` e a mandava para o host padrao, largando a `base_url`.
+    #[tokio::test]
+    async fn autodetect_chain_calls_the_entry_base_url_not_the_default_host() {
+        use crate::provider_binding::mock_endpoint::{MockEndpoint, SENTINEL};
+        let sem_env = |_: &str| None;
+        for (kind, suffix, expected_path) in [
+            ("anthropic", "", "/v1/messages"),
+            ("openai", "/v1", "/v1/chat/completions"),
+            ("openrouter", "/api/v1", "/api/v1/chat/completions"),
+        ] {
+            let mock = MockEndpoint::start().await;
+            let base = format!("{}{suffix}", mock.uri());
+            let cfg = config_with(&[(
+                kind,
+                make_llm_cfg(kind, Some("m"), Some("k-proxy"), Some(&base)),
+            )]);
+            assert!(
+                cfg.agent.default_provider.is_none(),
+                "pre-condicao: autodetect"
+            );
+            let (name, model, provider) =
+                detect_provider_with_env(&cfg, None, None, false, &sem_env).await;
+            assert_eq!((name.as_str(), model.as_str()), (kind, "m"));
+            assert_eq!(texto_da_chamada(&provider).await, SENTINEL, "{kind}");
+            assert_eq!(
+                mock.paths().await,
+                vec![expected_path.to_string()],
+                "{kind}"
+            );
+            assert_eq!(
+                mock.credentials().await,
+                vec!["k-proxy".to_string()],
+                "{kind}"
+            );
+        }
+    }
+
+    /// Caminho do `agent.default_provider` por `detect_provider`: a entrada
+    /// padrao traz endpoint, chave E modelo — nem a chave do `llm.openai` ao
+    /// lado, nem uma `OPENAI_API_KEY` velha do ambiente, nem o modelo do
+    /// `llm.openai`.
+    #[tokio::test]
+    async fn default_provider_path_uses_only_its_own_entry() {
+        use crate::provider_binding::mock_endpoint::MockEndpoint;
+        let a = MockEndpoint::start().await;
+        let b = MockEndpoint::start().await;
+        let cfg = config_with_default(
+            "lmstudio",
+            &[
+                (
+                    "openai",
+                    make_llm_cfg(
+                        "openai",
+                        Some("modelo-a"),
+                        Some("chave-a"),
+                        Some(&format!("{}/v1", a.uri())),
+                    ),
+                ),
+                (
+                    "lmstudio",
+                    make_llm_cfg(
+                        "openai",
+                        Some("modelo-b"),
+                        Some("chave-b"),
+                        Some(&format!("{}/v1", b.uri())),
+                    ),
+                ),
+            ],
+        );
+        let env = |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-velha-do-env".to_string());
+        let (name, model, provider) = detect_provider_with_env(&cfg, None, None, false, &env).await;
+        assert_eq!((name.as_str(), model.as_str()), ("lmstudio", "modelo-b"));
+        texto_da_chamada(&provider).await;
+        assert!(a.paths().await.is_empty(), "A nao pode receber nada");
+        assert_eq!(b.credentials().await, vec!["chave-b".to_string()]);
+    }
+
+    /// `--url` avulso: a `OPENAI_API_KEY` e a `GARRAIA_EMBEDDING_API_KEY` sao
+    /// credenciais de outros endpoints e nunca vao para o endereco digitado.
+    #[tokio::test]
+    async fn url_flag_never_forwards_the_openai_or_embedding_key() {
+        use crate::provider_binding::mock_endpoint::{MockEndpoint, SENTINEL};
+        let mock = MockEndpoint::start().await;
+        let env = |var: &str| match var {
+            "OPENAI_API_KEY" => Some("sk-da-openai".to_string()),
+            "GARRAIA_EMBEDDING_API_KEY" => Some("k-embeddings".to_string()),
+            _ => None,
+        };
+        let url = format!("{}/v1", mock.uri());
+        let (_, _, provider) =
+            detect_provider_with_env(&AppConfig::default(), Some(&url), Some("m"), false, &env)
+                .await;
+        assert_eq!(texto_da_chamada(&provider).await, SENTINEL);
+        assert_eq!(
+            mock.credentials().await,
+            vec![provider_binding::KEYLESS_PLACEHOLDER.to_string()]
+        );
+    }
+
+    /// Dentro de uma entrada, a chave dela vence a variavel de ambiente. E a
+    /// variavel NUNCA preenche uma entrada que aponta para o proprio
+    /// endpoint: `llm.openai { base_url: <proxy> }` sem `api_key`, com uma
+    /// `OPENAI_API_KEY` velha no ambiente (ou no `.env` do diretorio
+    /// corrente), manda o marcador de "sem chave" ao proxy — a chave da API
+    /// da OpenAI so vai para a API da OpenAI (achado do verificador).
+    #[tokio::test]
+    async fn explicit_entry_key_beats_a_stale_env_key() {
+        use crate::provider_binding::mock_endpoint::MockEndpoint;
+        let env = |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-velha".to_string());
+        for (entry_key, expected) in [
+            (Some("da-entrada"), "da-entrada"),
+            (None, provider_binding::KEYLESS_PLACEHOLDER),
+        ] {
+            let mock = MockEndpoint::start().await;
+            let cfg = config_with(&[(
+                "openai",
+                make_llm_cfg(
+                    "openai",
+                    Some("m"),
+                    entry_key,
+                    Some(&format!("{}/v1", mock.uri())),
+                ),
+            )]);
+            let (_, _, p) = select_explicit_provider_with_env(&cfg, "openai", None, None, &env)
+                .unwrap_or_else(|e| panic!("{e:#}"));
+            texto_da_chamada(&p).await;
+            assert_eq!(mock.credentials().await, vec![expected.to_string()]);
+        }
+    }
+
+    /// O mesmo achado pelo caminho do `agent.default_provider` (onde, antes
+    /// deste branch, a `OPENAI_API_KEY` ja ia para a `base_url` da entrada
+    /// padrao) e pela autodeteccao: a variavel do ambiente nunca chega na
+    /// `base_url` propria de uma entrada sem chave.
+    #[tokio::test]
+    async fn env_key_never_reaches_an_entry_base_url_on_default_or_autodetect() {
+        use crate::provider_binding::mock_endpoint::MockEndpoint;
+        let env = |var: &str| match var {
+            "OPENAI_API_KEY" => Some("sk-do-env".to_string()),
+            "ANTHROPIC_API_KEY" => Some("sk-ant-do-env".to_string()),
+            "OPENROUTER_API_KEY" => Some("sk-or-do-env".to_string()),
+            _ => None,
+        };
+        let do_env = ["sk-do-env", "sk-ant-do-env", "sk-or-do-env"];
+
+        // default_provider: openai → o proxy recebe o marcador.
+        let mock = MockEndpoint::start().await;
+        let cfg = config_with_default(
+            "openai",
+            &[(
+                "openai",
+                make_llm_cfg(
+                    "openai",
+                    Some("m"),
+                    None,
+                    Some(&format!("{}/v1", mock.uri())),
+                ),
+            )],
+        );
+        let (name, _, provider) = detect_provider_with_env(&cfg, None, None, false, &env).await;
+        assert_eq!(name, "openai");
+        texto_da_chamada(&provider).await;
+        assert_eq!(
+            mock.credentials().await,
+            vec![provider_binding::KEYLESS_PLACEHOLDER.to_string()]
+        );
+
+        // default_provider anthropic/openrouter sem chave propria, apontando
+        // para o proxy: a decisao nao conta a env, e nada chega ao proxy
+        // (nem por esse caminho nem pela autodeteccao que vem depois).
+        for kind in ["anthropic", "openrouter"] {
+            let mock = MockEndpoint::start().await;
+            let cfg = config_with_default(
+                kind,
+                &[(kind, make_llm_cfg(kind, Some("m"), None, Some(&mock.uri())))],
+            );
+            assert!(
+                matches!(
+                    decide_default_provider(&cfg, true, true, true),
+                    DefaultProviderDecision::FallThroughToChain { .. }
+                ),
+                "{kind}: a env nao e credencial para a base_url da entrada"
+            );
+            let (name, _, _) = detect_provider_with_env(&cfg, None, None, false, &env).await;
+            assert_ne!(name, kind, "{kind}: nao ha credencial para o proxy");
+            assert!(
+                mock.paths().await.is_empty(),
+                "{kind}: o proxy recebeu pedido"
+            );
+        }
+
+        // Autodeteccao: `llm.openai` sem chave apontando para o proxy.
+        let mock = MockEndpoint::start().await;
+        let cfg = config_with(&[(
+            "openai",
+            make_llm_cfg(
+                "openai",
+                Some("m"),
+                None,
+                Some(&format!("{}/v1", mock.uri())),
+            ),
+        )]);
+        let only_openai_env =
+            |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-do-env".to_string());
+        let (name, _, _) =
+            detect_provider_with_env(&cfg, None, None, false, &only_openai_env).await;
+        assert_ne!(name, "openai", "sem chave propria o proxy nao e candidato");
+        let vistas = mock.credentials().await;
+        assert!(
+            !vistas.iter().any(|c| do_env.contains(&c.as_str())),
+            "a env chegou no proxy: {vistas:?}"
+        );
+    }
+
+    /// Achado do verificador (LOW): `llm.openrouter` declarando
+    /// `provider: openai`, com chave propria e sem `agent.default_provider`,
+    /// era autodetectado como OpenRouter antes deste branch; o
+    /// `provider_binding` descartava o candidato e caia no Ollama. Volta a
+    /// ser o OpenRouter, vinculado inteiro: a chave dele, a base_url dele.
+    #[tokio::test]
+    async fn autodetect_keeps_a_candidate_whose_entry_declares_another_kind() {
+        use crate::provider_binding::mock_endpoint::{MockEndpoint, SENTINEL};
+        let mock = MockEndpoint::start().await;
+        let cfg = config_with(&[(
+            "openrouter",
+            make_llm_cfg(
+                "openai",
+                Some("m"),
+                Some("k-or"),
+                Some(&format!("{}/api/v1", mock.uri())),
+            ),
+        )]);
+        let (name, model, provider) =
+            detect_provider_with_env(&cfg, None, None, false, &|_| None).await;
+        assert_eq!((name.as_str(), model.as_str()), ("openrouter", "m"));
+        // Registrado com o nome da entrada, como um alias no caminho explicito.
+        assert_eq!(provider.provider_id(), "openrouter");
+        assert_eq!(texto_da_chamada(&provider).await, SENTINEL);
+        assert_eq!(
+            mock.paths().await,
+            vec!["/api/v1/chat/completions".to_string()]
+        );
+        assert_eq!(mock.credentials().await, vec!["k-or".to_string()]);
+    }
+
+    /// O fallback legado `llm.main`: `-p anthropic` com a `llm.main` do tipo
+    /// vai para a base_url DELA. Antes so a chave da `llm.main` era usada, e
+    /// ia para https://api.anthropic.com.
+    #[tokio::test]
+    async fn main_entry_fallback_keeps_its_base_url() {
+        use crate::provider_binding::mock_endpoint::{MockEndpoint, SENTINEL};
+        let mock = MockEndpoint::start().await;
+        let cfg = config_with(&[(
+            "main",
+            make_llm_cfg("anthropic", Some("m"), Some("k-main"), Some(&mock.uri())),
+        )]);
+        let (_, _, p) = select_explicit_provider_with_env(&cfg, "anthropic", None, None, &|_| None)
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(texto_da_chamada(&p).await, SENTINEL);
+        assert_eq!(mock.credentials().await, vec!["k-main".to_string()]);
+    }
+
+    /// Sem entrada nenhuma para o tipo, `-p openai` nao pega a chave de outra
+    /// entrada do mesmo tipo (ela iria para api.openai.com): falha fechado.
+    #[test]
+    fn explicit_kind_without_entry_never_borrows_another_entrys_key() {
+        let cfg = config_with(&[(
+            "lmstudio",
+            make_llm_cfg(
+                "openai",
+                Some("m"),
+                Some("k-lm"),
+                Some("http://127.0.0.1:1/v1"),
+            ),
+        )]);
+        let Err(err) = select_explicit_provider_with_env(&cfg, "openai", None, None, &|_| None)
+        else {
+            panic!("sem chave para api.openai.com, deve falhar");
+        };
+        assert!(format!("{err}").contains("OPENAI_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn decide_default_provider_prefers_the_default_entrys_own_model() {
+        let cfg = config_with_default(
+            "lmstudio",
+            &[
+                (
+                    "openai",
+                    make_llm_cfg("openai", Some("gpt-4o"), Some("k"), None),
+                ),
+                (
+                    "lmstudio",
+                    make_llm_cfg(
+                        "openai",
+                        Some("local-model"),
+                        None,
+                        Some("http://127.0.0.1:1234/v1"),
+                    ),
+                ),
+            ],
+        );
+        match decide_default_provider(&cfg, false, false, false) {
+            DefaultProviderDecision::UseDefault {
+                config_key, model, ..
+            } => {
+                assert_eq!(config_key, "lmstudio");
+                assert_eq!(model, "local-model");
+            }
+            other => panic!("esperava UseDefault(lmstudio), veio {other:?}"),
         }
     }
 
@@ -3036,7 +4295,7 @@ mod cli_tools_tests {
     #[test]
     fn registers_the_gateway_tool_set_plus_git_diff() {
         let runtime = AgentRuntime::new();
-        register_cli_tools(&runtime, None, None, vec![]);
+        register_cli_tools(&runtime, &AppConfig::default(), None, None, vec![]);
         let names = runtime.tool_names();
         for expected in [
             "file_read",
@@ -3066,7 +4325,13 @@ mod cli_tools_tests {
     #[test]
     fn brave_key_turns_web_search_on() {
         let runtime = AgentRuntime::new();
-        register_cli_tools(&runtime, None, Some("k".into()), vec![]);
+        register_cli_tools(
+            &runtime,
+            &AppConfig::default(),
+            None,
+            Some("k".into()),
+            vec![],
+        );
         assert!(runtime.tool_names().iter().any(|n| n == "web_search"));
     }
 
@@ -3075,7 +4340,7 @@ mod cli_tools_tests {
     #[test]
     fn prompt_lists_every_registered_tool_and_nothing_else() {
         let runtime = AgentRuntime::new();
-        register_cli_tools(&runtime, None, None, vec![]);
+        register_cli_tools(&runtime, &AppConfig::default(), None, None, vec![]);
         let names = runtime.tool_names();
         let doc = tool_docs(&names);
         for n in &names {
@@ -3166,8 +4431,10 @@ mod persist_tests {
     #[test]
     fn dois_turnos_voltam_em_ordem() {
         let store = SessionStore::in_memory().expect("store em memoria");
-        append_turn(&store, "cli-teste", "oi", "ola").expect("turno 1");
-        append_turn(&store, "cli-teste", "tudo bem?", "tudo").expect("turno 2");
+        persist_user_turn(&store, "cli-teste", "oi").expect("pergunta 1");
+        persist_assistant_turn(&store, "cli-teste", "ola").expect("resposta 1");
+        persist_user_turn(&store, "cli-teste", "tudo bem?").expect("pergunta 2");
+        persist_assistant_turn(&store, "cli-teste", "tudo").expect("resposta 2");
 
         let historico = load_history(&store, "cli-teste", RESUME_LIMIT).expect("carrega");
         assert_eq!(historico.len(), 4, "dois turnos sao quatro mensagens");
@@ -3185,11 +4452,13 @@ mod persist_tests {
         assert!(historico.is_empty());
     }
 
-    /// `append_turn` grava pergunta e resposta com o MESMO `Utc::now()`.
-    /// A ordem entre elas nao pode depender do timestamp: `load_recent_messages`
-    /// ordena por `rowid` (ordem de insercao), e e isso que mantem o turno
-    /// deterministico. Aqui o teste força o pior caso — todas as mensagens
-    /// da sessao com timestamp identico — e prende a ordem de insercao.
+    /// `persist_user_turn` grava a pergunta com o `Utc::now()` do inicio do
+    /// turno e `persist_assistant_turn` com o do fim — timestamps sempre
+    /// diferentes. A ordem entre elas nao pode depender do timestamp de
+    /// qualquer forma: `load_recent_messages` ordena por `rowid` (ordem de
+    /// insercao), e e isso que mantem o turno deterministico. Aqui o teste
+    /// força o pior caso — todas as mensagens da sessao com timestamp
+    /// identico — e prende a ordem de insercao.
     #[test]
     fn timestamps_iguais_mantem_ordem_de_insercao() {
         let store = SessionStore::in_memory().expect("store em memoria");
@@ -3219,5 +4488,309 @@ mod persist_tests {
             vec!["primeiro", "segundo", "terceiro"],
             "timestamp identico nao pode reordenar a sessao"
         );
+    }
+
+    /// #1227 (slice 1): abrir o `sessions.db` no CLI tambem e uma subida —
+    /// runs `running` de uma queda anterior viram `interrupted` aqui, do
+    /// mesmo jeito que no gateway. Se a chamada sair, o CLI reabre o banco
+    /// do gateway e engole a trilha. O scan usa `concat!` para o proprio
+    /// teste nao casar consigo mesmo.
+    #[test]
+    fn abertura_do_store_marca_runs_interrompidos() {
+        let src = include_str!("chat.rs");
+        let alvo = concat!("log_interrupted", "_runs(&store)");
+        let copias = src.matches(alvo).count();
+        assert_eq!(copias, 1, "esperava 1 chamada de subida, achei {copias}");
+    }
+
+    // ── #1298: /model transacional ─────────────────────────────────────────
+
+    /// O `/model` só toca o estado depois da validação: `Ausente` recusa e
+    /// mantém provider/model anteriores; rota válida fora da lista curada
+    /// aplica com confirmação explícita; sem listagem aplica com ressalva.
+    #[test]
+    fn model_transacional_recusa_ausente_e_explicita_indireta() {
+        assert_eq!(
+            efeito_da_validacao(&ValidacaoDeModelo::Listado),
+            EfeitoTrocaDeModelo::Aplicar
+        );
+        // Namespace de terceiro servido via OpenRouter (`z-ai/...` fora da
+        // curada): troca SIM, com a confirmação dizendo de onde veio.
+        assert_eq!(
+            efeito_da_validacao(&ValidacaoDeModelo::ListadoForaDaCurada),
+            EfeitoTrocaDeModelo::AplicarComNotaDeCatalogo
+        );
+        // Modelo que o catálogo real não tem: o estado anterior fica intacto.
+        assert_eq!(
+            efeito_da_validacao(&ValidacaoDeModelo::Ausente),
+            EfeitoTrocaDeModelo::RecusarEManterEstado
+        );
+        // Provider sem catálogo: aplica, mas nunca como sucesso validado.
+        assert_eq!(
+            efeito_da_validacao(&ValidacaoDeModelo::SemListagem),
+            EfeitoTrocaDeModelo::AplicarSemValidacao
+        );
+    }
+
+    // ── #1300: /resume volta ao ultimo turno interrompido ──────────────────
+
+    /// Os tres fins inacabados ganham marcador; o sucesso nao.
+    #[test]
+    fn marcador_de_interrupcao_cobre_os_tres_fins_inacabados() {
+        use garraia_common::Error;
+        assert_eq!(
+            marcador_de_interrupcao(&TurnOutcome::<String, Error>::TimedOut),
+            Some("[turno interrompido: timeout]")
+        );
+        assert_eq!(
+            marcador_de_interrupcao(&TurnOutcome::<String, Error>::Cancelled),
+            Some("[turno interrompido: cancelado]")
+        );
+        assert_eq!(
+            marcador_de_interrupcao(&TurnOutcome::<String, Error>::Done(Err(Error::Agent(
+                "provider caiu".into()
+            )))),
+            Some("[turno interrompido: erro]")
+        );
+        assert_eq!(
+            marcador_de_interrupcao(&TurnOutcome::<String, Error>::Done(Ok(
+                "resposta completa".into()
+            ))),
+            None,
+            "turno completo nao tem o que marcar"
+        );
+    }
+
+    /// Persistencia fracionada (#1300): a pergunta grava ANTES do turno, o
+    /// marcador grava depois — e um crash duro no meio deixa a pergunta sola
+    /// no banco, que e exatamente o que o `--resume` seguinte recupera.
+    #[test]
+    fn persistencia_fracionada_sobrevive_a_crash_no_meio_do_turno() {
+        let store = SessionStore::in_memory().expect("store em memoria");
+
+        // O turno comecou: a pergunta ja esta no disco.
+        persist_user_turn(&store, "cli-crash", "ajuda no SOUL.md").expect("user persistido");
+        // ...crash duro aqui (kill -9, pcao de luz): NADA mais roda. A
+        // sessao seguinte com `--resume latest` acha a pergunta.
+        let msgs = store
+            .load_recent_messages("cli-crash", 10)
+            .expect("carrega apos crash");
+        assert_eq!(msgs.len(), 1, "so a pergunta existe");
+        assert_eq!(msgs[0].content, "ajuda no SOUL.md");
+
+        // Em vez do crash, o turno acabou em timeout: o marcador entra como
+        // mensagem do assistant e o historico hidratado conta a verdade.
+        let marcador =
+            marcador_de_interrupcao(&TurnOutcome::<String, garraia_common::Error>::TimedOut)
+                .expect("timeout tem marcador");
+        persist_assistant_turn(&store, "cli-crash", marcador).expect("marcador persistido");
+        let msgs = store
+            .load_recent_messages("cli-crash", 10)
+            .expect("carrega apos marcador");
+        let conteudos: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            conteudos,
+            vec!["ajuda no SOUL.md", "[turno interrompido: timeout]"],
+            "o resume hidrata pergunta + marcador, na ordem em que aconteceram"
+        );
+    }
+
+    /// `--resume latest` resolve para a sessao mais ativa do canal CLI. A
+    /// ordem no banco mora em `latest_session_id` (garraia-db, testado la);
+    /// aqui a decisao de boot do CLI: id explicito vence, `latest` cai para
+    /// o alvo do banco, e sem alvo a sessao comeca nova (com aviso) em vez
+    /// de derrubar o programa — primeiro uso com `--resume` e legitimo.
+    #[test]
+    fn id_inicial_da_sessao_resolve_latest_com_fallback_para_nova() {
+        // Id explicito: vence sempre, nao toca no banco.
+        let (id, nova) = id_inicial_da_sessao(Some("cli-xyz"), None, "cli-fresh".into());
+        assert_eq!(id, "cli-xyz");
+        assert!(!nova);
+        // `latest` com alvo no banco: o alvo.
+        let (id, nova) =
+            id_inicial_da_sessao(Some("latest"), Some("cli-alvo".into()), "cli-fresh".into());
+        assert_eq!(id, "cli-alvo");
+        assert!(!nova);
+        // `latest` sem alvo (banco vazio / canal errado): sessao nova.
+        let (id, nova) = id_inicial_da_sessao(Some("latest"), None, "cli-fresh".into());
+        assert_eq!(id, "cli-fresh");
+        assert!(nova, "banco vazio nao e erro de boot");
+        // Sem --resume: sessao nova (comportamento #1088 preservado).
+        let (id, nova) = id_inicial_da_sessao(None, Some("cli-alvo".into()), "cli-fresh".into());
+        assert_eq!(id, "cli-fresh");
+        assert!(nova);
+    }
+}
+
+#[cfg(test)]
+mod aprovacao_tests {
+    //! #1343 — o `garraia chat` retoma o pedido de confirmacao no turno
+    //! seguinte. O historico do CLI e texto puro (`MessagePart::Text`), entao
+    //! antes do escopo o "sim" nunca aprovava: a ferramenta perguntava de
+    //! novo para sempre.
+
+    use super::*;
+    use garraia_agents::tools::approval::ApprovalFingerprint;
+    use garraia_agents::{
+        ChatMessage, ChatRole, ContentBlock, LlmProvider, LlmRequest, LlmResponse, MessagePart,
+        Tool, ToolContext, ToolOutput,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TOOL: &str = "apaga_arquivo";
+    const ALVO: &str = "/tmp/garraia-1343-cli";
+
+    struct ApagaArquivo(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Tool for ApagaArquivo {
+        fn name(&self) -> &str {
+            TOOL
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            c: &ToolContext,
+            _i: serde_json::Value,
+        ) -> garraia_common::Result<ToolOutput> {
+            if c.approval.covers(TOOL, ALVO) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                return Ok(ToolOutput::success("apagado"));
+            }
+            let m = ApprovalFingerprint::of(TOOL, ALVO).marker();
+            Ok(ToolOutput::confirmation_request(format!(
+                "Confirma apagar {ALVO}? {m}"
+            )))
+        }
+    }
+
+    /// A cada mensagem humana pede a tool; depois do resultado, texto. Sem
+    /// `stream_complete`: o runtime cai no batch, como com provider local.
+    struct Roteiro;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for Roteiro {
+        fn provider_id(&self) -> &str {
+            "roteiro"
+        }
+        async fn complete(&self, r: &LlmRequest) -> garraia_common::Result<LlmResponse> {
+            let humano = matches!(
+                r.messages.last(),
+                Some(ChatMessage {
+                    role: ChatRole::User,
+                    content: MessagePart::Text(_),
+                })
+            );
+            let content = if humano {
+                vec![ContentBlock::ToolUse {
+                    id: "t".into(),
+                    name: TOOL.into(),
+                    input: serde_json::json!({ "alvo": ALVO }),
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: "feito".into(),
+                }]
+            };
+            Ok(LlmResponse {
+                content,
+                model: "m".into(),
+                stop_reason: None,
+                usage: None,
+            })
+        }
+        async fn health_check(&self) -> garraia_common::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Um turno pelo mesmo ponto de entrada do REPL, com o mesmo
+    /// `exec_do_turno`, e o historico crescendo so com texto.
+    async fn turno(
+        rt: &AgentRuntime,
+        sessao: &str,
+        historico: &mut Vec<ChatMessage>,
+        texto: &str,
+    ) -> String {
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(64);
+        let dreno = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let exec = exec_do_turno("/tmp", sessao);
+        let r = rt
+            .process_message_streaming_with_events(
+                sessao, texto, historico, tx, None, None, None, None, None, None, &exec,
+            )
+            .await
+            .expect("turno");
+        dreno.await.expect("dreno");
+        historico.push(ChatMessage {
+            role: ChatRole::User,
+            content: MessagePart::Text(texto.to_string()),
+        });
+        historico.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: MessagePart::Text(r.clone()),
+        });
+        r
+    }
+
+    #[test]
+    fn exec_do_turno_escopa_canal_sessao_e_o_terminal() {
+        let exec = exec_do_turno("/tmp", "sess-1");
+        let escopo = exec.approval_scope.expect("o CLI opta pelo escopo");
+        assert_eq!(escopo.channel(), CANAL_CLI);
+        assert_eq!(escopo.session_id(), "sess-1");
+        assert_eq!(escopo.sender(), REMETENTE_CLI);
+        assert_eq!(exec.working_dir.as_deref(), Some("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn sim_no_turno_seguinte_roda_uma_vez_e_replay_pausa() {
+        let rt = AgentRuntime::new();
+        let vezes = Arc::new(AtomicUsize::new(0));
+        rt.register_tool(Box::new(ApagaArquivo(Arc::clone(&vezes))));
+        rt.register_provider(Arc::new(Roteiro));
+        let mut h = Vec::new();
+
+        // #1373: o marcador interno nao chega ao texto do humano; o pedido e
+        // reconhecido pela frase da ferramenta de teste.
+        let e_pedido = |r: &str| {
+            assert!(
+                !r.contains(garraia_agents::tools::approval::MARKER_PREFIX),
+                "o marcador interno chegou ao terminal: {r}"
+            );
+            r.contains("Confirma apagar")
+        };
+        let r1 = turno(&rt, "cli-1343", &mut h, "apaga o arquivo").await;
+        assert!(e_pedido(&r1), "pausa: {r1}");
+        assert_eq!(vezes.load(Ordering::SeqCst), 0);
+
+        let r2 = turno(&rt, "cli-1343", &mut h, "sim").await;
+        assert!(!e_pedido(&r2), "{r2}");
+        assert_eq!(vezes.load(Ordering::SeqCst), 1, "roda uma vez");
+
+        let r3 = turno(&rt, "cli-1343", &mut h, "sim").await;
+        assert!(e_pedido(&r3), "replay pausa: {r3}");
+        assert_eq!(vezes.load(Ordering::SeqCst), 1, "replay nao roda");
+    }
+
+    /// `/resume` para outra sessao troca o escopo: o pedido da sessao
+    /// anterior nao e aprovado pelo "sim" dado na nova.
+    #[tokio::test]
+    async fn sim_em_outra_sessao_nao_aprova() {
+        let rt = AgentRuntime::new();
+        let vezes = Arc::new(AtomicUsize::new(0));
+        rt.register_tool(Box::new(ApagaArquivo(Arc::clone(&vezes))));
+        rt.register_provider(Arc::new(Roteiro));
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+
+        turno(&rt, "cli-a", &mut a, "apaga o arquivo").await;
+        turno(&rt, "cli-b", &mut b, "sim").await;
+        assert_eq!(vezes.load(Ordering::SeqCst), 0);
     }
 }

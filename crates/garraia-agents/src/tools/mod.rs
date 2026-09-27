@@ -1,29 +1,41 @@
 pub mod approval;
 pub mod bash_tool;
+pub mod breaker;
 pub mod code_review_tool;
+pub mod device_tools;
+pub mod file_jail;
 pub mod file_read_tool;
 pub mod file_write_tool;
 pub mod git_diff_tool;
 pub mod list_dir_tool;
+pub mod pending_approval;
+pub mod repo_dir;
 pub mod repo_search_tool;
 pub mod run_tests_tool;
 pub mod schedule;
+pub mod session_workspace;
 pub mod tool_context;
+pub mod turn_tools;
 pub mod web_fetch_tool;
 pub mod web_search_tool;
 
 pub use bash_tool::BashTool;
 pub use code_review_tool::CodeReviewTool;
+pub use device_tools::{DeviceExecuteTool, DeviceListTool, DeviceReadTool, DeviceToolsConfig};
+pub use file_jail::{Denial as FileJailDenial, FileJail};
 pub use file_read_tool::FileReadTool;
 pub use file_write_tool::FileWriteTool;
 pub use git_diff_tool::GitDiffTool;
 pub use list_dir_tool::ListDirTool;
+pub use pending_approval::{ApprovalScope, PendingApprovals};
+pub use repo_dir::RepoDir;
 pub use repo_search_tool::RepoSearchTool;
 pub use run_tests_tool::RunTestsTool;
 pub use schedule::{
     EventTrigger, EventType, ScheduledTask, TaskStatus, TriggerRegistry, WebhookTrigger,
 };
 pub use schedule::{ScheduleHeartbeat, ScheduleRecurring};
+pub use session_workspace::{RaizGarantida, RecusaDaRaiz, SessionWorkspace};
 pub use tool_context::ProjectToolContext;
 pub use web_fetch_tool::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
@@ -82,6 +94,85 @@ pub trait Tool: Send + Sync {
 
     /// Executa a ferramenta com o contexto e entrada fornecidos.
     async fn execute(&self, context: &ToolContext, input: serde_json::Value) -> Result<ToolOutput>;
+
+    /// O que esta ferramenta **faz**, em classes (#1385). O default consulta a
+    /// tabela fechada das nativas pelo nome; uma tool fora dela — ou um
+    /// servidor MCP sem anotacao — nao tem classe, e sem classe nao passa em
+    /// modo que restringe por classe (fail-closed).
+    fn capacidades(&self) -> &'static [crate::capacidades::Capacidade] {
+        crate::capacidades::capacidades_nativas(self.name())
+    }
+
+    /// A ferramenta esta **operacional agora** (#1425)? Registrada nao e o
+    /// mesmo que utilizavel: `telegram_send` registrado num Garra em que o
+    /// Telegram nao esta configurado (ou esta fora do ar) nao pode aparecer na
+    /// lista chamavel do modelo — ela aparece como indisponivel, com o motivo,
+    /// fora da lista (opcao B da #1425). O runtime consulta isto ao montar a
+    /// lista do turno e antes de despachar; o default e "disponivel".
+    ///
+    /// Sincrona e barata por contrato: e chamada a cada turno, para cada
+    /// ferramenta. Quem precisa de estado vivo le um snapshot (config viva,
+    /// `try_read` num lock), nunca faz I/O.
+    fn disponibilidade(&self) -> Disponibilidade {
+        Disponibilidade::Disponivel
+    }
+}
+
+/// O que [`Tool::disponibilidade`] responde.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Disponibilidade {
+    /// Operacional: entra na lista chamavel (se o portao deixar).
+    Disponivel,
+    /// Registrada mas nao utilizavel agora. Fica FORA da lista chamavel; o
+    /// `garra_status` e os diagnosticos a mostram com o motivo.
+    Indisponivel {
+        /// Legivel por maquina: `not_configured` | `channel_offline` |
+        /// `no_roots` | `no_devices` | `mcp_disconnected` | ...
+        codigo: &'static str,
+        /// Legivel por humano, sem segredo nem caminho do host.
+        motivo: String,
+        /// O que fazer, quando ha o que fazer.
+        remediacao: Option<String>,
+    },
+}
+
+impl Disponibilidade {
+    pub fn indisponivel(
+        codigo: &'static str,
+        motivo: impl Into<String>,
+        remediacao: Option<String>,
+    ) -> Self {
+        Self::Indisponivel {
+            codigo,
+            motivo: motivo.into(),
+            remediacao,
+        }
+    }
+
+    pub fn e_disponivel(&self) -> bool {
+        matches!(self, Self::Disponivel)
+    }
+
+    /// O texto que volta ao modelo quando ele pede a ferramenta mesmo assim.
+    pub fn explicacao(&self, nome: &str) -> String {
+        match self {
+            Self::Disponivel => format!("A ferramenta `{nome}` esta disponivel."),
+            Self::Indisponivel {
+                codigo,
+                motivo,
+                remediacao,
+            } => {
+                let mut texto = format!(
+                    "A ferramenta `{nome}` existe, mas esta indisponivel agora ({codigo}): {motivo}"
+                );
+                if let Some(r) = remediacao {
+                    texto.push_str(&format!(" {r}"));
+                }
+                texto.push_str(" Nao repita a chamada neste turno; diga ao usuario o motivo.");
+                texto
+            }
+        }
+    }
 }
 
 /// Resultado retornado por uma ferramenta.
@@ -128,6 +219,32 @@ impl ToolOutput {
             requires_confirmation: true,
         }
     }
+}
+
+/// #1296: erro de entrada que o modelo consegue corrigir no mesmo turno.
+///
+/// Volta como `Ok(ToolOutput { is_error: true })` — observação de tool — e
+/// NUNCA como `Err(Error::Agent(...))`. O dispatch do runtime até converte
+/// `Err` em `ToolOutput::error(e.to_string())`, mas aí a mensagem sai com o
+/// prefixo `agent error:` (enganoso — quem errou foi a chamada, não o
+/// agente) e sem orientação de schema; e em caminhos sem amortecimento
+/// (orquestrador falha o step, um futuro call site pode falhar o turno) um
+/// erro de forma recuperável vira abort. A regra: `Err` só para falha
+/// ambiental real (IO, permissão, jail); entrada malformada é observação.
+pub(crate) fn parametro_ausente(tool: &str, schema: &str, faltando: &str) -> ToolOutput {
+    ToolOutput::error(format!(
+        "parâmetro '{faltando}' ausente — {tool} requer {schema}. \
+         Reenvie a chamada com o parâmetro preenchido."
+    ))
+}
+
+/// Variante do [`parametro_ausente`] para argumentos em que a presença E o
+/// tipo podem errar (`as_i64`/`as_str` sobre um JSON de outra forma).
+pub(crate) fn argumento_invalido(tool: &str, schema: &str, faltando: &str) -> ToolOutput {
+    ToolOutput::error(format!(
+        "argumento '{faltando}' ausente ou inválido — {tool} requer {schema}. \
+         Reenvie a chamada com o argumento correto."
+    ))
 }
 
 #[cfg(test)]

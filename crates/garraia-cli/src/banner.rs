@@ -52,6 +52,73 @@ pub(crate) fn shorten_path(p: &Path) -> String {
     format!("{head}…{tail}")
 }
 
+/// Renderiza a tela `garra about` a partir das capacidades do terminal.
+///
+/// Pura de proposito, no mesmo molde do `ui/conversation` (#942): nada aqui
+/// escreve no terminal, e cada linha e afirmavel contra literal em teste —
+/// inclusive o caminho plain, que ninguem exercita a mao e por isso quebrava
+/// em silencio: a versao anterior escrevia ANSI incondicional, e um
+/// `garra about > arquivo` (ou pipe, `NO_COLOR`, `TERM=dumb`) recebia
+/// sequencias de escape cruas.
+pub fn about_text(style: crate::ui::Style) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+
+    // Cores e desenho derivam do Style — o dono unico da decisao e
+    // `ui::Capabilities::detect()`, nao este modulo.
+    let (cyan, yellow, green, bold, dim, reset) = if style.color {
+        (
+            "\x1b[36m", "\x1b[33m", "\x1b[32m", "\x1b[1m", "\x1b[2m", "\x1b[0m",
+        )
+    } else {
+        ("", "", "", "", "", "")
+    };
+    let (tl, tr, bl, br, h, v) = if style.unicode {
+        ('╭', '╮', '╰', '╯', '─', '│')
+    } else {
+        ('+', '+', '+', '+', '-', '|')
+    };
+    // Largura interna do quadro (46 colunas entre as bordas), herdada da
+    // versao anterior; `edge` monta as bordas e `pad` as linhas vazias.
+    let bar = h.to_string().repeat(46);
+    let edge = |l: char, r: char| format!("{cyan}{bold}{l}{bar}{r}{reset}\n");
+    let pad = format!(
+        "{cyan}{bold}{v}{reset}                                              {cyan}{bold}{v}{reset}"
+    );
+
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str(&edge(tl, tr));
+    out.push_str(&format!("{pad}\n"));
+    out.push_str(&format!("{cyan}{bold}{v}{reset}      {yellow}{bold}_~^~^~_{reset}                                {cyan}{bold}{v}{reset}\n"));
+    out.push_str(&format!("{cyan}{bold}{v}{reset}   {yellow}{bold}\\) /  o o  \\ (/{reset}   {green}{bold}GarraIA v{version}{reset}         {cyan}{bold}{v}{reset}\n"));
+    out.push_str(&format!("{cyan}{bold}{v}{reset}     {yellow}{bold}'_   -   _'{reset}    Personal AI Assistant   {cyan}{bold}{v}{reset}\n"));
+    out.push_str(&format!("{cyan}{bold}{v}{reset}     {yellow}{bold}/ '-----' \\{reset}                            {cyan}{bold}{v}{reset}\n"));
+    out.push_str(&format!("{pad}\n"));
+    out.push_str(&edge(bl, br));
+    out.push('\n');
+    out.push_str(&format!(
+        "  {dim}Assistente de IA pessoal, escrito em Rust.{reset}\n"
+    ));
+    out.push_str(&format!(
+        "  {dim}Tudo local: conversas, memoria, config e credenciais.{reset}\n"
+    ));
+    out.push('\n');
+    // O nome que o usuario tem na maquina (`garra` ou `garraia`), alinhado
+    // em coluna fixa para o desenho nao entortar com o nome mais longo.
+    let bin = crate::binario::nome();
+    out.push_str(&format!("  {bold}{bin:<14}{reset} conversar\n"));
+    let start = format!("{bin} start");
+    out.push_str(&format!("  {bold}{start:<14}{reset} subir o gateway\n"));
+    let doctor = format!("{bin} doctor");
+    out.push_str(&format!(
+        "  {bold}{doctor:<14}{reset} diagnosticar a instalacao\n"
+    ));
+    let help = format!("{bin} --help");
+    out.push_str(&format!("  {bold}{help:<14}{reset} todos os comandos\n"));
+    out.push('\n');
+    out
+}
+
 /// A marca inteira, sob demanda (#935).
 ///
 /// O mascote saiu da abertura do `garra chat`, que passou a ser um cabecalho
@@ -60,45 +127,9 @@ pub(crate) fn shorten_path(p: &Path) -> String {
 /// porque identidade de produto nao se joga fora: so deixa de ser cobrada de
 /// quem so quer conversar.
 pub fn print_about() {
-    const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-    const GREEN: &str = "\x1b[32m";
-    const BOLD: &str = "\x1b[1m";
-    const DIM: &str = "\x1b[2m";
-    const RESET: &str = "\x1b[0m";
-
-    let version = env!("CARGO_PKG_VERSION");
-
-    println!();
-    println!("{CYAN}{BOLD}╭──────────────────────────────────────────────╮{RESET}");
-    println!(
-        "{CYAN}{BOLD}│{RESET}                                              {CYAN}{BOLD}│{RESET}"
-    );
-    println!(
-        "{CYAN}{BOLD}│{RESET}      {YELLOW}{BOLD}_~^~^~_{RESET}                                {CYAN}{BOLD}│{RESET}"
-    );
-    println!(
-        "{CYAN}{BOLD}│{RESET}   {YELLOW}{BOLD}\\) /  o o  \\ (/{RESET}   {GREEN}{BOLD}GarraIA v{version}{RESET}         {CYAN}{BOLD}│{RESET}"
-    );
-    println!(
-        "{CYAN}{BOLD}│{RESET}     {YELLOW}{BOLD}'_   -   _'{RESET}    Personal AI Assistant   {CYAN}{BOLD}│{RESET}"
-    );
-    println!(
-        "{CYAN}{BOLD}│{RESET}     {YELLOW}{BOLD}/ '-----' \\{RESET}                            {CYAN}{BOLD}│{RESET}"
-    );
-    println!(
-        "{CYAN}{BOLD}│{RESET}                                              {CYAN}{BOLD}│{RESET}"
-    );
-    println!("{CYAN}{BOLD}╰──────────────────────────────────────────────╯{RESET}");
-    println!();
-    println!("  {DIM}Assistente de IA pessoal, escrito em Rust.{RESET}");
-    println!("  {DIM}Tudo local: conversas, memoria, config e credenciais.{RESET}");
-    println!();
-    println!("  {BOLD}garra{RESET}          conversar");
-    println!("  {BOLD}garra start{RESET}    subir o gateway");
-    println!("  {BOLD}garra doctor{RESET}   diagnosticar a instalacao");
-    println!("  {BOLD}garra --help{RESET}   todos os comandos");
-    println!();
+    // O dono unico da decisao (#942): pipe/arquivo, `NO_COLOR` e `TERM=dumb`
+    // recebem o caminho plain (ASCII, sem escape nenhum).
+    print!("{}", about_text(crate::ui::Capabilities::detect().style()));
 }
 
 /// Print the startup banner with Ferris and config summary.
@@ -271,5 +302,29 @@ mod tests {
             s.contains('…'),
             "expected ellipsis in shortened path, got `{s}`"
         );
+    }
+
+    /// O débito que motivou o `about_text` (#942, TODO.md): a versão anterior
+    /// escrevia ANSI incondicional, e `garra about > arquivo` recebia escapes
+    /// crus. O caminho plain é ASCII puro, sem uma única sequência de escape.
+    #[test]
+    fn about_plain_has_no_ansi_and_ascii_box() {
+        let s = about_text(crate::ui::Style::PLAIN);
+        assert!(
+            !s.contains('\x1b'),
+            "plain path must not emit escape sequences, got `{s}`"
+        );
+        assert!(s.contains('+'), "plain box uses ASCII corners, got `{s}`");
+        assert!(s.contains('-'), "plain box uses ASCII rules, got `{s}`");
+        assert!(s.contains("GarraIA v"), "version line missing");
+    }
+
+    /// O terminal interativo comum continua recebendo cor e o quadro unicode.
+    #[test]
+    fn about_rich_uses_color_and_unicode_box() {
+        let s = about_text(crate::ui::Style::RICH);
+        assert!(s.contains("\x1b[36m"), "rich path colors the frame cyan");
+        assert!(s.contains('╭'), "rich box uses unicode corners, got `{s}`");
+        assert!(s.contains("GarraIA v"), "version line missing");
     }
 }

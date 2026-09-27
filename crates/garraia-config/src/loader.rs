@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use garraia_common::{Error, Result};
 use tracing::info;
 
-use crate::model::{AppConfig, McpServerConfig};
+use crate::model::{AppConfig, ChannelConfig, McpServerConfig};
 
 pub struct ConfigLoader {
     config_dir: PathBuf,
@@ -55,7 +55,38 @@ impl ConfigLoader {
         &self.config_dir
     }
 
+    /// Le o arquivo de config (ou os defaults) **e** aplica a env por cima.
+    ///
+    /// ADR 0024 (#1329): `GARRAIA_EXECUTION_PROFILE` vence `execution.profile`
+    /// e e resolvida aqui, uma vez, com a origem registrada. Valor invalido
+    /// e erro de carga — o gateway nao sobe — em vez de cair em `standard`
+    /// em silencio. E o unico lugar que aplica a env: `AppConfig::default()`
+    /// nunca a le, para os fluxos de teste baseados em `Default` nao
+    /// dependerem do ambiente.
+    ///
+    /// #1261: `GARRAIA_GATEWAY_API_KEY` tambem entra aqui, e so aqui, em
+    /// `gateway.api_key_env` — um campo que o serde nunca le nem escreve,
+    /// para que um `save()` depois do `load()` nao grave o segredo de env no
+    /// `config.yml`.
     pub fn load(&self) -> Result<AppConfig> {
+        let mut config = self.load_sem_env()?;
+        config
+            .execution
+            .aplicar_env()
+            .map_err(|e| Error::Config(e.to_string()))?;
+        config.gateway.api_key_env = crate::auth::gateway_api_key_from_env();
+        Ok(config)
+    }
+
+    /// [`Self::load`] sem aplicar `GARRAIA_EXECUTION_PROFILE`.
+    ///
+    /// Para o `garra config check`: um valor invalido na env tem de virar
+    /// **Finding** de severidade `Error` no relatorio (com o sumario, as
+    /// outras findings e o exit code 2), nao um exit 65 "arquivo nao parseia"
+    /// — o arquivo parseia; o que esta errado e o ambiente. O check le a env
+    /// por conta propria (`validate_execution`). Todo outro chamador quer
+    /// `load`.
+    pub fn load_sem_env(&self) -> Result<AppConfig> {
         self.warn_if_legacy_dir_shadowed();
         let yaml_path = self.config_dir.join("config.yml");
         let toml_path = self.config_dir.join("config.toml");
@@ -63,6 +94,34 @@ impl ConfigLoader {
         if yaml_path.exists() {
             info!("loading config from {}", yaml_path.display());
             let contents = std::fs::read_to_string(&yaml_path)?;
+            // Um `config.yml` sem conteudo desserializa **com sucesso** para
+            // `AppConfig::default()`, e esse e o pior resultado possivel: e a
+            // forma exata que uma escrita truncada deixa o arquivo, e o que
+            // vinha depois era um `save()` gravando os defaults por cima da
+            // config do usuario — e todo gate que morava nela (chaves, canais,
+            // credenciais) sumindo em silencio. Arquivo sem conteudo nao e "sem
+            // config": e config ilegivel.
+            //
+            // Dois criterios, porque nenhum cobre o outro. `trim().is_empty()`
+            // pega o arquivo em branco, inclusive quando ele tem um TAB, que o
+            // YAML nem consegue tokenizar. E `Value::Null` pega o arquivo que
+            // sobrou so com comentarios: ele tem bytes, passa pelo `trim`, cai
+            // no mesmo `AppConfig::default()` e faria a mesma perda silenciosa
+            // de gate. Erro de parse com conteudo de verdade cai fora daqui de
+            // proposito: a mensagem do `from_str` abaixo diz linha e coluna, e
+            // esta nao diria.
+            let sem_conteudo = contents.trim().is_empty()
+                || serde_yaml::from_str::<serde_yaml::Value>(&contents)
+                    .map(|v| v.is_null())
+                    .unwrap_or(false);
+            if sem_conteudo {
+                return Err(Error::Config(format!(
+                    "{} esta vazio (ou so tem comentarios) — isso costuma ser uma \
+                     escrita interrompida, nao uma config valida. Restaure o \
+                     arquivo, ou apague-o para que os defaults valham.",
+                    yaml_path.display()
+                )));
+            }
             serde_yaml::from_str(&contents)
                 .map_err(|e| Error::Config(format!("failed to parse YAML config: {e}")))
         } else if toml_path.exists() {
@@ -74,6 +133,70 @@ impl ConfigLoader {
             info!("no config file found, using defaults");
             Ok(AppConfig::default())
         }
+    }
+
+    /// [`Self::load_sem_env`] para o `garra config check`, que tolera **um**
+    /// defeito a mais: `execution.profile` com valor fora de
+    /// `standard` | `isolated-pod` no arquivo.
+    ///
+    /// ADR 0024: valor invalido no arquivo e erro de carga — `load` recusa e
+    /// o gateway nao sobe — e o `config check` reporta `Error` em
+    /// `execution.profile` (exit 2). So que o serde recusa o valor como erro
+    /// de parse do arquivo inteiro, e ai o check nunca chegava ao relatorio:
+    /// era exit 65 "o arquivo nao parseia; corrija a sintaxe", que manda o
+    /// operador procurar um erro de YAML que nao existe. Aqui, quando o
+    /// arquivo nao carrega, o valor de `execution.profile` e lido cru; se
+    /// ele e a unica coisa errada, a config e carregada sem ele e marcada
+    /// com o valor recusado (`ExecutionConfig::perfil_invalido_no_arquivo`),
+    /// que `validate_execution` transforma no `Error`. Qualquer outro erro
+    /// de parse continua sendo o erro original.
+    ///
+    /// Nunca e o caminho do boot: a marca so nasce aqui.
+    pub fn load_para_o_check(&self) -> Result<AppConfig> {
+        let erro = match self.load_sem_env() {
+            Ok(config) => return Ok(config),
+            Err(e) => e,
+        };
+        match self.recarregar_sem_o_perfil_invalido() {
+            Some(config) => Ok(config),
+            None => Err(erro),
+        }
+    }
+
+    /// A metade crua de [`Self::load_para_o_check`]: `Some` so quando
+    /// `execution.profile` e uma string que o arquivo nao aceita E o resto
+    /// do arquivo carrega sem ela.
+    fn recarregar_sem_o_perfil_invalido(&self) -> Option<AppConfig> {
+        let yaml_path = self.config_dir.join("config.yml");
+        let toml_path = self.config_dir.join("config.toml");
+
+        let (mut config, valor) = if yaml_path.exists() {
+            let contents = std::fs::read_to_string(&yaml_path).ok()?;
+            let mut valor: serde_yaml::Value = serde_yaml::from_str(&contents).ok()?;
+            let perfil = valor
+                .get_mut("execution")?
+                .as_mapping_mut()?
+                .remove("profile")?;
+            let cru = perfil.as_str()?.to_string();
+            let config: AppConfig = serde_yaml::from_value(valor).ok()?;
+            (config, cru)
+        } else if toml_path.exists() {
+            let contents = std::fs::read_to_string(&toml_path).ok()?;
+            let mut valor: toml::Value = toml::from_str(&contents).ok()?;
+            let perfil = valor
+                .get_mut("execution")?
+                .as_table_mut()?
+                .remove("profile")?;
+            let cru = perfil.as_str()?.to_string();
+            let config: AppConfig = valor.try_into().ok()?;
+            (config, cru)
+        } else {
+            return None;
+        };
+
+        let err = crate::execution::perfil_do_arquivo_estrito(&valor).err()?;
+        config.execution.marcar_perfil_invalido_no_arquivo(err);
+        Some(config)
     }
 
     /// Warn when config files exist in the legacy `~/.garraia` dir while the
@@ -119,9 +242,10 @@ impl ConfigLoader {
             }
         };
 
-        // Per-entry deserialization: one malformed server (e.g. a URL-only
-        // entry written by the admin UI, whose schema differs) must not drop
-        // every other server in the file.
+        // Per-entry deserialization: one malformed server (a wrong-typed
+        // field, say) must not drop every other server in the file. Since
+        // #1274 a URL-only entry is NOT malformed — it is an HTTP server and
+        // is kept, with its `allowed_tools`.
         #[derive(serde::Deserialize)]
         struct McpJsonFile {
             #[serde(default, rename = "mcpServers")]
@@ -141,6 +265,19 @@ impl ConfigLoader {
         for (name, value) in raw {
             match serde_json::from_value::<McpServerConfig>(value) {
                 Ok(cfg) => {
+                    // #1274: `command` is `#[serde(default)]` now, so the
+                    // type no longer refuses a stdio entry without one — the
+                    // refusal has to be explicit here, before the merge, or
+                    // a defaulted `String` would flow on toward a spawn. An
+                    // entry with a `url` is legitimate without a command
+                    // (HTTP/SSE); this is the same rule `garra config check`
+                    // reports as an error for the `mcp:` section.
+                    if cfg.command.trim().is_empty() && cfg.url.is_none() {
+                        tracing::warn!(
+                            "mcp.json entry '{name}' has neither 'command' nor 'url', skipping"
+                        );
+                        continue;
+                    }
                     servers.insert(name, cfg);
                 }
                 Err(e) => {
@@ -190,24 +327,216 @@ impl ConfigLoader {
     /// The file is written with mode `0600` on Unix — `llm.*.api_key` and
     /// `gateway.api_key` live in here, so a umask-default `0644` would leave
     /// provider credentials world-readable.
+    ///
+    /// On Windows there is **no** equivalent hardening today: the file lands
+    /// with whatever ACL the parent directory grants by default (typically
+    /// readable by every process of the same user, and by administrators).
+    /// That gap is tracked in #1253 — until a Windows ACL path exists, treat
+    /// the on-disk `config.yml` as unprotected on Windows and prefer env-only
+    /// secrets (`AuthConfig::from_env`) there.
     pub fn save(&self, config: &AppConfig) -> Result<()> {
         let yaml_path = self.config_dir.join("config.yml");
 
         let contents = serde_yaml::to_string(config)
             .map_err(|e| Error::Config(format!("failed to serialize config: {e}")))?;
 
-        std::fs::write(&yaml_path, contents).map_err(|e| {
-            garraia_common::Error::Config(format!(
-                "failed to write config to {}: {e}",
-                yaml_path.display()
-            ))
-        })?;
-
-        harden_secret_file(&yaml_path)?;
+        write_atomic_secret(&yaml_path, contents.as_bytes())?;
 
         info!("saved updated config to {}", yaml_path.display());
         Ok(())
     }
+
+    /// Liga ou desliga `channels.<key>.enabled`, sem tocar em mais nada.
+    ///
+    /// Devolve `true` quando o arquivo mudou; `false` quando ja estava assim
+    /// (ou quando a secao nao existe e o pedido era `false` — nao se cria uma
+    /// secao so para escrever "desligado").
+    ///
+    /// # Por que isto mora aqui
+    ///
+    /// Dois processos precisam desta escrita e precisam dela **igual**: a CLI
+    /// (`garra whatsapp link` liga, `logout` desliga) e o gateway (que desliga
+    /// sozinho quando o servidor mata a sessao — senao todo boot seguinte paga
+    /// timeout e retry por uma credencial que nao existe mais). Duas copias
+    /// desta funcao divergiriam no dia em que uma delas ganhasse um campo, e o
+    /// sintoma seria o pior possivel: a CLI dizendo "desligado" e o gateway
+    /// subindo o canal assim mesmo.
+    pub fn set_channel_enabled(&self, key: &str, enabled: bool) -> Result<bool> {
+        // `save` escreve `<config_dir>/config.yml`; numa maquina que nunca
+        // rodou `garra init` o diretorio ainda nao existe.
+        self.ensure_dirs()?;
+        let mut config = self.load()?;
+        match config.channels.get_mut(key) {
+            Some(existing) => {
+                if existing.enabled == Some(enabled) {
+                    return Ok(false);
+                }
+                existing.enabled = Some(enabled);
+            }
+            None => {
+                if !enabled {
+                    return Ok(false);
+                }
+                config.channels.insert(
+                    key.to_string(),
+                    ChannelConfig {
+                        channel_type: key.to_string(),
+                        enabled: Some(true),
+                        settings: Default::default(),
+                    },
+                );
+            }
+        }
+        self.save(&config)?;
+        Ok(true)
+    }
+}
+
+/// Escreve `path` de forma atomica e ja apertada: tmp no **mesmo** diretorio,
+/// nascido `0600`, `sync_all`, `rename`.
+///
+/// # Por que isto substituiu `fs::write` + `harden_secret_file`
+///
+/// `std::fs::write` e truncate-then-write: entre o truncate e o fim da escrita
+/// o `config.yml` esta parcial no disco, e uma queda ali deixa o arquivo vazio
+/// — que o `load` acima agora recusa em vez de tratar como "sem config". O
+/// `chmod` vinha **depois** da escrita, entao havia ainda uma janela em que
+/// `llm.*.api_key` e `gateway.api_key` estavam no disco com o modo do umask
+/// (comumente `0644`).
+///
+/// A janela deixou de ser teorica nesta fatia: alem da CLI (`garra whatsapp
+/// link` / `logout`), o gateway passou a chamar `set_channel_enabled` sozinho
+/// quando o servidor invalida a sessao — dois processos, read-modify-write, sem
+/// lock. O `rename` nao remove a corrida de leitura-modificacao-escrita (o
+/// ultimo a escrever ainda vence), mas garante que nenhum leitor jamais veja um
+/// arquivo pela metade, e que o arquivo nunca exista com modo frouxo.
+///
+/// # Por que o nome do temporario e aleatorio, e por que `create_new`
+///
+/// O nome era deterministico (`.config.yml.tmp`) e o arquivo era aberto com
+/// `create(true).truncate(true)`, sem `O_EXCL`. Com **um** escritor isso e
+/// inofensivo; com dois — e o paragrafo acima declara dois — os dois calculam
+/// o mesmo caminho. A escrita do gateway abre o tmp e comeca a escrever; a da
+/// CLI abre o MESMO tmp com `O_TRUNC` no meio; a primeira segue escrevendo do
+/// offset antigo, e o que sobra e um arquivo com buraco de NULs e fragmentos
+/// dos dois. Os dois `rename`: o `config.yml` resultante ou nao parseia (o
+/// gateway nao sobe) ou parseia pela metade e **perde secoes** — exatamente a
+/// perda silenciosa de gate que esta funcao existe para impedir.
+///
+/// E com nome previsivel o preexistente nao precisa ser um arquivo: um symlink
+/// plantado no mesmo diretorio seria SEGUIDO por `create(true)`, e o alvo dele
+/// e que receberia a config e o `chmod`. `create_new(true)` recusa abrir
+/// qualquer coisa que ja exista — symlink inclusive — e o sufixo aleatorio faz
+/// o caminho nao ser adivinhavel. As duas juntas, porque cada uma sozinha
+/// ainda deixa metade do problema.
+///
+/// O padrao e o mesmo de `whatsapp_linked::session::write_atomic`, que guarda o
+/// blob de sessao, ate no sufixo: sao dois call sites e um padrao, e a
+/// alternativa era duas definicoes de "escrita segura" capazes de divergir.
+fn write_atomic_secret(path: &Path, bytes: &[u8]) -> Result<()> {
+    let nonce = u64::from_ne_bytes(garraia_security::random_bytes::<8>().map_err(|_| {
+        Error::Config("RNG do sistema indisponivel para nomear o temporario da config".into())
+    })?);
+    write_atomic_secret_with_nonce(path, bytes, nonce)
+}
+
+/// O caminho do temporario que [`write_atomic_secret_with_nonce`] vai usar.
+///
+/// Funcao nomeada, e nao um `format!` no meio da escrita, porque e o que
+/// permite ao teste plantar no caminho EXATO — e sem isso nao ha como pinar o
+/// `create_new`. Plantar no nome deterministico de antes do nonce so pina o
+/// nonce: trocar `create_new(true)` por `create(true).truncate(true)` deixa
+/// esse teste verde, porque o caminho plantado ja nao e o caminho escrito.
+/// Mesma licao, e mesma forma, do `session::tmp_path_for`.
+fn tmp_path_for(path: &Path, nonce: u64) -> PathBuf {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    dir.join(format!(
+        ".{}.{nonce:016x}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config".into())
+    ))
+}
+
+/// [`write_atomic_secret`] com o nonce injetado. Ver [`tmp_path_for`].
+fn write_atomic_secret_with_nonce(path: &Path, bytes: &[u8], nonce: u64) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| Error::Config(format!("{} nao tem diretorio pai", path.display())))?;
+
+    let tmp = tmp_path_for(path, nonce);
+
+    // `escreve_tmp` ja limpa o que ele mesmo criou — e SO o que ele criou.
+    // Se o `create_new` recusar um caminho ocupado, nada foi criado e nada ha
+    // para apagar: apagar ali seria destruir o arquivo do outro escritor, que
+    // e exatamente o que `create_new` existe para evitar, com outro nome.
+    //
+    // Daqui para baixo o `tmp` E nosso e ja tem a config inteira dentro —
+    // 0600, entao nao e exposicao, mas e uma segunda copia que ninguem espera
+    // e que o proximo `save` nao reaproveita, porque o nome muda. Por isso o
+    // desfecho de erro o apaga, e nao so no braco do `rename`, que era o unico
+    // coberto antes.
+    escreve_tmp(&tmp, bytes)?;
+    // `harden_secret_file` roda em TODA plataforma, e nao so fora de Unix como
+    // o comentario anterior dizia. Em Unix o `mode(0o600)` do `open` ja
+    // garante que o arquivo nunca existiu mais frouxo que isso — o `open(2)`
+    // aplica `mode & ~umask`, e umask so tira bit. O que sobra para esta
+    // chamada fazer la e o caso patologico do umask que tira tambem os bits do
+    // dono: `0000` e restritivo demais, e o proprio processo nao reabriria o
+    // arquivo.
+    let terminado = harden_secret_file(&tmp).and_then(|()| {
+        std::fs::rename(&tmp, path).map_err(|e| {
+            Error::Config(format!(
+                "failed to replace {} atomically: {e}",
+                path.display()
+            ))
+        })
+    });
+    if let Err(e) = terminado {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Best-effort: sem isto o rename pode nao estar duravel depois de uma queda
+    // de energia. Falha aqui nao invalida a escrita.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// O temporario do [`write_atomic_secret`]: criado do zero, 0600 desde o
+/// `open`, escrito e sincronizado.
+fn escreve_tmp(tmp: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    // `create_new`: se o caminho ja existe — arquivo ou symlink — isto falha
+    // em vez de escrever por cima. Ver o docstring de [`write_atomic_secret`].
+    opts.write(true).create_new(true);
+    // Nasce 0600: apertar depois da escrita deixaria uma janela com o
+    // segredo ja no disco sob o modo do umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    // Um `?` aqui e o desfecho CERTO de `create_new` recusando um caminho
+    // ocupado: nada foi criado, e portanto nada ha para limpar.
+    let mut f = opts
+        .open(tmp)
+        .map_err(|e| Error::Config(format!("failed to open {} for write: {e}", tmp.display())))?;
+    let escrito = f.write_all(bytes).and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = escrito {
+        // Daqui em diante o arquivo E nosso, e ja tem parte da config dentro.
+        let _ = std::fs::remove_file(tmp);
+        return Err(Error::Config(format!(
+            "failed to write {}: {e}",
+            tmp.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Restrict `path` to owner-only read/write (`0600`) on Unix.
@@ -217,29 +546,30 @@ impl ConfigLoader {
 /// the credential vault, and `std::fs::write` alone leaves the file at whatever
 /// the process umask allows (commonly `0644`).
 ///
-/// No-op on non-Unix targets, where the parent directory ACL governs access.
+/// No-op on non-Unix targets — on Windows the file keeps whatever ACL the
+/// parent directory grants by default, which is **not** an access
+/// restriction: any process of the same user reads it. That gap is tracked
+/// in #1253; until a Windows ACL path exists, Unix-only is the honest
+/// description of what this function guarantees.
+///
+/// A politica em si mora em [`garraia_common::fs_perms`] desde o
+/// `whatsapp_linked`: `garraia-channels` precisa das mesmas regras (0600 em
+/// arquivo, 0700 em diretorio) e nao depende desta crate. Esta funcao continua
+/// existindo porque dezenas de call sites ja a usam e porque ela mapeia o erro
+/// para [`Error::Config`]; o que ela nao faz mais e ter uma segunda definicao
+/// de "modo seguro" capaz de divergir da primeira.
 pub fn harden_secret_file(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            Error::Config(format!(
-                "failed to restrict permissions on {}: {e}",
-                path.display()
-            ))
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    garraia_common::fs_perms::harden_secret_file(path).map_err(|e| {
+        Error::Config(format!(
+            "failed to restrict permissions on {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ConfigLoader;
+    use super::{ConfigLoader, tmp_path_for, write_atomic_secret_with_nonce};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -291,6 +621,215 @@ mod tests {
             mode & 0o777
         );
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// ADR 0024 (#1329): `load` aplica `GARRAIA_EXECUTION_PROFILE` por cima
+    /// do arquivo (env vence). `load_sem_env` ignora a env de proposito, para
+    /// o `config check` poder reportar o mesmo valor como Finding.
+    ///
+    /// So valores VALIDOS entram na env aqui: `load()` e lido sem lock por
+    /// outros testes deste binario, e um valor invalido em transito faria
+    /// qualquer um deles falhar (review C7). O caminho invalido e provado
+    /// puro em `execution::tests` e num subprocesso pelo smoke da CLI.
+    #[test]
+    fn load_aplica_a_env_do_perfil() {
+        use crate::execution::{ExecutionProfile, PROFILE_ENV, ProfileSource};
+
+        let dir = temp_dir("execution-env");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::write(dir.join("config.yml"), "execution:\n  profile: standard\n")
+            .expect("failed to write config");
+        let loader = ConfigLoader::with_dir(&dir);
+
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Restaura(Option<std::ffi::OsString>);
+        impl Drop for Restaura {
+            fn drop(&mut self) {
+                // SAFETY: ENV_TEST_LOCK held for the whole test.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(PROFILE_ENV, v),
+                        None => std::env::remove_var(PROFILE_ENV),
+                    }
+                }
+            }
+        }
+        let _restaura = Restaura(std::env::var_os(PROFILE_ENV));
+
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe { std::env::set_var(PROFILE_ENV, "isolated-pod") };
+        let com_env = loader.load();
+        let sem_env = loader.load_sem_env();
+
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe { std::env::remove_var(PROFILE_ENV) };
+        let sem_nada = loader.load();
+        let _ = fs::remove_dir_all(dir);
+
+        let com_env = com_env.expect("env valida carrega");
+        assert_eq!(com_env.execution.perfil(), ExecutionProfile::IsolatedPod);
+        assert_eq!(com_env.execution.origem(), ProfileSource::Env);
+        // O arquivo continua dizendo `standard`: um `save` nao promove a env.
+        assert_eq!(com_env.execution.profile, Some(ExecutionProfile::Standard));
+
+        let sem_env = sem_env.expect("load_sem_env ignora a env");
+        assert_eq!(sem_env.execution.perfil(), ExecutionProfile::Standard);
+        assert_eq!(sem_env.execution.origem(), ProfileSource::File);
+
+        let sem_nada = sem_nada.expect("sem env carrega");
+        assert_eq!(sem_nada.execution.origem(), ProfileSource::File);
+    }
+
+    /// #1261: `GARRAIA_GATEWAY_API_KEY` vence o arquivo em `load()`, nunca
+    /// entra em `load_sem_env()`, e — o ponto de seguranca — um `save()` do
+    /// que `load()` devolveu NAO grava o segredo de env no `config.yml`.
+    #[test]
+    fn load_aplica_a_credencial_de_env_sem_nunca_salva_la() {
+        use crate::auth::GATEWAY_API_KEY_ENV;
+
+        let dir = temp_dir("gateway-key-env");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::write(
+            dir.join("config.yml"),
+            "gateway:\n  api_key: \"chave-do-arquivo\"\n",
+        )
+        .expect("failed to write config");
+        let loader = ConfigLoader::with_dir(&dir);
+
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Restaura(Option<std::ffi::OsString>);
+        impl Drop for Restaura {
+            fn drop(&mut self) {
+                // SAFETY: ENV_TEST_LOCK held for the whole test.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var(GATEWAY_API_KEY_ENV, v),
+                        None => std::env::remove_var(GATEWAY_API_KEY_ENV),
+                    }
+                }
+            }
+        }
+        let _restaura = Restaura(std::env::var_os(GATEWAY_API_KEY_ENV));
+
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe { std::env::set_var(GATEWAY_API_KEY_ENV, "segredo-da-env-1261") };
+        let com_env = loader.load().expect("carrega");
+        let sem_env = loader.load_sem_env().expect("carrega");
+        loader.save(&com_env).expect("salva");
+        let gravado = fs::read_to_string(dir.join("config.yml")).expect("le");
+
+        // SAFETY: ENV_TEST_LOCK held.
+        unsafe { std::env::set_var(GATEWAY_API_KEY_ENV, "   ") };
+        let em_branco = loader.load().expect("carrega");
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(
+            com_env.gateway.api_key_normalizada(),
+            Some("segredo-da-env-1261"),
+            "a env vence o arquivo"
+        );
+        assert_eq!(
+            sem_env.gateway.api_key_normalizada(),
+            Some("chave-do-arquivo")
+        );
+        assert!(
+            !gravado.contains("segredo-da-env-1261"),
+            "o segredo de env nao pode chegar ao disco: {gravado}"
+        );
+        assert!(gravado.contains("chave-do-arquivo"));
+        assert_eq!(
+            em_branco.gateway.api_key_normalizada(),
+            Some("chave-do-arquivo"),
+            "env em branco nao e credencial e nao apaga a do arquivo"
+        );
+        assert!(!format!("{:?}", com_env.gateway).contains("segredo-da-env-1261"));
+    }
+
+    /// ADR 0024: valor invalido de `execution.profile` NO ARQUIVO e erro de
+    /// carga (`load` e `load_sem_env` recusam; o gateway nao sobe), mas o
+    /// `config check` precisa chegar ao relatorio para dizer `Error` em
+    /// `execution.profile` (review C10). `load_para_o_check` carrega o resto
+    /// e marca o valor recusado; qualquer OUTRO erro de parse continua sendo
+    /// erro.
+    #[test]
+    fn load_para_o_check_tolera_so_o_perfil_invalido_no_arquivo() {
+        use crate::execution::{ExecutionProfile, ProfileSource};
+
+        for (arquivo, conteudo) in [
+            (
+                "config.yml",
+                "gateway:\n  port: 4000\nexecution:\n  profile: isolated_pod\n  pod_root: /workspace\n",
+            ),
+            (
+                "config.toml",
+                "[gateway]\nport = 4000\n\n[execution]\nprofile = \"isolated_pod\"\npod_root = \"/workspace\"\n",
+            ),
+        ] {
+            let dir = temp_dir("execution-invalid-file");
+            fs::create_dir_all(&dir).expect("failed to create temp dir");
+            fs::write(dir.join(arquivo), conteudo).expect("failed to write config");
+            let loader = ConfigLoader::with_dir(&dir);
+
+            assert!(
+                loader.load_sem_env().is_err(),
+                "{arquivo}: o arquivo e recusado"
+            );
+
+            let config = loader
+                .load_para_o_check()
+                .unwrap_or_else(|e| panic!("{arquivo}: o check carrega o resto: {e}"));
+            assert_eq!(
+                config.gateway.port, 4000,
+                "{arquivo}: o resto do arquivo vale"
+            );
+            assert_eq!(
+                config.execution.pod_root().map(|p| p.display().to_string()),
+                Some("/workspace".to_string()),
+                "{arquivo}"
+            );
+            let err = config
+                .execution
+                .perfil_invalido_no_arquivo()
+                .unwrap_or_else(|| panic!("{arquivo}: o valor recusado fica marcado"));
+            assert_eq!(err.valor(), "isolated_pod", "{arquivo}");
+            // Sem o valor invalido a secao e o default — e o Error do check
+            // e quem conta a historia, nao um `standard` em silencio no boot
+            // (que nunca chega a este objeto).
+            assert_eq!(config.execution.perfil(), ExecutionProfile::Standard);
+            assert_eq!(config.execution.origem(), ProfileSource::Default);
+            let _ = fs::remove_dir_all(dir);
+        }
+
+        // Valor valido no arquivo: `load_para_o_check` == `load_sem_env`.
+        let dir = temp_dir("execution-valid-file");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::write(
+            dir.join("config.yml"),
+            "execution:\n  profile: isolated-pod\n",
+        )
+        .expect("failed to write config");
+        let loader = ConfigLoader::with_dir(&dir);
+        let config = loader.load_para_o_check().expect("carrega");
+        assert!(config.execution.perfil_invalido_no_arquivo().is_none());
+        assert_eq!(config.execution.perfil(), ExecutionProfile::IsolatedPod);
+        let _ = fs::remove_dir_all(dir);
+
+        // Outro erro de parse (aqui: `gateway.port` nao numerico) junto com
+        // o perfil invalido: o erro original e devolvido, nao mascarado.
+        let dir = temp_dir("execution-other-error");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::write(
+            dir.join("config.yml"),
+            "gateway:\n  port: nao-e-porta\nexecution:\n  profile: isolated_pod\n",
+        )
+        .expect("failed to write config");
+        let loader = ConfigLoader::with_dir(&dir);
+        assert!(loader.load_para_o_check().is_err());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -404,6 +943,7 @@ mod tests {
                 memory_limit_mb: None,
                 max_restarts: None,
                 restart_delay_secs: None,
+                inherit_env: false,
             },
         );
 
@@ -422,16 +962,24 @@ mod tests {
         let dir = temp_dir("mcp-tolerant");
         fs::create_dir_all(&dir).expect("failed to create temp dir");
 
-        // "broken" lacks the required `command` (e.g. a URL-only entry
-        // written by the gateway admin UI). It must not drop "filesystem".
+        // "broken" has a wrong-typed field. It must not drop "filesystem".
+        // Since #1274 the URL-only entry ("http-only") is NOT invalid — it is
+        // an HTTP server, is kept, and carries its `allowed_tools` into the
+        // declared merge (see load_mcp_json_keeps_http_entry_without_command).
         let mcp_json = r#"{
             "mcpServers": {
                 "filesystem": {
                     "command": "npx",
                     "args": ["-y", "@modelcontextprotocol/server-filesystem", "/root"]
                 },
+                "http-only": {
+                    "url": "http://localhost:9999/mcp",
+                    "transport": "http",
+                    "allowed_tools": ["read_file"]
+                },
                 "broken": {
-                    "url": "http://localhost:9999/mcp"
+                    "command": "npx",
+                    "timeout": "soon"
                 }
             }
         }"#;
@@ -440,9 +988,80 @@ mod tests {
         let loader = ConfigLoader::with_dir(&dir);
         let mcp = loader.load_mcp_json();
 
-        assert_eq!(mcp.len(), 1);
+        assert_eq!(mcp.len(), 2);
         assert_eq!(mcp.get("filesystem").unwrap().command, "npx");
+        assert_eq!(
+            mcp.get("http-only").unwrap().allowed_tools,
+            vec!["read_file".to_string()]
+        );
         assert!(!mcp.contains_key("broken"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #1274 — the regression that is the reason for the issue. An HTTP entry
+    /// of `mcp.json` has no `command`; the loader used to drop it, so the
+    /// operator's `allowed_tools` never reached the declared merge the admin
+    /// restart reads, and a routine restart click reconnected the server with
+    /// every tool exposed. The entry must survive, allowlist intact.
+    #[test]
+    fn load_mcp_json_keeps_http_entry_without_command() {
+        let dir = temp_dir("mcp-http-entry");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+
+        // Exactly what an operator writes for a remote MCP server — the
+        // shape from issue #1274.
+        let mcp_json = r#"{
+            "mcpServers": {
+                "remote": {
+                    "url": "https://example.tld/mcp",
+                    "transport": "http",
+                    "allowed_tools": ["read_file"]
+                }
+            }
+        }"#;
+        fs::write(dir.join("mcp.json"), mcp_json).expect("failed to write mcp.json");
+
+        let loader = ConfigLoader::with_dir(&dir);
+        let mcp = loader.load_mcp_json();
+
+        let cfg = mcp.get("remote").expect(
+            "the HTTP entry must survive the loader — without it the declared \
+             merge is blind to the name and a restart reconnects the server \
+             unrestricted (#1274)",
+        );
+        assert!(cfg.command.is_empty());
+        assert_eq!(cfg.url.as_deref(), Some("https://example.tld/mcp"));
+        assert_eq!(cfg.allowed_tools, vec!["read_file".to_string()]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #1274 — the other side of the same default. A stdio entry without a
+    /// `command` used to be refused by the type; the refusal must now be the
+    /// explicit check at the merge boundary, not a lost guarantee. It must
+    /// never flow on toward a spawn of an empty command.
+    #[test]
+    fn load_mcp_json_skips_stdio_entry_without_command() {
+        let dir = temp_dir("mcp-stdio-no-command");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+
+        let mcp_json = r#"{
+            "mcpServers": {
+                "half-declared": {
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/root"],
+                    "transport": "stdio",
+                    "allowed_tools": ["read_file"]
+                }
+            }
+        }"#;
+        fs::write(dir.join("mcp.json"), mcp_json).expect("failed to write mcp.json");
+
+        let loader = ConfigLoader::with_dir(&dir);
+        assert!(
+            loader.load_mcp_json().is_empty(),
+            "a stdio entry without 'command' must be refused before the merge"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -455,6 +1074,51 @@ mod tests {
 
         let loader = ConfigLoader::with_dir(&dir);
         assert!(loader.load_mcp_json().is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #1273: the gateway's registry writer spells the tuning fields in
+    /// camelCase; the allowlist / inherit_env / enabled in snake_case. A
+    /// file written through the admin API must keep its declared values at
+    /// the next boot. `timeout` deliberately has NO camelCase alias — see
+    /// the field docs in `model.rs`.
+    #[test]
+    fn load_mcp_json_reads_gateway_written_tuning_aliases() {
+        let dir = temp_dir("mcp-aliases");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+
+        let mcp_json = r#"{
+            "mcpServers": {
+                "admin-written": {
+                    "command": "npx",
+                    "transport": "stdio",
+                    "timeoutSecs": 30,
+                    "memoryLimitMb": 256,
+                    "maxRestarts": 3,
+                    "restartDelaySecs": 2,
+                    "allowed_tools": ["read_file"],
+                    "inherit_env": true,
+                    "enabled": false
+                }
+            }
+        }"#;
+        fs::write(dir.join("mcp.json"), mcp_json).expect("failed to write mcp.json");
+
+        let loader = ConfigLoader::with_dir(&dir);
+        let mcp = loader.load_mcp_json();
+
+        let cfg = mcp.get("admin-written").expect("entry parsed");
+        assert_eq!(cfg.allowed_tools, vec!["read_file".to_string()]);
+        assert!(cfg.inherit_env);
+        assert_eq!(cfg.enabled, Some(false));
+        assert_eq!(cfg.memory_limit_mb, Some(256));
+        assert_eq!(cfg.max_restarts, Some(3));
+        assert_eq!(cfg.restart_delay_secs, Some(2));
+        // Sem alias de propósito: ler o `timeoutSecs: 30` do writer
+        // sobrescreveria `timeouts.mcp.default_secs` em servidores em que o
+        // operador nunca escolheu um timeout.
+        assert_eq!(cfg.timeout, None);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -473,6 +1137,201 @@ mod tests {
         assert!(dir.join("skills").exists());
         assert!(dir.join("data").exists());
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// **A prova de que a escrita e por rename, e nao truncate-then-write.**
+    ///
+    /// `std::fs::write` reaproveita o arquivo existente: mesmo inode, conteudo
+    /// substituido no lugar — e entre o truncate e o fim da escrita o
+    /// `config.yml` esta parcial no disco. Um `rename` atomico **troca** o
+    /// inode. E a unica diferenca observavel das duas implementacoes sem uma
+    /// corrida, e ela morre no instante em que alguem voltar ao `fs::write`.
+    #[cfg(unix)]
+    #[test]
+    fn save_substitui_o_arquivo_por_rename_em_vez_de_truncar() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = temp_dir("save-atomica");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let loader = ConfigLoader::with_dir(&dir);
+        let config = loader.load().expect("defaults");
+
+        loader.save(&config).expect("primeira escrita");
+        let path = dir.join("config.yml");
+        let antes = fs::metadata(&path).expect("metadata").ino();
+
+        loader.save(&config).expect("segunda escrita");
+        let depois = fs::metadata(&path).expect("metadata").ino();
+
+        assert_ne!(
+            antes, depois,
+            "o destino tem de ser substituido por rename; mesmo inode significa \
+             truncate-then-write, que deixa o arquivo parcial no disco durante a escrita"
+        );
+        assert!(
+            fs::read_dir(&dir)
+                .expect("lista")
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+            "nenhum tmp orfao pode sobrar — seria uma segunda copia da config inteira"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// **Config vazia nao e "sem config".**
+    ///
+    /// `serde_yaml` desserializa uma string em branco para `AppConfig::default()`
+    /// **com sucesso** — e essa era a forma exata que uma escrita interrompida
+    /// deixava o arquivo. O gate de credencial do gateway desaparecia em
+    /// silencio, e o `save()` seguinte gravava os defaults por cima do que
+    /// restava da config do usuario.
+    #[test]
+    fn load_recusa_config_yml_em_branco() {
+        let dir = temp_dir("load-vazia");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("config.yml");
+
+        // A premissa que torna o bug possivel — se ela cair, este teste perde o
+        // sentido e quem mexer precisa saber disso.
+        assert!(
+            serde_yaml::from_str::<crate::model::AppConfig>("   \n").is_ok(),
+            "premissa: YAML em branco desserializa com sucesso para os defaults"
+        );
+
+        // O ultimo caso e o que `trim().is_empty()` deixava passar: um arquivo
+        // que sobrou so com comentarios tem bytes, cai no MESMO
+        // `AppConfig::default()` e faz a MESMA perda silenciosa de gate. E
+        // criterio de YAML, nao de espaco em branco, que fecha os dois.
+        for conteudo in ["", "   ", "\n\n", "  \n\t\n", "# so um comentario\n"] {
+            fs::write(&path, conteudo).expect("seed");
+            let erro = ConfigLoader::with_dir(&dir)
+                .load()
+                .expect_err("config sem conteudo tem de ser recusada");
+            assert!(
+                format!("{erro}").contains("vazio"),
+                "o erro tem de dizer o que fazer: {erro}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// **O temporario nao pode ter nome que outro escritor saiba adivinhar.**
+    ///
+    /// Esta fatia declara dois escritores do mesmo `config.yml` — a CLI
+    /// (`garra whatsapp link`/`logout`) e o gateway (`desligar_na_config()` →
+    /// `set_channel_enabled` → `save`). Com o nome deterministico
+    /// (`.config.yml.tmp`) e `create(true).truncate(true)` os dois abriam o
+    /// MESMO arquivo, e o resultado era um tmp com fragmentos dos dois — que
+    /// os dois entao renomeavam por cima da config.
+    ///
+    /// O teste planta um arquivo exatamente no nome antigo e exige que ele
+    /// sobreviva intacto: com a construcao anterior ele seria truncado no
+    /// `open`, entao a mutacao "voltar ao nome fixo" sai vermelha aqui.
+    #[test]
+    fn o_temporario_nao_usa_o_nome_deterministico_de_antes() {
+        let dir = temp_dir("save-tmp-unico");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let loader = ConfigLoader::with_dir(&dir);
+        let config = loader.load().expect("defaults");
+
+        let antigo = dir.join(".config.yml.tmp");
+        fs::write(&antigo, b"escrita de outro processo").expect("planta o tmp antigo");
+
+        loader
+            .save(&config)
+            .expect("a escrita nao pode depender do tmp antigo");
+
+        assert_eq!(
+            fs::read(&antigo).expect("o tmp plantado tem de continuar la"),
+            b"escrita de outro processo",
+            "o nome do temporario nao pode ser adivinhavel: este arquivo e o que \
+             o outro escritor estaria no meio de escrever"
+        );
+        assert!(
+            dir.join("config.yml").is_file(),
+            "e a config tem de ter sido gravada assim mesmo"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// **O `create_new` pinado no caminho EXATO.**
+    ///
+    /// Os dois testes acima plantam no nome deterministico de antes do nonce,
+    /// entao o que eles pinam e o NONCE: trocar `create_new(true)` por
+    /// `create(true).truncate(true)` os deixa verdes, porque o caminho
+    /// plantado ja nao e o caminho escrito. Aqui o nonce e injetado, o
+    /// temporario e plantado no caminho que a escrita vai de fato usar, e o
+    /// que se exige e que a escrita **recuse** em vez de passar por cima.
+    ///
+    /// E a licao que a fatia C aprendeu em `session::tmp_path_for`, aplicada
+    /// ao outro call site do mesmo padrao.
+    #[test]
+    fn o_create_new_recusa_um_temporario_que_ja_exista_no_caminho_exato() {
+        let dir = temp_dir("save-create-new");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let path = dir.join("config.yml");
+
+        const NONCE: u64 = 0x0123_4567_89ab_cdef;
+        let tmp = tmp_path_for(&path, NONCE);
+        fs::write(&tmp, b"de outro escritor").expect("planta no caminho exato");
+
+        let erro = write_atomic_secret_with_nonce(&path, b"gateway:\n", NONCE)
+            .expect_err("o temporario ja existe: a escrita tem de recusar, nao truncar");
+        assert!(
+            format!("{erro}").contains("failed to open"),
+            "o erro tem de vir do `open`, e nao de outro ponto: {erro}"
+        );
+        assert_eq!(
+            fs::read(&tmp).expect("o plantado continua la"),
+            b"de outro escritor",
+            "`create(true).truncate(true)` teria apagado isto"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// **E nem symlink plantado no caminho do temporario e seguido.**
+    ///
+    /// Nome previsivel mais `create(true)` seguia um symlink: o alvo dele e que
+    /// receberia a config inteira e o `chmod 0600`. `create_new` recusa abrir
+    /// qualquer coisa que ja exista. Este teste cobre o caso que o anterior
+    /// nao cobre — la o plantado e um arquivo comum, e truncar um arquivo
+    /// comum estraga o do vizinho; aqui o plantado redireciona a escrita para
+    /// fora do diretorio.
+    #[cfg(unix)]
+    #[test]
+    fn o_temporario_nao_segue_symlink_plantado_no_nome_antigo() {
+        let dir = temp_dir("save-tmp-symlink");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let vitima = dir.join("vitima.txt");
+        fs::write(&vitima, b"conteudo da vitima").expect("vitima");
+        std::os::unix::fs::symlink(&vitima, dir.join(".config.yml.tmp")).expect("symlink");
+
+        let loader = ConfigLoader::with_dir(&dir);
+        let config = loader.load().expect("defaults");
+        loader.save(&config).expect("salva");
+
+        assert_eq!(
+            fs::read(&vitima).expect("vitima"),
+            b"conteudo da vitima",
+            "a escrita nao pode ter atravessado o symlink"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// E uma config de verdade continua carregando — a recusa acima nao pode
+    /// ter virado "recusa tudo".
+    #[test]
+    fn load_aceita_config_yml_com_conteudo() {
+        let dir = temp_dir("load-ok");
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::write(dir.join("config.yml"), "gateway:\n  host: \"127.0.0.1\"\n").expect("seed");
+        assert!(ConfigLoader::with_dir(&dir).load().is_ok());
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -185,10 +185,32 @@ impl GatewayServer {
         // hardening flag that does not do what its documentation promised.
         refuse_inert_auth_flag(&self.config)?;
 
+        // #1261 (decisao A): bind nao-loopback sem credencial de gateway
+        // RECUSA o boot, antes de qualquer MCP/canal subir e antes do bind.
+        // Mesma regra da CLI (`garraia_config::bind`), para embedders que nao
+        // passam pela CLI. TLS nao isenta.
+        refuse_exposed_bind(&self.config.gateway)?;
+
         let addr = format!("{}:{}", self.config.gateway.host, self.config.gateway.port);
+        // Copia da secao `gateway` para depois do `AppState::new`, que consome
+        // a config. `serve_plain`/`serve_tls` recebem a CONFIG, e nao um bool
+        // ja decidido aqui (#1241): enquanto existia o bool, um
+        // `let api_key_ativa = true;` nesta linha desligava o aviso do boot
+        // inteiro sem quebrar teste nenhum — a decisao agora e tomada no
+        // ponto de uso, que tem teste de fiacao.
+        let gateway_cfg = self.config.gateway.clone();
         let tls_cert = self.config.gateway.tls_cert_path.clone();
         let tls_key = self.config.gateway.tls_key_path.clone();
 
+        // #1378: o workspace padrao das file tools nativas precisa EXISTIR
+        // antes do runtime ser montado — `build_agent_runtime` canonicaliza as
+        // raizes, e uma raiz que nao resolve e descartada. Fora de
+        // `build_agent_runtime` de proposito: aquela funcao e chamada por duas
+        // dezenas de testes unitarios com a config default, e criar diretorio
+        // a partir dela plantaria `<config_dir>/data/workspace` no `$HOME` de
+        // quem roda a suite. Um teste de fonte (`bootstrap::tests`) garante
+        // que esta chamada continue aqui, e antes.
+        crate::bootstrap::garantir_workspace_padrao(&self.config);
         let agents = build_agent_runtime(&self.config);
         // `build_agent_runtime` e sincrono; o health check do provider de
         // embeddings precisa de await, entao acontece aqui (#951).
@@ -198,7 +220,13 @@ impl GatewayServer {
         // happen only inside AppState::new (below), i.e. after build_mcp_tools
         // had already read an absent file — so the very first boot always
         // came up with zero MCP tools.
-        crate::mcp::McpPersistenceService::with_default_path().provision_filesystem_if_missing();
+        //
+        // ADR 0024 (#1329): as raizes vem da politica de execucao (nunca
+        // `$HOME`) — `agent.file_roots` / `<data_dir>/workspace` em
+        // `standard`, `execution.pod_root` em `isolated-pod`.
+        crate::mcp::McpPersistenceService::with_default_path().provision_filesystem_if_missing(
+            &crate::bootstrap::raizes_do_mcp_filesystem(&self.config),
+        );
 
         // Connect MCP servers, then let the runtime pull their tools from the
         // manager. Issue #924: the boot path used to register the flat
@@ -225,8 +253,10 @@ impl GatewayServer {
 
         // `build_mcp_tools` already returns the Arc: the bridged tools hold it
         // so they can resolve the CURRENT peer on every call (surviving
-        // reconnects). register_mcp_tools() also reads mcp_manager_arc, and
-        // used to be a silent no-op when the Arc was created ~300 lines below.
+        // reconnects). The health monitor and the admin API read the same Arc
+        // from `AppState`, so it has to be installed here, before either of
+        // them can observe the state — not ~300 lines below, where it used to
+        // be created and where the earlier readers silently saw `None`.
         let mcp_manager_arc = mcp_manager;
         state.mcp_manager_arc = Some(Arc::clone(&mcp_manager_arc));
 
@@ -247,9 +277,6 @@ impl GatewayServer {
                 )
                 .await;
         }
-
-        // Register MCP tools as slash commands (must be done before Arc-wrapping)
-        state.register_mcp_tools().await;
 
         // Register built-in commands (must be done before Telegram channels are created)
         crate::commands::register_commands(&mut state.command_registry.write().unwrap());
@@ -335,18 +362,24 @@ impl GatewayServer {
         }
 
         // Initialize persistent session storage used by channel memory bus hydration.
-        let data_dir = state
-            .config
-            .data_dir
-            .clone()
-            .or_else(|| dirs::home_dir().map(|h| h.join(".garraia").join("data")))
-            .unwrap_or_else(|| ".garraia/data".into());
+        // Fonte única (`AppConfig::resolved_data_dir`) — o fallback inline
+        // `~/.garraia/data` divergia do `memory.db`/`admin.db`, que usam o
+        // config dir XDG (`ConfigLoader::default_config_dir()/data`).
+        let data_dir = state.config.resolved_data_dir();
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
             warn!("failed to create data directory: {e}");
         }
         let sessions_db = data_dir.join("sessions.db");
         match SessionStore::open(&sessions_db) {
             Ok(store) => {
+                // #1227 (slice 1): runs `running` deixados por uma queda
+                // viram `interrupted` aqui, com ids no log — nunca `goal`
+                // (PII). Falha e fail-soft: nao pode impedir a subida.
+                garraia_db::agent_runs::log_interrupted_runs(&store);
+                // #1227 (slice 2): tarefas agendadas que a queda deixou
+                // `running` voltam a `pending` aqui, com id + attempts no
+                // log — nunca `payload` (PII). Idem fail-soft.
+                garraia_db::log_recovered_leases(&store);
                 let store = Arc::new(Mutex::new(store));
                 state.set_session_store(Arc::clone(&store));
                 // GAR-201: Create ChatSessionManager from the same store for multi-channel session resolution
@@ -569,6 +602,11 @@ impl GatewayServer {
             }
         }
 
+        // #1227 (slice 5): retencao do ledger `agent_runs`. Default 0 =
+        // nunca apaga; desligada, o boot avisa uma vez com a contagem. Ver o
+        // docblock de `runs_retention_worker`.
+        crate::runs_retention_worker::iniciar(&state.config, state.session_store.clone());
+
         // Start config hot-reload watcher
         let config_path = garraia_config::ConfigLoader::default_config_dir().join("config.yml");
 
@@ -669,18 +707,96 @@ impl GatewayServer {
 
         let state = Arc::new(state);
 
-        if let Some((client, rx)) = openclaw_rx {
-            spawn_openclaw_router(Arc::clone(&state), client, rx);
+        // Build WhatsApp channels (webhook-driven — no persistent connection)
+        let whatsapp_channels = build_whatsapp_channels(&state.config, &state);
+        for channel in &whatsapp_channels {
+            info!(
+                "whatsapp channel ready (webhook mode, phone_number_id={})",
+                channel.phone_number_id()
+            );
         }
+        let whatsapp_state: garraia_channels::whatsapp::webhook::WhatsAppState =
+            Arc::new(whatsapp_channels);
+
+        // Build Google Chat channels (webhook-driven — no persistent connection).
+        //
+        // Como o WhatsApp: nao entram no `ChannelRegistry`, viram estado da
+        // rota `/webhooks/google-chat`. Um canal sem `audience` nao chega ate
+        // aqui — `build_google_chat_channels` o descarta, porque sem ela o
+        // webhook aceitaria o token de qualquer outra app do Google Chat.
+        let google_chat_channels = build_google_chat_channels(&state.config, &state);
+        for channel in &google_chat_channels {
+            info!(
+                "google chat channel ready (webhook mode, name={})",
+                channel.name()
+            );
+        }
+        let google_chat_state: garraia_channels::google_chat::webhook::GoogleChatState =
+            Arc::new(google_chat_channels);
+
+        // Build Teams channels (webhook-driven — no persistent connection).
+        //
+        // Um canal sem `app_id` nao chega ate aqui — `build_teams_channels` o
+        // descarta, porque sem ele o webhook aceitaria o token de qualquer
+        // outro bot do Bot Framework.
+        let teams_channels = build_teams_channels(&state.config, &state);
+        for channel in &teams_channels {
+            info!(
+                "teams channel ready (webhook mode, name={})",
+                channel.name()
+            );
+        }
+        let teams_state: garraia_channels::teams::webhook::TeamsState = Arc::new(teams_channels);
+
+        // Build LINE channels (webhook-driven — no persistent connection).
+        //
+        // Como o WhatsApp: nao entram no `ChannelRegistry`, viram estado da
+        // rota `/webhooks/line`. Um canal com `channel_secret` invalido nao
+        // chega ate aqui — `build_line_channels` o descarta (#1051).
+        let line_channels = build_line_channels(&state.config, &state);
+        for channel in &line_channels {
+            info!("line channel ready (webhook mode, name={})", channel.name());
+        }
+        let line_state: garraia_channels::line_channel::webhook::LineState =
+            Arc::new(line_channels);
+
+        let push_channels = crate::push_channels::PushChannelStates {
+            whatsapp: whatsapp_state,
+            google_chat: google_chat_state,
+            teams: teams_state,
+            line: line_state,
+        };
 
         // `garra_status` reads the live `AppState` (provider, model, tools,
         // features, channels, session mode), so it can only exist once the
         // state is shared. Unconditional: every runtime should be able to
         // describe itself — the v0.4.0 field report was a Garra on a phone
         // saying it "cannot inspect its own runtime", and nothing let it.
+        //
+        // #1347: registrada DEPOIS de montar os canais push e ANTES de
+        // qualquer canal pull conectar. Depois dos push porque o relatorio de
+        // canais e o do `/api/channels` saem da mesma funcao
+        // (`channels_view::channel_rows`), e ela precisa das contagens push.
+        // Antes dos pull porque cada um deles (OpenClaw, Discord, Telegram,
+        // IRC, Signal, Matrix, Slack, iMessage, `whatsapp_linked`) ja pode
+        // rodar turno assim que conecta, e um turno sem a tool respondia "nao
+        // consigo me inspecionar" — a janela que a revisao da #1347 achou
+        // quando o registro ficava depois do ultimo pull. Montar os push
+        // aqui e seguro: `build_*_channels` so constroi os canais e os
+        // callbacks, e ninguem os alcanca antes do listener HTTP subir, no
+        // fim de `run`. So as contagens: guardar o `PushChannelStates` na
+        // tool fecharia um ciclo de `Arc` (cada canal push segura o
+        // `AppState` forte). Um teste do `garra_status` varre esta ordem.
         state
             .agents
-            .register_tool(Box::new(crate::tools::GarraStatusTool::new(&state)));
+            .register_tool(Box::new(crate::tools::GarraStatusTool::new(
+                &state,
+                push_channels.contagens(),
+            )));
+
+        if let Some((client, rx)) = openclaw_rx {
+            spawn_openclaw_router(Arc::clone(&state), client, rx);
+        }
 
         // Issue #921: the proactive-send tool needs `AppState.channels` and the
         // session store, so it can only be built once the state is shared —
@@ -796,10 +912,15 @@ impl GatewayServer {
         // Start background scheduler loop
         let scheduler_state = Arc::clone(&state);
         tokio::spawn(async move {
+            // #1227 (slice 2): identidade deste processo nas leases
+            // (`scheduled_tasks.leased_by`). Gerada uma vez por subida, so
+            // para diagnostico — quem reivindicou a tarefa que ficou
+            // `running` depois de uma queda.
+            let scheduler_owner = uuid::Uuid::new_v4().to_string();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                if let Err(e) = run_scheduler(&scheduler_state).await {
+                if let Err(e) = run_scheduler(&scheduler_state, &scheduler_owner).await {
                     tracing::error!("Scheduler error: {e}");
                 }
             }
@@ -896,58 +1017,34 @@ impl GatewayServer {
             }
         }
 
-        // Build WhatsApp channels (webhook-driven — no persistent connection)
-        let whatsapp_channels = build_whatsapp_channels(&state.config, &state);
-        for channel in &whatsapp_channels {
-            info!(
-                "whatsapp channel ready (webhook mode, phone_number_id={})",
-                channel.phone_number_id()
-            );
-        }
-        let whatsapp_state: garraia_channels::whatsapp::webhook::WhatsAppState =
-            Arc::new(whatsapp_channels);
-
-        // Build Google Chat channels (webhook-driven — no persistent connection).
+        // Sobe o canal WhatsApp por dispositivo vinculado (#1238, fatia D).
         //
-        // Como o WhatsApp: nao entram no `ChannelRegistry`, viram estado da
-        // rota `/webhooks/google-chat`. Um canal sem `audience` nao chega ate
-        // aqui — `build_google_chat_channels` o descarta, porque sem ela o
-        // webhook aceitaria o token de qualquer outra app do Google Chat.
-        let google_chat_channels = build_google_chat_channels(&state.config, &state);
-        for channel in &google_chat_channels {
-            info!(
-                "google chat channel ready (webhook mode, name={})",
-                channel.name()
-            );
-        }
-        let google_chat_state: garraia_channels::google_chat::webhook::GoogleChatState =
-            Arc::new(google_chat_channels);
-
-        // Build Teams channels (webhook-driven — no persistent connection).
+        // Canal PULL e supervisao propria: nao entra no `ChannelRegistry` (o
+        // `Channel` trait pressupoe `connect()/disconnect()` sincronos sobre um
+        // objeto mutavel, e aqui quem vive e um processo filho Node com loop de
+        // reconexao proprio), e nao entra no `PushChannelStates` (nao ha
+        // webhook). O status dele sai do `AppState::whatsapp_linked`, que o
+        // `/api/channels` e o `/api/diagnostics` leem pela MESMA funcao.
         //
-        // Um canal sem `app_id` nao chega ate aqui — `build_teams_channels` o
-        // descarta, porque sem ele o webhook aceitaria o token de qualquer
-        // outro bot do Bot Framework.
-        let teams_channels = build_teams_channels(&state.config, &state);
-        for channel in &teams_channels {
-            info!(
-                "teams channel ready (webhook mode, name={})",
-                channel.name()
-            );
-        }
-        let teams_state: garraia_channels::teams::webhook::TeamsState = Arc::new(teams_channels);
-
-        // Build LINE channels (webhook-driven — no persistent connection).
+        // Nao subir e o caso comum — canal desligado, sem sessao, ou sem Node —
+        // e nenhum deles e erro de boot.
+        // `Ok(())` e nao `Ok(cancel)`: o `watch::Sender` que mantem o
+        // supervisor vivo fica estacionado no `AppState`
+        // (`WhatsAppLinkedRuntime::reter_cancelamento`). Ele ja morreu aqui uma
+        // vez, solto no fim deste braco do `match`, e o canal inteiro morria
+        // com ele em ~0,1 s a cada boot.
         //
-        // Como o WhatsApp: nao entram no `ChannelRegistry`, viram estado da
-        // rota `/webhooks/line`. Um canal com `channel_secret` invalido nao
-        // chega ate aqui — `build_line_channels` o descarta (#1051).
-        let line_channels = build_line_channels(&state.config, &state);
-        for channel in &line_channels {
-            info!("line channel ready (webhook mode, name={})", channel.name());
+        // Desligado e o caso comum e sai em `info!`. Qualquer OUTRO motivo e um
+        // canal que o operador ligou e que nao subiu: `warn!`, com a frase de
+        // acao do `Display` (#1327) — o nome do enum em `info!` foi o que
+        // deixou o sintoma da issue invisivel.
+        match crate::bootstrap::spawn_whatsapp_linked(&state) {
+            Ok(()) => info!("whatsapp_linked: canal supervisionado"),
+            Err(crate::bootstrap::NaoSubiu::Desabilitado) => {
+                info!("whatsapp_linked: canal desligado, nada a supervisionar")
+            }
+            Err(motivo) => warn!("whatsapp_linked: canal nao subiu — {motivo}"),
         }
-        let line_state: garraia_channels::line_channel::webhook::LineState =
-            Arc::new(line_channels);
 
         // Initialize admin store for the web admin console
         let admin_db_path = data_dir.join("admin.db");
@@ -989,21 +1086,23 @@ impl GatewayServer {
         }
 
         let state_for_shutdown = Arc::clone(&state);
-        let app = build_router(
-            state,
-            crate::push_channels::PushChannelStates {
-                whatsapp: whatsapp_state,
-                google_chat: google_chat_state,
-                teams: teams_state,
-                line: line_state,
-            },
-            admin_store,
-            admin_encryption_key,
-        );
+        let app = build_router(state, push_channels, admin_store, admin_encryption_key);
 
         // TLS support: if cert + key paths are configured and tls feature is enabled,
         // use axum-server with rustls. Otherwise, plain HTTP.
         let use_tls = tls_cert.is_some() && tls_key.is_some();
+        // #1247: so um dos dois caminhos configurado caia em HTTP puro em
+        // silencio — o operador pediu TLS e recebia texto claro. A CLI recusa
+        // o boot nesse caso (allowlist do boot gate); aqui fica o aviso para
+        // quem embute o `GatewayServer` sem passar pela CLI.
+        if let Some(falta) = tls_meio_configurado(tls_cert.as_deref(), tls_key.as_deref()) {
+            warn!(
+                "TLS half-configured: {falta} is missing, so the gateway serves PLAIN HTTP; \
+                 set both gateway.tls_cert_path and gateway.tls_key_path (or neither) — run \
+                 `{} config check`",
+                garraia_common::executavel::nome()
+            );
+        }
 
         // Each branch yields a Result instead of `?`-ing out: the MCP/channel
         // cleanup below must run even when serving fails, otherwise the child
@@ -1011,47 +1110,30 @@ impl GatewayServer {
         let serve_result: Result<()> = if use_tls {
             #[cfg(feature = "tls")]
             {
-                serve_tls(&addr, tls_cert.as_deref(), tls_key.as_deref(), app).await
+                serve_tls(
+                    &addr,
+                    tls_cert.as_deref(),
+                    tls_key.as_deref(),
+                    app,
+                    &gateway_cfg,
+                )
+                .await
             }
             #[cfg(not(feature = "tls"))]
             {
                 warn!(
                     "TLS cert/key configured but 'tls' feature not enabled — falling back to HTTP"
                 );
-                serve_plain(&addr, app).await
+                serve_plain(&addr, app, &gateway_cfg).await
             }
         } else {
-            serve_plain(&addr, app).await
+            serve_plain(&addr, app, &gateway_cfg).await
         };
 
         // Cleanup runs even when the listener errored out: this block used to
         // sit after a `?`, so any serve error skipped it and orphaned every
         // MCP child process. The serve result is propagated at the end.
-        //
-        // Bounded: `disconnect_all` cancels each service, and a server that
-        // ignores stdin EOF can take up to its own drain time; unbounded and
-        // sequential, N bad servers could hang shutdown indefinitely.
-        if let Some(ref manager) = state_for_shutdown.mcp_manager_arc {
-            info!("disconnecting MCP servers...");
-            if tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, manager.disconnect_all())
-                .await
-                .is_err()
-            {
-                warn!(
-                    "MCP disconnect exceeded {:?}; continuing shutdown (children are killed on drop)",
-                    MCP_SHUTDOWN_TIMEOUT
-                );
-            }
-        }
-
-        info!("disconnecting channels...");
-        state_for_shutdown
-            .channels
-            .write()
-            .await
-            .disconnect_all()
-            .await
-            .ok();
+        shutdown_subsystems(&state_for_shutdown).await;
 
         serve_result?;
 
@@ -1157,9 +1239,72 @@ pub async fn build_router_for_test_with_storage(
 /// their transport is dropped regardless.
 const MCP_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// #1247: qual campo de TLS falta quando so um dos dois esta configurado,
+/// ou `None` quando os dois estao (TLS) ou nenhum esta (HTTP de proposito).
+/// Os nomes batem com os campos dos achados do `garraia config check`.
+pub fn tls_meio_configurado(cert: Option<&str>, key: Option<&str>) -> Option<&'static str> {
+    match (cert, key) {
+        (Some(_), None) => Some("gateway.tls_key_path"),
+        (None, Some(_)) => Some("gateway.tls_cert_path"),
+        _ => None,
+    }
+}
+
+/// #1261 (decisao A): recusa o boot quando o bind pedido e alcancavel da
+/// rede sem credencial de gateway e sem o opt-out explicito
+/// `gateway.allow_unauthenticated_network_bind` (so no arquivo). Com o
+/// opt-out sobe, com `warn!` alto em todo boot.
+///
+/// Substitui o aviso-sem-recusa do #1241: um bind exposto sem credencial
+/// abre o `/ws` (tools de arquivo e de dispositivo) e o
+/// `/api/mcp/marketplace/install` — spawn remoto de processo — para quem
+/// alcanca a porta, e o boot ja sabia disso e seguia assim mesmo.
+pub fn refuse_exposed_bind(gateway: &garraia_config::GatewayConfig) -> Result<()> {
+    match garraia_config::bind::verificar(&gateway.host, gateway.port, gateway) {
+        Ok(garraia_config::bind::VereditoDoBind::ExpostoPorOptOut) => {
+            warn!(
+                "{}",
+                garraia_config::bind::aviso_de_opt_out(&gateway.host, gateway.port)
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(recusa) => Err(garraia_common::Error::Config(recusa.to_string())),
+    }
+}
+
+/// A mesma regra de [`refuse_exposed_bind`] sobre o endereco **efetivamente
+/// ligado** — defesa em profundidade para o caso de o nome resolver diferente
+/// entre a checagem e o bind. Nunca repete o aviso do opt-out (esse sai uma
+/// vez, em `run`).
+fn conferir_socket(
+    bound: &std::net::SocketAddr,
+    gateway: &garraia_config::GatewayConfig,
+) -> Result<()> {
+    garraia_config::bind::decidir(
+        &bound.to_string(),
+        std::slice::from_ref(bound),
+        gateway.api_key_configurada(),
+        gateway.allow_unauthenticated_network_bind,
+    )
+    .map(|_| ())
+    .map_err(|recusa| garraia_common::Error::Config(recusa.to_string()))
+}
+
 /// Serve plain HTTP until the shutdown signal.
-async fn serve_plain(addr: &str, app: axum::Router) -> Result<()> {
+async fn serve_plain(
+    addr: &str,
+    app: axum::Router,
+    gateway: &garraia_config::GatewayConfig,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    // Depois do bind: `local_addr` e o endereco real, inclusive quando `addr`
+    // era um nome. Recusado (#1261), o listener cai aqui sem ter aceitado
+    // conexao nenhuma. Sem `local_addr` nao ha como afirmar loopback: recusa.
+    let bound = listener
+        .local_addr()
+        .map_err(|e| garraia_common::Error::Gateway(format!("local_addr: {e}")))?;
+    conferir_socket(&bound, gateway)?;
     info!("GarraIA gateway listening on http://{}", addr);
     axum::serve(
         listener,
@@ -1177,6 +1322,7 @@ async fn serve_tls(
     cert_path: Option<&str>,
     key_path: Option<&str>,
     app: axum::Router,
+    gateway: &garraia_config::GatewayConfig,
 ) -> Result<()> {
     let (Some(cert_path), Some(key_path)) = (cert_path, key_path) else {
         return Err(garraia_common::Error::Gateway(
@@ -1190,6 +1336,8 @@ async fn serve_tls(
     let sock_addr: std::net::SocketAddr = addr
         .parse()
         .map_err(|e| garraia_common::Error::Gateway(format!("invalid addr: {e}")))?;
+    // #1261: TLS nao isenta — TLS sem credencial continua aberto.
+    conferir_socket(&sock_addr, gateway)?;
     info!("GarraIA gateway listening on https://{}", sock_addr);
     axum_server::bind_rustls(sock_addr, tls_config)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -1223,7 +1371,22 @@ async fn shutdown_signal() {
 /// How many times one occurrence is retried before being given up on.
 const MAX_TASK_ATTEMPTS: i64 = 3;
 
-async fn run_scheduler(state: &AppState) -> Result<()> {
+/// #1227 (slice 2): por quanto tempo uma tarefa reivindicada fica `running`
+/// antes de a queda do processo ser assumida e a linha voltar a `pending`.
+///
+/// Nao ha constante de timeout do turno no runtime hoje (o `process_heartbeat`
+/// espera o provider ate o fim); 600 s e o teto pratico de um turno com tools
+/// dobrado, para que uma execucao lenta mas viva nunca seja reivindicada de
+/// novo por outro tick enquanto ainda corre. Quando o runtime ganhar um
+/// timeout de turno, este valor deve virar 2x ele — e a origem fica aqui.
+const SCHEDULER_LEASE_SECS: i64 = 600;
+
+/// Um tick do scheduler: recupera leases expiradas (explicito, logado),
+/// reivindica as tarefas vencidas para `owner` e executa cada uma.
+///
+/// `owner` e a identidade deste processo (uuid gerado uma vez na subida);
+/// vai para `scheduled_tasks.leased_by` so para diagnostico.
+async fn run_scheduler(state: &AppState, owner: &str) -> Result<()> {
     let store_mutex = match &state.session_store {
         Some(s) => s,
         None => return Ok(()),
@@ -1231,7 +1394,15 @@ async fn run_scheduler(state: &AppState) -> Result<()> {
 
     let tasks = {
         let store = store_mutex.lock().await;
-        store.poll_due_tasks()?
+        // Queda no meio do tick anterior deixou `running` sem dono vivo:
+        // volta a `pending` AQUI, com log, e e reivindicada logo abaixo no
+        // mesmo tick — o re-poll deixa de ser silencioso.
+        garraia_db::log_recovered_leases(&store);
+        store.claim_due_tasks(
+            garraia_db::session_store::DEFAULT_POLL_LIMIT,
+            SCHEDULER_LEASE_SECS,
+            owner,
+        )?
     };
 
     if tasks.is_empty() {
@@ -1270,6 +1441,63 @@ async fn execute_scheduled_task(
     store_mutex: &Arc<Mutex<SessionStore>>,
     task: &garraia_db::ScheduledTask,
 ) -> Result<()> {
+    // #1227 (slice 1): o scheduler e o primeiro produtor real do ledger —
+    // cada execucao deixa uma linha em `agent_runs` com `session_id`
+    // preenchido e desfecho terminal; uma queda no meio vira `interrupted`
+    // na subida seguinte (`log_interrupted_runs`). Falha do ledger e
+    // fail-soft: nunca impede a tarefa nem muda o fluxo de retry.
+    let run_id = ledger_inicia_run_agendado(store_mutex, task).await;
+    let resultado = execute_scheduled_task_inner(state, store_mutex, task).await;
+    ledger_fecha_run_agendado(store_mutex, &run_id, &resultado).await;
+    resultado.map(|_| ())
+}
+
+/// Abre a linha do run (`running`) para uma execucao de tarefa agendada.
+/// `mode = "heartbeat"` nomeia o produtor; `goal` e o payload da tarefa
+/// (a coluna guarda, o log nunca). Devolve o `run_id` mesmo se a gravacao
+/// falhar — o fecho do run tambem e fail-soft.
+async fn ledger_inicia_run_agendado(
+    store_mutex: &Arc<Mutex<SessionStore>>,
+    task: &garraia_db::ScheduledTask,
+) -> String {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let store = store_mutex.lock().await;
+    if let Err(e) = store.start_agent_run(
+        &run_id,
+        Some(&task.session_id),
+        &task.payload,
+        Some("heartbeat"),
+    ) {
+        tracing::warn!(erro = %e, "run ledger: falhou ao abrir run da tarefa agendada");
+    }
+    run_id
+}
+
+/// Fecha a linha do run com desfecho terminal: `done` com snippet da
+/// resposta, ou `error` com o snippet do erro. O ramo de retry do
+/// `run_scheduler` continua dono da politica de reexecucao — aqui so fica
+/// a trilha.
+async fn ledger_fecha_run_agendado(
+    store_mutex: &Arc<Mutex<SessionStore>>,
+    run_id: &str,
+    resultado: &Result<String>,
+) {
+    let (status, result_snippet, error_snippet) = match resultado {
+        Ok(texto) => (garraia_db::RunStatus::Done, Some(texto.as_str()), None),
+        Err(e) => (garraia_db::RunStatus::Error, None, Some(e.to_string())),
+    };
+    let store = store_mutex.lock().await;
+    if let Err(e) = store.finish_agent_run(run_id, status, result_snippet, error_snippet.as_deref())
+    {
+        tracing::warn!(erro = %e, "run ledger: falhou ao fechar run da tarefa agendada");
+    }
+}
+
+async fn execute_scheduled_task_inner(
+    state: &AppState,
+    store_mutex: &Arc<Mutex<SessionStore>>,
+    task: &garraia_db::ScheduledTask,
+) -> Result<String> {
     let channel_type = &task.channel_id;
 
     let message = Message {
@@ -1405,7 +1633,7 @@ async fn execute_scheduled_task(
         }
     }
 
-    Ok(())
+    Ok(response_text)
 }
 
 /// Plan 0044 (GAR-395 slice 2): construct the ObjectStore backend +
@@ -1607,10 +1835,249 @@ async fn build_storage_wiring(
     (object_store, Some(staging))
 }
 
+/// Desliga, na ordem, tudo que este processo pos de pe e que sobrevive ao
+/// listener: servidores MCP, canais push e o supervisor do WhatsApp vinculado.
+///
+/// # Por que isto e uma funcao, e nao um bloco dentro do `serve`
+///
+/// Porque a unica coisa que se pode testar de um bloco inline e o texto dele.
+/// A regressao que importa aqui — "o subsistema novo entrou no boot e ninguem
+/// o desligou" — ja aconteceu uma vez neste canal, e uma varredura de fonte a
+/// pegaria so ate alguem renomear a chamada.
+///
+/// # O ciclo de `Arc`, e por que o cancelamento e explicito
+///
+/// "O `Sender` cai junto com o `AppState`" nao vale para o WhatsApp vinculado:
+/// `AppState` guarda `whatsapp_linked: Arc<WhatsAppLinkedRuntime>`, o runtime
+/// guarda o `watch::Sender` do supervisor, e a tarefa do supervisor detem um
+/// `GatewaySink` que detem um `Arc<AppState>`. A tarefa so termina quando o
+/// `cancel_rx` dispara; o `cancel_tx` so cai quando o `AppState` cai; o
+/// `AppState` so cai quando a tarefa termina. Sem a chamada abaixo o gateway
+/// imprime "shut down gracefully" com a ponte Node viva, mensagens sendo lidas
+/// e turnos de agente rodando — ate o processo morrer.
+///
+/// Quebrar o ciclo com `Weak<AppState>` no sink foi considerado e recusado: o
+/// sink usa o estado em todo turno (sessoes, agentes, allowlist), cada uso
+/// viraria um `upgrade()` falivel, e o resultado seria um desligamento que
+/// depende de **nenhum outro** `Arc<AppState>` ter sobrado em lugar nenhum —
+/// mecanismo implicito, que e o que falhou aqui em primeiro lugar. O
+/// cancelamento explicito diz o que faz.
+async fn shutdown_subsystems(state: &Arc<AppState>) {
+    // Bounded: `disconnect_all` cancels each service, and a server that
+    // ignores stdin EOF can take up to its own drain time; unbounded and
+    // sequential, N bad servers could hang shutdown indefinitely.
+    if let Some(ref manager) = state.mcp_manager_arc {
+        info!("disconnecting MCP servers...");
+        if tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, manager.disconnect_all())
+            .await
+            .is_err()
+        {
+            warn!(
+                "MCP disconnect exceeded {:?}; continuing shutdown (children are killed on drop)",
+                MCP_SHUTDOWN_TIMEOUT
+            );
+        }
+    }
+
+    info!("disconnecting channels...");
+    state.channels.write().await.disconnect_all().await.ok();
+
+    if state.whatsapp_linked.cancelar() {
+        info!("whatsapp_linked: supervisor cancelado");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// **A outra metade do F1: o canal sobe, e agora ele tambem para.**
+    ///
+    /// `WhatsAppLinkedRuntime::cancelar()` existia, estava correto e nao tinha
+    /// UM chamador de producao — so os dois testes do proprio runtime. O bloco
+    /// de desligamento deste arquivo desligava MCP e canais push e passava ao
+    /// largo deste. Depois do Ctrl+C o gateway imprimia "shut down gracefully"
+    /// com a ponte Node viva, mensagens sendo lidas e turnos de agente rodando.
+    ///
+    /// E a rota de escape "o `Sender` cai junto com o `AppState`" nao existe,
+    /// por um ciclo de `Arc` — ver o docstring de `shutdown_subsystems`.
+    ///
+    /// Este teste nao varre o fonte: ele **chama** o desligamento e pergunta do
+    /// outro lado do canal de cancelamento se o sinal chegou. Uma varredura de
+    /// texto morreria no dia em que alguem renomeasse a chamada; esta so morre
+    /// se o comportamento morrer junto.
+    #[tokio::test]
+    async fn o_desligamento_cancela_o_supervisor_do_whatsapp_vinculado() {
+        use garraia_agents::AgentRuntime;
+        use garraia_channels::ChannelRegistry;
+
+        let state: Arc<AppState> = Arc::new(AppState::new(
+            AppConfig::default(),
+            Arc::new(AgentRuntime::new()),
+            ChannelRegistry::new(),
+        ));
+
+        // O supervisor de mentira: so o lado que importa para o desligamento.
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        state.whatsapp_linked.reter_cancelamento(cancel_tx);
+        assert!(
+            state.whatsapp_linked.cancelamento_vivo(),
+            "premissa: ha supervisor retido antes do desligamento"
+        );
+        assert!(
+            !*cancel_rx.borrow_and_update(),
+            "premissa: ninguem cancelou ainda"
+        );
+
+        shutdown_subsystems(&state).await;
+
+        // O que o `serve` do supervisor observa e o valor do canal. (O
+        // `has_changed()` aqui devolveria `Err`, porque `cancelar()` **solta**
+        // o `Sender` depois de enviar — o que, do lado do supervisor, tambem e
+        // um sinal de parada; nao e o que este teste mede.)
+        assert!(
+            *cancel_rx.borrow(),
+            "o supervisor tem de receber o cancelamento no desligamento do gateway; \
+             sem isto a ponte Node segue viva e turnos de agente seguem rodando \
+             depois de `gateway shut down gracefully`"
+        );
+        assert!(
+            !state.whatsapp_linked.cancelamento_vivo(),
+            "e o slot tem de ficar vazio: um segundo desligamento nao tem o que cancelar"
+        );
+    }
+
+    /// E desligar sem canal vinculado nao pode explodir nem mentir — o caminho
+    /// de toda instalacao que nunca rodou `garra whatsapp link`.
+    #[tokio::test]
+    async fn o_desligamento_sem_supervisor_e_um_noop() {
+        use garraia_agents::AgentRuntime;
+        use garraia_channels::ChannelRegistry;
+
+        let state: Arc<AppState> = Arc::new(AppState::new(
+            AppConfig::default(),
+            Arc::new(AgentRuntime::new()),
+            ChannelRegistry::new(),
+        ));
+        shutdown_subsystems(&state).await;
+        assert!(!state.whatsapp_linked.cancelamento_vivo());
+    }
+
+    #[test]
+    fn tls_meio_configurado_nomeia_o_campo_que_falta() {
+        assert_eq!(tls_meio_configurado(None, None), None);
+        assert_eq!(tls_meio_configurado(Some("c"), Some("k")), None);
+        assert_eq!(
+            tls_meio_configurado(Some("c"), None),
+            Some("gateway.tls_key_path")
+        );
+        assert_eq!(
+            tls_meio_configurado(None, Some("k")),
+            Some("gateway.tls_cert_path")
+        );
+    }
+
+    // ---- #1261: recusa de bind exposto sem credencial --------------------
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("socket addr de teste")
+    }
+
+    fn gateway_em(host: &str, api_key: Option<&str>) -> garraia_config::GatewayConfig {
+        garraia_config::GatewayConfig {
+            host: host.into(),
+            port: 0,
+            api_key: api_key.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn refuse_exposed_bind_recusa_sem_credencial() {
+        for host in ["0.0.0.0", "[::]"] {
+            let err = refuse_exposed_bind(&gateway_em(host, None))
+                .expect_err("bind exposto sem credencial recusa");
+            let msg = err.to_string();
+            assert!(msg.contains("refusing to start"), "{msg}");
+            assert!(msg.contains("GARRAIA_GATEWAY_API_KEY"), "{msg}");
+            assert!(msg.contains("/ws"), "a mensagem nomeia o /ws: {msg}");
+        }
+    }
+
+    /// Chave vazia ou so com espaco e gate desligado (#1241): recusa igual.
+    #[test]
+    fn credencial_em_branco_conta_como_ausente() {
+        for valor in [None, Some(""), Some("   ")] {
+            assert!(
+                refuse_exposed_bind(&gateway_em("0.0.0.0", valor)).is_err(),
+                "{valor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuse_exposed_bind_sobe_com_credencial_loopback_ou_opt_out() {
+        assert!(refuse_exposed_bind(&gateway_em("0.0.0.0", Some("uma-credencial"))).is_ok());
+        assert!(refuse_exposed_bind(&gateway_em("127.0.0.1", None)).is_ok());
+        assert!(refuse_exposed_bind(&gateway_em("[::1]", None)).is_ok());
+        let mut g = gateway_em("0.0.0.0", None);
+        g.allow_unauthenticated_network_bind = true;
+        assert!(refuse_exposed_bind(&g).is_ok());
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn opt_out_avisa_alto_no_boot() {
+        let mut g = gateway_em("0.0.0.0", None);
+        g.allow_unauthenticated_network_bind = true;
+        refuse_exposed_bind(&g).expect("opt-out sobe");
+        assert!(logs_contain("allow_unauthenticated_network_bind is true"));
+    }
+
+    #[test]
+    fn conferir_socket_segue_a_mesma_regra() {
+        let sem = gateway_em("x", None);
+        assert!(conferir_socket(&addr("0.0.0.0:3888"), &sem).is_err());
+        assert!(conferir_socket(&addr("192.168.1.10:3888"), &sem).is_err());
+        assert!(conferir_socket(&addr("127.0.0.1:3888"), &sem).is_ok());
+        let com = gateway_em("x", Some("k"));
+        assert!(conferir_socket(&addr("0.0.0.0:3888"), &com).is_ok());
+    }
+
+    // ---- FIACAO: `serve_plain` confere o socket real -------------------
+    //
+    // `serve_plain` so retorna no shutdown; com timeout, "serviu ate o
+    // timeout" e "recusou" sao distinguiveis pelo resultado.
+
+    /// Apagar a chamada em `serve_plain` tem que quebrar AQUI.
+    #[tokio::test]
+    async fn serve_plain_recusa_socket_exposto_sem_credencial() {
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            serve_plain("0.0.0.0:0", axum::Router::new(), &gateway_em("x", None)),
+        )
+        .await
+        .expect("a recusa e imediata, nao pode esperar o timeout");
+        let err = r.expect_err("socket exposto sem credencial recusa");
+        assert!(err.to_string().contains("refusing to start"), "{err}");
+    }
+
+    /// O outro lado: com credencial `serve_plain` fica servindo.
+    #[tokio::test]
+    async fn serve_plain_serve_com_credencial() {
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            serve_plain(
+                "0.0.0.0:0",
+                axum::Router::new(),
+                &gateway_em("x", Some("k")),
+            ),
+        )
+        .await;
+        assert!(r.is_err(), "com credencial serve ate o timeout: {r:?}");
+    }
 
     /// A borda que importa: cresce exponencialmente, satura no teto, e não
     /// estoura com contagens absurdas de tentativa.
@@ -1653,6 +2120,50 @@ mod tests {
         fn status(&self) -> garraia_channels::ChannelStatus {
             garraia_channels::ChannelStatus::Connected
         }
+    }
+
+    /// Fiacao do canal `whatsapp_linked` (#1238, fatia D).
+    ///
+    /// `Server::run` nao e chamavel de um teste unitario (abre socket, monta
+    /// admin store, entra no `serve`), entao esta e a forma honesta de pinar a
+    /// chamada: varre o proprio fonte. E fraco de proposito, e esta escrito
+    /// aqui que e fraco — mas e a diferenca entre "o supervisor nunca sobe" ser
+    /// pego pelo CI e ser pego pelo usuario. E a licao do comando que se
+    /// chamava `whats-app` com 599 testes verdes: toda funcao bem testada
+    /// precisa de alguem provando que ela e CHAMADA.
+    ///
+    /// **E so isso que ele prova.** Ele ficou verde durante toda a vida do bug
+    /// em que o `watch::Sender` devolvido morria no fim do braco do `match` e
+    /// matava o canal em ~0,1 s: a chamada estava la, o resultado e que nao
+    /// era retido. Quem prova a retencao e a entrega da mensagem e
+    /// `bootstrap::whatsapp_linked::tests::ponta_a_ponta::
+    /// o_boot_retem_o_supervisor_e_a_mensagem_chega_ao_agente`, contra a ponte
+    /// falsa e sem segurar handle nenhum. Hoje a mutacao "soltar o handle"
+    /// nem e expressavel — `spawn_whatsapp_linked` devolve `()`.
+    #[test]
+    fn o_boot_chama_o_supervisor_do_whatsapp_vinculado() {
+        let fonte = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs"),
+        )
+        .expect("fonte legivel");
+        // So o codigo de producao: o proprio corpo deste teste cita o nome da
+        // funcao, e sem este corte ele casaria consigo mesmo — que e como um
+        // teste de fiacao vira decoracao. (Verificado por mutacao: com o corte,
+        // apagar a chamada do boot deixa este teste vermelho.)
+        let producao = fonte
+            .split_once("\nmod tests {")
+            .map(|(antes, _)| antes.to_string())
+            .unwrap_or_else(|| fonte.clone());
+        let codigo: String = producao
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            codigo.contains("spawn_whatsapp_linked(&state)"),
+            "o boot precisa chamar `spawn_whatsapp_linked`; sem isso o canal \
+             nunca sobe e nenhum outro teste percebe"
+        );
     }
 
     /// O comportamento que a #928 pedia sem saber: uma falha transitória de
@@ -1704,5 +2215,135 @@ mod tests {
     #[test]
     fn default_config_boots() {
         assert!(refuse_inert_auth_flag(&AppConfig::default()).is_ok());
+    }
+
+    /// #1227 (slice 1): a subida do gateway tem de marcar runs `running`
+    /// deixados por uma queda — a chamada vive no bloco `Ok(store)` do
+    /// `SessionStore::open`. Se alguém a remover, a tabela volta a acumular
+    /// `running` eterno e o restart perde a trilha de auditoria. O scan usa
+    /// `concat!` para o próprio teste não casar consigo mesmo.
+    #[test]
+    fn subida_do_store_marca_runs_interrompidos() {
+        let src = include_str!("server.rs");
+        let alvo = concat!("log_interrupted", "_runs(&store)");
+        let copias = src.matches(alvo).count();
+        assert_eq!(copias, 1, "esperava 1 chamada de subida, achei {copias}");
+    }
+
+    /// #1227 (slice 2): o scheduler tem de REIVINDICAR as tarefas vencidas
+    /// (`claim_due_tasks`, que as poe em `running` sob lease), nunca so
+    /// ler (`poll_due_tasks`). Com o poll, uma queda no meio do turno
+    /// deixava a linha `pending` e o tick seguinte reexecutava em silencio
+    /// — mensagem de sistema duplicada. O scan recorta o corpo de
+    /// `run_scheduler` e usa `concat!` para nao casar consigo mesmo.
+    #[test]
+    fn scheduler_reivindica_em_vez_de_pollar() {
+        let src = include_str!("server.rs");
+        let assinatura = concat!("async fn run_", "scheduler(");
+        let inicio = src
+            .find(assinatura)
+            .expect("run_scheduler tem de existir em server.rs");
+        let resto = &src[inicio..];
+        let fim = resto
+            .find("\n}\n")
+            .expect("run_scheduler tem de fechar em coluna zero");
+        let corpo = &resto[..fim];
+
+        assert!(
+            corpo.contains(concat!("claim_due", "_tasks(")),
+            "run_scheduler deve reivindicar via claim_due_tasks (#1227 slice 2)"
+        );
+        assert!(
+            !corpo.contains(concat!("poll_due", "_tasks")),
+            "run_scheduler nao pode voltar ao poll read-only — reexecucao silenciosa apos queda"
+        );
+        assert!(
+            corpo.contains(concat!("log_recovered", "_leases(&store)")),
+            "cada tick deve recuperar leases expiradas antes de reivindicar"
+        );
+    }
+
+    /// #1227 (slice 2): a recuperacao de leases roda em DOIS lugares — na
+    /// subida (bloco `Ok(store)` do `SessionStore::open`, ao lado de
+    /// `log_interrupted_runs`) e no inicio de cada tick. Sem a subida, uma
+    /// tarefa que caiu com lease longa espera ate 10 min para ser vista;
+    /// sem o tick, uma queda de OUTRO processo sobre o mesmo arquivo nunca
+    /// e vista.
+    #[test]
+    fn leases_expiradas_sao_recuperadas_na_subida_e_no_tick() {
+        let src = include_str!("server.rs");
+        let alvo = concat!("log_recovered", "_leases(&store)");
+        let copias = src.matches(alvo).count();
+        assert_eq!(
+            copias, 2,
+            "esperava 2 chamadas (subida + tick), achei {copias}"
+        );
+    }
+
+    fn tarefa_fixura() -> garraia_db::ScheduledTask {
+        garraia_db::ScheduledTask {
+            id: "task-1".to_string(),
+            session_id: "sess-1".to_string(),
+            channel_id: "telegram".to_string(),
+            user_id: "user-1".to_string(),
+            execute_at: chrono::Utc::now(),
+            payload: "verificar o build".to_string(),
+            session_metadata: serde_json::json!({}),
+            cron_expr: None,
+            timezone: None,
+            run_count: 0,
+            max_runs: None,
+            attempts: 0,
+        }
+    }
+
+    /// #1227 (slice 1): cada execucao agendada deixa uma linha em
+    /// `agent_runs` com `session_id` preenchido e desfecho terminal — a
+    /// queda no meio vira `interrupted` no restart seguinte, em vez de sumir.
+    #[tokio::test]
+    async fn run_agendado_grava_linha_terminal_com_sessao() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            SessionStore::open(&tmp.path().join("sessions.db")).unwrap(),
+        ));
+        let task = tarefa_fixura();
+
+        let run_id = ledger_inicia_run_agendado(&store, &task).await;
+        ledger_fecha_run_agendado(&store, &run_id, &Ok("resposta do heartbeat".to_string())).await;
+
+        let runs = store.lock().await.list_recent_agent_runs(10).unwrap();
+        assert_eq!(runs.len(), 1, "uma execucao, uma linha");
+        assert_eq!(runs[0].status, garraia_db::RunStatus::Done);
+        assert_eq!(runs[0].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            runs[0].result_snippet.as_deref(),
+            Some("resposta do heartbeat")
+        );
+    }
+
+    /// Falha da execucao fecha o run com `error` e snippet do erro — nunca
+    /// fica `running` para sempre esperando o restart.
+    #[tokio::test]
+    async fn run_agendado_com_erro_fecha_com_status_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(
+            SessionStore::open(&tmp.path().join("sessions.db")).unwrap(),
+        ));
+        let task = tarefa_fixura();
+
+        let run_id = ledger_inicia_run_agendado(&store, &task).await;
+        ledger_fecha_run_agendado(
+            &store,
+            &run_id,
+            &Err(garraia_common::Error::Agent("boom".to_string())),
+        )
+        .await;
+
+        let runs = store.lock().await.list_recent_agent_runs(10).unwrap();
+        assert_eq!(runs[0].status, garraia_db::RunStatus::Error);
+        assert!(
+            runs[0].error_snippet.as_deref().unwrap().contains("boom"),
+            "snippet de erro presente"
+        );
     }
 }

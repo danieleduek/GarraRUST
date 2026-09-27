@@ -9,7 +9,7 @@ use tracing::{debug, info, instrument};
 
 use crate::providers::{
     ChatMessage, ChatRole, ContentBlock, LlmProvider, LlmRequest, LlmResponse, MessagePart,
-    StreamEvent, Usage,
+    StreamEvent, Usage, ValidacaoDeModelo, erro_de_envio,
 };
 
 const DEFAULT_MODEL: &str = "gpt-4o";
@@ -27,6 +27,26 @@ pub struct OpenAiProvider {
     is_openrouter: bool,
 }
 
+/// O `Display` do `reqwest::Error` para no rotulo: qualquer falha lendo o
+/// corpo (conexao fechada no meio, corpo truncado) sai como "error decoding
+/// response body", e a causa real fica em `source()`. Sem ela o erro nao da
+/// para agir (#1228: o dogfood do `max-power` parou nesse texto e nao havia
+/// como saber se o servidor caiu ou mandou lixo).
+fn com_causa(e: &dyn std::error::Error) -> String {
+    let mut texto = e.to_string();
+    let mut causa = e.source();
+    while let Some(c) = causa {
+        let parte = c.to_string();
+        // hyper e reqwest as vezes repetem a mensagem da camada de baixo.
+        if !texto.ends_with(&parte) {
+            texto.push_str(": ");
+            texto.push_str(&parte);
+        }
+        causa = c.source();
+    }
+    texto
+}
+
 impl OpenAiProvider {
     pub fn new(
         api_key: impl Into<String>,
@@ -37,8 +57,14 @@ impl OpenAiProvider {
         let is_openrouter = base_url_str.contains("openrouter.ai");
         // connect_timeout only: responses stream for minutes, but a dead
         // host must fail fast instead of hanging the caller indefinitely.
+        // Redirects are off by default (issue #1248, rule 14): an LLM
+        // endpoint never legitimately 302s to another host, and following
+        // one would bypass the SSRF gate that `add_provider` applies. A
+        // pinned client supplied via `with_client` already has this; the
+        // default covers providers built from config at boot.
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -77,13 +103,11 @@ impl OpenAiProvider {
         format!("{}/v1/chat/completions", base)
     }
 
-    /// List models available from OpenRouter API
-    /// Returns a curated list of popular models to avoid overwhelming the UI
-    async fn list_models(&self) -> Result<Vec<String>> {
-        if !self.is_openrouter {
-            return Ok(Vec::new());
-        }
-
+    /// Catálogo COMPLETO do OpenRouter (`GET /models`), sem o filtro de
+    /// populares — é contra esta lista que uma rota se valida (#1298): a
+    /// curada de `/models` anuncia só os populares e esconderia namespaces
+    /// válidos como `z-ai/...` (o default da ADR 0022 vive fora dela).
+    async fn catalogo_openrouter(&self) -> Result<Vec<String>> {
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{}/models", base);
 
@@ -131,35 +155,22 @@ impl OpenAiProvider {
             .await
             .map_err(|e| Error::Agent(format!("failed to parse models response: {e}")))?;
 
-        let all_models: Vec<String> = models_response.data.into_iter().map(|m| m.id).collect();
+        Ok(models_response.data.into_iter().map(|m| m.id).collect())
+    }
+
+    /// List models available from OpenRouter API
+    /// Returns a curated list of popular models to avoid overwhelming the UI
+    async fn list_models(&self) -> Result<Vec<String>> {
+        if !self.is_openrouter {
+            return Ok(Vec::new());
+        }
+
+        let all_models = self.catalogo_openrouter().await?;
 
         tracing::info!("OpenRouter total models: {}", all_models.len());
 
         // Return popular models for UI display
-        let popular_models = vec![
-            "openai/gpt-4o".to_string(),
-            "openai/gpt-4o-mini".to_string(),
-            "openai/gpt-4".to_string(),
-            "openai/gpt-3.5-turbo".to_string(),
-            "anthropic/claude-sonnet-4.5".to_string(),
-            "anthropic/claude-opus-4.5".to_string(),
-            "anthropic/claude-haiku-4.5".to_string(),
-            "google/gemini-2.5-pro".to_string(),
-            "google/gemini-2.5-flash".to_string(),
-            "meta-llama/llama-3.1-70b-instruct".to_string(),
-            "meta-llama/llama-3.3-70b-instruct".to_string(),
-            "deepseek/deepseek-r1".to_string(),
-            "mistralai/mistral-large".to_string(),
-            "qwen/qwen-plus".to_string(),
-            "moonshotai/kimi-k2".to_string(),
-            "openrouter/auto".to_string(),
-        ];
-
-        // Filter to only include models that exist in the available models
-        let models: Vec<String> = popular_models
-            .into_iter()
-            .filter(|m| all_models.contains(m))
-            .collect();
+        let models = curada_do_catalogo(&all_models);
 
         tracing::info!("OpenRouter popular models count: {}", models.len());
 
@@ -328,6 +339,9 @@ impl LlmProvider for OpenAiProvider {
     #[instrument(skip(self, request), fields(model))]
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse> {
         let body = self.build_request(request);
+        // Capturado antes de o corpo da resposta sombrear `body` no caminho
+        // de erro (#1299).
+        let modelo = body.model.clone();
 
         tracing::Span::current().record("model", body.model.as_str());
         debug!("openai request: model={}", body.model);
@@ -358,7 +372,9 @@ impl LlmProvider for OpenAiProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Error::Agent(format!("openai request failed: {e}")))?;
+            // #1249: rede caida vira `Error::Transport`, que o runtime trata
+            // como elegivel a fallback na primeira tentativa.
+            .map_err(|e| erro_de_envio("openai request failed", &e))?;
 
         let status = response.status();
 
@@ -371,6 +387,14 @@ impl LlmProvider for OpenAiProvider {
                 &body[..body.len().min(500)],
                 self.endpoint()
             );
+            // #1299: roteamento impossível é determinístico — sai classificado
+            // como configuração, com modelo, restrição e recuperação, em vez
+            // de erro cru que o operador não consegue agir.
+            if let Some(e) =
+                erro_de_roteamento_openrouter(self.is_openrouter, status.as_u16(), &body, &modelo)
+            {
+                return Err(e);
+            }
             return Err(Error::Agent(format!(
                 "openai API error: status={status}, body={body}"
             )));
@@ -387,10 +411,9 @@ impl LlmProvider for OpenAiProvider {
             .unwrap_or("")
             .to_string();
 
-        let body_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::Agent(format!("failed to read response body: {e}")))?;
+        let body_bytes = response.bytes().await.map_err(|e| {
+            Error::Agent(format!("failed to read response body: {}", com_causa(&e)))
+        })?;
 
         let body_str = String::from_utf8_lossy(&body_bytes);
 
@@ -499,6 +522,9 @@ impl LlmProvider for OpenAiProvider {
         request: &LlmRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let body = self.build_request(request);
+        // Capturado antes de o corpo da resposta sombrear `body` no caminho
+        // de erro (#1299).
+        let modelo = body.model.clone();
 
         tracing::Span::current().record("model", body.model.as_str());
         debug!("openai stream request: model={}", body.model);
@@ -525,11 +551,20 @@ impl LlmProvider for OpenAiProvider {
             .json(&body_value)
             .send()
             .await
-            .map_err(|e| Error::Agent(format!("openai stream request failed: {e}")))?;
+            // #1249: mesmo tratamento do caminho batch — o braco de streaming
+            // do fallback e separado e ficou de fora do fix anterior.
+            .map_err(|e| erro_de_envio("openai stream request failed", &e))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            // #1299: mesma classificação do caminho batch — o braço de
+            // streaming não fica com a mensagem pior.
+            if let Some(e) =
+                erro_de_roteamento_openrouter(self.is_openrouter, status.as_u16(), &body, &modelo)
+            {
+                return Err(e);
+            }
             return Err(Error::Agent(format!(
                 "openai API error: status={status}, body={body}"
             )));
@@ -635,6 +670,21 @@ impl LlmProvider for OpenAiProvider {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    /// #1298: valida contra o catálogo COMPLETO do OpenRouter. A curada de
+    /// `/models` esconde namespaces válidos — o default `z-ai/glm-5.3-flash`
+    /// da ADR 0022 não está nela — e não pode ser o gate do `/model`.
+    async fn validar_modelo(&self, model: &str) -> Result<ValidacaoDeModelo> {
+        if !self.is_openrouter {
+            return Ok(ValidacaoDeModelo::SemListagem);
+        }
+        let completa = self.catalogo_openrouter().await?;
+        Ok(classificar_no_catalogo(
+            &curada_do_catalogo(&completa),
+            &completa,
+            model,
+        ))
     }
 }
 
@@ -952,10 +1002,217 @@ fn from_openai_response(response: OpenAiResponse) -> LlmResponse {
     }
 }
 
+/// Os populares anunciados na lista curada de `/models` (#1298).
+fn modelos_populares() -> Vec<&'static str> {
+    vec![
+        "openai/gpt-4o",
+        "openai/gpt-4o-mini",
+        "openai/gpt-4",
+        "openai/gpt-3.5-turbo",
+        "anthropic/claude-sonnet-4.5",
+        "anthropic/claude-opus-4.5",
+        "anthropic/claude-haiku-4.5",
+        "google/gemini-2.5-pro",
+        "google/gemini-2.5-flash",
+        "meta-llama/llama-3.1-70b-instruct",
+        "meta-llama/llama-3.3-70b-instruct",
+        "deepseek/deepseek-r1",
+        "mistralai/mistral-large",
+        "qwen/qwen-plus",
+        "moonshotai/kimi-k2",
+        "openrouter/auto",
+    ]
+}
+
+/// Os populares que o catálogo completo confirma — a lista curada que
+/// `available_models` anuncia.
+fn curada_do_catalogo(completa: &[String]) -> Vec<String> {
+    modelos_populares()
+        .into_iter()
+        .filter(|m| completa.iter().any(|c| c.as_str() == *m))
+        .map(str::to_string)
+        .collect()
+}
+
+/// #1298: classificação pura do identificador contra os dois níveis de
+/// catálogo — a regra que o `validar_modelo` do OpenRouter aplica. O modelo
+/// pode estar nos dois (anunciado), só no completo (rota válida com nome não
+/// anunciado) ou em nenhum (recusa).
+fn classificar_no_catalogo(
+    curada: &[String],
+    completa: &[String],
+    model: &str,
+) -> ValidacaoDeModelo {
+    if !completa.iter().any(|m| m == model) {
+        return ValidacaoDeModelo::Ausente;
+    }
+    if curada.iter().any(|m| m == model) {
+        ValidacaoDeModelo::Listado
+    } else {
+        ValidacaoDeModelo::ListadoForaDaCurada
+    }
+}
+
+/// Assinatura do 404 determinístico de roteamento do OpenRouter (#1299): a
+/// preferência `provider.only` em vigor não tem interseção com os providers
+/// que servem o modelo. Repetir não muda nada — não é condição transitória.
+const ASSINATURA_ROTEAMENTO_404: &str = "No allowed providers are available";
+
+/// Trecho do corpo que segue a um marcador, colapsado em uma linha. O corpo
+/// da falha de roteamento delimita os segmentos `Providers serving <model>:`
+/// e `permits only:` com linha em branco — é deles que a mensagem da #1299
+/// tira a restrição efetiva e a lista de providers compatíveis.
+fn segmento_apos(body: &str, marcador: &str) -> Option<String> {
+    let idx = body.find(marcador)? + marcador.len();
+    let resto = &body[idx..];
+    let fim = resto.find("\n\n").unwrap_or(resto.len());
+    Some(
+        resto[..fim]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// #1299: classifica o 404 `No allowed providers are available` do OpenRouter
+/// como erro de configuração de roteamento — não-transitório — e devolve a
+/// mensagem acionável: modelo, restrição efetiva, providers compatíveis e
+/// caminho de recuperação. Qualquer outro caso devolve `None` e segue para o
+/// erro cru.
+///
+/// Política de segurança da issue: o Garra **não** relaxa `provider.only`.
+/// A correção é detectar e explicar; afrouxar a preferência é decisão do
+/// operador. O gate `is_openrouter` evita dar orientação de OpenRouter a um
+/// endpoint compatível qualquer que devolva o mesmo texto.
+fn erro_de_roteamento_openrouter(
+    is_openrouter: bool,
+    status: u16,
+    body: &str,
+    model: &str,
+) -> Option<Error> {
+    if !is_openrouter || status != 404 || !body.contains(ASSINATURA_ROTEAMENTO_404) {
+        return None;
+    }
+    let mut msg = format!(
+        "O modelo '{model}' não pode ser servido por nenhum provider permitido \
+         pela preferência `provider.only` em vigor — erro de configuração de \
+         roteamento (não-transitório; não será retriado)."
+    );
+    if let Some(permitido) = segmento_apos(body, "permits only:") {
+        msg.push_str(&format!("\n\nPermitido atualmente: {permitido}"));
+    }
+    if let Some(compativeis) = segmento_apos(body, &format!("Providers serving {model}:")) {
+        msg.push_str(&format!("\nProviders compatíveis: {compativeis}"));
+    }
+    msg.push_str(
+        "\n\nTente:\n  /model <outro-modelo> — troca o modelo no mesmo turno \
+         (ou escolha um slug sem sufixo `:provider`)\n  ajuste a preferência de \
+         providers (`provider.only`) na sua conta OpenRouter — o Garra não \
+         altera essa preferência por conta própria",
+    );
+    Some(Error::Agent(msg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::ToolDefinition;
+
+    #[derive(Debug)]
+    struct Camada(&'static str, Option<Box<Camada>>);
+    impl std::fmt::Display for Camada {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Camada {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|c| c as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn com_causa_desce_a_cadeia_sem_repetir() {
+        let erro = Camada(
+            "error decoding response body",
+            Some(Box::new(Camada(
+                "connection closed before message completed",
+                Some(Box::new(Camada(
+                    "connection closed before message completed",
+                    None,
+                ))),
+            ))),
+        );
+        assert_eq!(
+            com_causa(&erro),
+            "error decoding response body: connection closed before message completed"
+        );
+        assert_eq!(com_causa(&Camada("sozinho", None)), "sozinho");
+    }
+
+    /// Servidor que promete um corpo e fecha a conexao no meio: o erro que o
+    /// provider devolve tem de trazer a causa, nao so o rotulo do reqwest.
+    #[tokio::test]
+    async fn corpo_truncado_diz_a_causa() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind efemero");
+        let porta = listener.local_addr().expect("endereco local").port();
+        let servidor = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut lido = Vec::new();
+            while !lido.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                lido.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{\"id\":",
+            )
+            .await
+            .expect("write");
+            sock.flush().await.expect("flush");
+            drop(sock);
+        });
+
+        let provider = OpenAiProvider::new(
+            "chave-de-teste",
+            Some("modelo".to_string()),
+            Some(format!("http://127.0.0.1:{porta}/v1")),
+        );
+        let request = LlmRequest {
+            model: String::new(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: MessagePart::Text("oi".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(16),
+            temperature: None,
+            tools: vec![],
+        };
+        let erro = provider
+            .complete(&request)
+            .await
+            .expect_err("corpo truncado tem de falhar")
+            .to_string();
+        servidor.await.expect("servidor");
+        assert!(erro.contains("failed to read response body"), "{erro}");
+        let depois = erro
+            .split("error decoding response body")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            depois.starts_with(": ") && depois.len() > 2,
+            "o erro tem de trazer a causa depois do rotulo: {erro}"
+        );
+    }
 
     #[test]
     fn builds_request_with_default_model() {
@@ -1242,5 +1499,93 @@ mod tests {
                 .unwrap_or("");
             assert!(!msg.is_empty(), "error message should not be empty");
         }
+    }
+
+    /// #1298: classificação do `/model` contra os dois níveis de catálogo do
+    /// OpenRouter — a lista curada de `/models` anuncia só os populares, e o
+    /// próprio default da ADR 0022 (`z-ai/glm-5.3-flash`) vive fora dela.
+    /// Namespace de terceiro servido pelo OpenRouter é rota VÁLIDA com nome
+    /// não anunciado, não erro.
+    #[test]
+    fn classificar_no_catalogo_distingue_curada_de_completa() {
+        let curada = vec!["openai/gpt-4o".to_string()];
+        let completa = vec![
+            "openai/gpt-4o".to_string(),
+            "z-ai/glm-5.3-flash".to_string(),
+        ];
+        assert_eq!(
+            classificar_no_catalogo(&curada, &completa, "openai/gpt-4o"),
+            ValidacaoDeModelo::Listado
+        );
+        // Namespace de terceiro via OpenRouter: rota válida, fora da curada.
+        assert_eq!(
+            classificar_no_catalogo(&curada, &completa, "z-ai/glm-5.3-flash"),
+            ValidacaoDeModelo::ListadoForaDaCurada
+        );
+        // Nem no catálogo completo: recusa transacional.
+        assert_eq!(
+            classificar_no_catalogo(&curada, &completa, "vendor/inexistente"),
+            ValidacaoDeModelo::Ausente
+        );
+    }
+
+    /// Corpo real do 404 observado na #1299: `provider.only` sem interseção
+    /// com os providers que servem o modelo.
+    fn corpo_roteamento_1299() -> String {
+        "No allowed providers are available for the selected model.\n\n\
+         Providers serving deepseek/deepseek-v4-flash-20260731:\n\
+         relace, streamlake, baidu, deepinfra, together, fireworks\n\n\
+         but your request's provider.only preference permits only:\n\
+         open-inference\n\n\
+         failed_routing_step: Filter by Allowed Providers"
+            .to_string()
+    }
+
+    /// #1299: o 404 determinístico de roteamento sai classificado — mensagem
+    /// com modelo, restrição efetiva, providers compatíveis e caminho de
+    /// recuperação, e sem nenhum segredo.
+    #[test]
+    fn roteamento_404_e_classificado_com_orientacao() {
+        let model = "deepseek/deepseek-v4-flash-20260731";
+        let e = erro_de_roteamento_openrouter(true, 404, &corpo_roteamento_1299(), model)
+            .expect("404 de roteamento deve ser classificado");
+        let msg = e.to_string();
+        assert!(msg.contains(model), "{msg}");
+        assert!(msg.contains("não-transitório"), "{msg}");
+        assert!(
+            msg.contains("Permitido atualmente: open-inference"),
+            "{msg}"
+        );
+        assert!(msg.contains("deepinfra"), "{msg}");
+        assert!(msg.contains("/model"), "{msg}");
+        assert!(msg.contains("provider.only"), "{msg}");
+        // O corpo do OpenRouter não carrega credenciais e o trecho repassado
+        // não pode introduzir uma.
+        assert!(!msg.contains("sk-"), "{msg}");
+    }
+
+    /// #1299: nenhum falso positivo — outro 404 (data policy, modelo
+    /// inexistente), a mesma assinatura com status de sucesso e a assinatura
+    /// fora do OpenRouter seguem para o erro cru. Configuração VÁLIDA de
+    /// `provider.only` nunca gera essa assinatura, então não muda de caminho.
+    #[test]
+    fn outros_404_nao_sao_roteamento() {
+        let model = "deepseek/deepseek-v4-flash-20260731";
+        assert!(
+            erro_de_roteamento_openrouter(
+                true,
+                404,
+                "No endpoints found matching your data policy",
+                model
+            )
+            .is_none()
+        );
+        assert!(erro_de_roteamento_openrouter(true, 404, "", model).is_none());
+        assert!(
+            erro_de_roteamento_openrouter(true, 200, &corpo_roteamento_1299(), model).is_none()
+        );
+        assert!(
+            erro_de_roteamento_openrouter(false, 404, &corpo_roteamento_1299(), model).is_none()
+        );
     }
 }

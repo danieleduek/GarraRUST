@@ -72,6 +72,15 @@ metrics_token_ttl_hint_secs = 0
 Both forms are equivalent. The file is never required — when absent the
 defaults above apply automatically (all four fields are `#[serde(default)]`).
 
+> **File permissions are Unix-only.** `config.yml` can also carry
+> `llm.*.api_key` and `gateway.api_key`; on Unix the writer clamps the mode to
+> `0600` (and creates it `0600` from birth, see `write_atomic_secret`). On
+> Windows **no equivalent hardening exists today** — the file inherits the
+> default ACL of its directory, which lets any process of the same user (and
+> administrators) read it. The gap is tracked in #1253; on Windows, prefer
+> env-only secrets (`GARRAIA_JWT_SECRET`, provider keys via environment or the
+> credential vault) over an on-disk `config.yml`.
+
 ---
 
 ## 3. Environment variables
@@ -199,7 +208,8 @@ whether it mattered. It usually does not.
 | --- | --- |
 | Web Console (`/`, `webchat.html`) | the `/api/*` endpoints never use a JWT — see the note below on the gateway API key |
 | WebSocket chat (`/ws`) | authenticates with the gateway API key, not a JWT |
-| `POST /v1/chat/completions` | OpenAI-compatible surface, same API-key path |
+| `POST /v1/chat/completions`, `POST /v1/messages` | compat surfaces (OpenAI/Anthropic): no JWT in the path, they sit on the gateway API-key axis instead (#1240) |
+| `POST /a2a/tasks` and the rest of `/a2a/*` | same axis — the A2A surface never used a JWT |
 | `garra mcp-server` (stdio) | in-process, no HTTP auth in the path at all |
 | `garra chat` / `garra ask` | local CLI, talks to the runtime directly |
 | Telegram / Discord / Slack / WhatsApp | channel adapters carry their own allowlist |
@@ -225,18 +235,69 @@ answers a different question. The JWT stack is *who are you*; the gateway key
 is *are you allowed on this port at all*.
 
 Since #1045, a configured `gateway.api_key` is required on the whole `/api/*`
-REST surface, not just on the `/ws` handshake as before. Three routes stay open
-so a client can find the gateway before it has the key: `/api/health`,
-`/api/capabilities` and `/api/auth-check`. All three are secret-free.
+REST surface, not just on the `/ws` handshake as before. Since #1240 it also
+covers the **conversation plane and the A2A surface**, which are mounted on the
+same raw router and had been left out:
 
-**With no `gateway.api_key` set, nothing changes** — `/api/*` answers as it
-always did, which is the right default for a gateway bound to `127.0.0.1`. It
-is binding to `0.0.0.0` that makes the key worth setting, and that is the case
-the mobile app on the LAN puts you in. See `docs/hardening-gateway.md` §2.
+| Path | Method | Gated since |
+| --- | --- | --- |
+| `/api/*` | any | #1045 |
+| `/v1/chat/completions` | `POST` | #1240 |
+| `/v1/messages`, `/v1/messages/count_tokens` | `POST` | #1240 |
+| `/a2a/*` (whole namespace, by prefix) | any | #1240 |
+| `/ws`, `/ws/parrot` (handshake) | `GET` | #1045 / #1240 |
 
-The key travels in the `Authorization: Bearer` header. Only `/ws` also accepts
-it in the query string, because a browser's WebSocket handshake cannot carry a
-header; on REST it would end up in access logs and in the request span.
+These were the reason the gate had to stop being a single `/api/` prefix test.
+The original exclusion note said "`/v1/*` has its own JWT" — true of the
+`rest_v1` workspace routes (`/v1/me`, `/v1/groups`) and of `/v1/auth/*`, and
+**not** true of the OpenAI/Anthropic compat routes, which only share the
+prefix and resolve no identity at all. Those routes run GarraIA's tools on the
+operator's machine, so a key that did not cover them was a control the operator
+had switched on believing it closed the port.
+
+Open with the key configured, because they are how a client *finds* the
+gateway before it has one, and none of them executes anything:
+
+- `/api/health`, `/api/capabilities`, `/api/auth-check` (all secret-free);
+- `/v1/models` and `/.well-known/agent.json` (discovery);
+- `/health`, `/ping`.
+
+`/v1/auth/*`, `/v1/me` and the rest of `rest_v1` are **not** on this axis: they
+answer with their own JWT/503 contract, gate or no gate.
+
+**With no `gateway.api_key` set, nothing changes** — every one of the routes
+above answers exactly as it always did, which is the right default for a
+gateway bound to `127.0.0.1`. #1240 closed nothing by default; it only made the
+key cover what the operator already thought it covered. It is binding to
+`0.0.0.0` that makes the key worth setting, and that is the case the mobile app
+on the LAN puts you in. See `docs/hardening-gateway.md` §2.
+
+The key travels in the `Authorization: Bearer` header. The two Anthropic compat
+routes (`/v1/messages`, `/v1/messages/count_tokens`) also accept it in
+`x-api-key`, because Claude Code and the official Anthropic SDK never send a
+bearer — the two headers are alternatives, and either one being right is
+enough. Only the two WebSocket handshakes also accept the key in the query
+string, because a browser's WebSocket handshake cannot carry a header; on REST
+it would end up in access logs and in the request span.
+
+### The two WebSocket handshakes
+
+`/ws` (web chat) and `/ws/parrot` (the Garra Desktop overlay) are checked
+**inside their handlers**, not by the `/api/*` middleware, and both accept the
+key as `?token=` or `?api_key=` as well as `Authorization: Bearer`. The query
+string is not a convenience here, it is the only channel that works: the Tauri
+webview opens the overlay with `new WebSocket(...)`, which cannot set a header
+at all, so gating `/ws/parrot` in the middleware — which only reads headers —
+would lock the desktop out instead of authenticating it.
+
+`/ws/parrot` was gated in the R4 audit of PR #1251, not in #1240 itself. It had
+been guarded only by the #1182 origin check, which passes by design when there
+is no `Origin` header (a non-browser client — app, CLI, `curl` — never sends
+one). With `gateway.api_key` set and the gateway on `0.0.0.0`, a
+`websocat ws://host:3888/ws/parrot` therefore connected with no credential and
+drove a full agent turn, with the tools and the operator's LLM key, on the
+desktop's persistent session. Its sibling `/ws`, mounted on the line above in
+`router.rs`, had checked the key since #1045.
 
 The key is read once at startup, so changing it on disk needs a gateway
 restart — the config hot-reload does not reach it.
@@ -299,10 +360,16 @@ secret (§3.2.1, issue #824). Two consequences worth knowing:
   `GARRAIA_SIGNUP_DATABASE_URL` is missing — `AuthConfig::from_env` is
   all-or-nothing, so `/auth/*` and `/v1/auth/*` still answer 503
   (previously this partial state passed `config check` clean).
-- **Warning** (network section, field `gateway.host`) when the config
-  file binds `0.0.0.0`/`::` with no `gateway.api_key` or TLS disabled.
-  Note `garra start --host` / the `HOST` env var can override the file
-  value at runtime — the finding reflects the file, not the live process.
+- **Error** (network section, field `gateway.host`) when the resolved bind
+  (see §5.1) is not loopback and no gateway credential is set
+  (`gateway.api_key` or `GARRAIA_GATEWAY_API_KEY`): `garraia start` refuses
+  that bind (#1261), so `config check` never reports it clean. With a
+  credential but no TLS the finding is a **Warning**; with the file-only
+  opt-out `gateway.allow_unauthenticated_network_bind: true` it is a
+  **Warning**, and the opt-out itself is always reported.
+- **Warning** (field `gateway.api_key`) when `GARRAIA_GATEWAY_API_KEY` and
+  `gateway.api_key` are both set and differ — the env var wins. Presence
+  only; values are never emitted.
 - **Warning** when the env secret is set **and** `[auth]` overrides are
   present — non-secret overrides apply but secrets remain env-only.
 - **Warning** (deprecation) whenever the mixed-case
@@ -314,6 +381,87 @@ secret (§3.2.1, issue #824). Two consequences worth knowing:
 
 The JSON output of `config check --json` never contains secret values —
 only presence flags (plan 0035 SEC-M-02).
+
+### 5.1 The gateway bind address — what `config check` sees vs what `start` binds
+
+The host and port the gateway actually binds come from the **command
+line**, in this order:
+
+1. explicit `--host` / `--port` flags, then
+2. the `HOST` / `PORT` environment variables (clap `env = "..."` — how
+   RunPod / container runtimes inject theirs, GAR-603), then
+3. the clap built-in defaults `127.0.0.1` : `3888`.
+
+**The `gateway.host` / `gateway.port` keys in `config.yml` / `config.toml`
+do not feed `garra start` / `garra restart`.** `Commands::Start` overwrites
+`config.gateway.host` / `config.gateway.port` unconditionally right after
+`ConfigLoader::load()` (`crates/garraia-cli/src/main.rs`), and because both
+clap args always carry a value (flag, env, or built-in default), the file
+value never survives. Measured on v0.4.2: a `config.yml` with
+`gateway.host: 0.0.0.0` and `port: 3977` still binds `127.0.0.1:3888`,
+while `HOST=…` changes the banner and the bind.
+
+`garraia restart` reads `HOST` / `PORT` exactly like `garraia start`
+(#1261 — before, restarting a RunPod/`HOST` daemon quietly rebound it to
+loopback).
+
+**`gateway.host` / `gateway.port` in the file are deprecated** (#1261,
+decision B). They still parse, for back-compat, but nothing reads them to
+bind: `garraia init` no longer writes them and removes them on a re-run, the
+Web Console shows the running bind read-only, and the client commands
+(`garraia status`, `stop`, `doctor`, `admin`) target the same address
+`start` uses (`HOST`/`PORT`, else `127.0.0.1:3888`, with `0.0.0.0`/`::`
+mapped to loopback) instead of the file value. Removing the keys from the
+schema is deliberately not done in v0.4.5: once nothing reads or writes
+them, deleting them would only turn a helpful deprecation warning into a
+silent no-op.
+
+#### The boot refuses an exposed bind without a credential
+
+Since v0.4.5 (#1261, decision A), `garraia start`, `start -d` and `restart`
+**refuse to boot** (exit 78, `EX_CONFIG`) when any address the bind resolves
+to is not loopback and no gateway credential is configured. The refusal
+happens before the socket is bound, before the fork in `-d` mode (so the
+message lands on the terminal), and before `restart` stops the running
+daemon. TLS does not exempt the bind: TLS without a credential is still open
+to anyone who can reach the port. A hostname counts as exposed if **any** of
+its resolved addresses is not loopback; a hostname that does not resolve is
+refused too.
+
+Fix it with one of:
+
+- run `garraia init` (it writes `gateway.api_key` on a server-like machine
+  or when `HOST` is not loopback);
+- set `gateway.api_key` in the config file;
+- export `GARRAIA_GATEWAY_API_KEY=<a long random secret>` — the env var
+  wins over the file and is never written back to disk (the way to give a
+  container a key without editing a read-only mounted config);
+- or bind locally: `garraia start --host 127.0.0.1` (unset `HOST`).
+
+A deployment that is open **on purpose**, behind an authenticating proxy or
+a firewall, can set `gateway.allow_unauthenticated_network_bind: true` in the
+config file. It is file-only by design — there is no env var or flag, so the
+same `HOST` injection that exposes the bind cannot also switch the guard off
+— and every boot with it logs a loud warning.
+
+Consequences for `config check`:
+
+- `garraia config check` and `garraia doctor` resolve the bind the way
+  `start` does, **minus the flag**: `HOST` / `PORT` from their own
+  environment if set, otherwise `127.0.0.1` : `3888`. A non-loopback IP
+  literal without a credential is an **Error** ("`garraia start` will
+  REFUSE"); a hostname other than `localhost` gets a warning saying the
+  check cannot judge it (`start` resolves it and applies the rule).
+- The file's `gateway.host` / `gateway.port` are reported by a separate
+  deprecation warning ("deprecated and not read by `garraia start`") when
+  they differ from the resolved bind. Under `--strict` that warning exits
+  2: remove the keys.
+- What the check cannot see is a `--host` / `--port` flag on a later
+  `start`/`restart` (another process). That gap is closed at runtime: the
+  boot applies the same rule to the real bind.
+- The dedicated `/metrics` listener follows the same precedent: it refuses
+  to start on a non-loopback bind with no auth configured
+  (`metrics_exporter.rs`).
 
 ---
 
@@ -435,7 +583,10 @@ For the systemd unit, write the variables to `/etc/garraia/env`
 nothing about auth:
 
 ```bash
-garraia config check --strict                      # expect exit 0
+garraia config check --strict   # expect exit 0 — exits 2 if this shell exports
+                                # HOST=0.0.0.0 without gateway.api_key AND without
+                                # in-process TLS, i.e. the §7.6 layout with TLS at
+                                # the reverse proxy (see §5.1)
 # journal/log: "garraia-auth wired (login + signup pools + jwt)"
 curl -si -X POST http://127.0.0.1:3888/v1/auth/signup \
   -H 'Content-Type: application/json' \

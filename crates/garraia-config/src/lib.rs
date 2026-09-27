@@ -1,12 +1,29 @@
 pub mod auth;
+pub mod bind;
+pub mod boot_gate;
 pub mod check;
+pub mod defaults;
+pub mod execution;
 pub mod loader;
 pub mod model;
 pub mod provider_keys;
+/// #1436: politica de retencao (memoria × ledger de runs), dona das faixas
+/// que o `config check` e o `PATCH /admin/api/retention` cobram.
+pub mod retention;
+pub mod sandbox;
 pub mod watcher;
 
-pub use auth::{AuthConfig, AuthConfigError};
+pub use auth::{AuthConfig, AuthConfigError, GATEWAY_API_KEY_ENV};
 pub use check::{ConfigCheck, ConfigSummary, Finding, Severity, SourceReport, run_check};
+pub use defaults::{
+    DEFAULT_CLOUD_MODEL, DEFAULT_CLOUD_PROVIDER, DEFAULT_LOCAL_MODEL, DEFAULT_LOCAL_PROVIDER,
+};
+// ADR 0024 (#1329): a secao `execution` mora em modulo proprio, como
+// `agent.sandbox`; o re-export segue o mesmo caminho.
+pub use execution::{
+    ExecutionConfig, ExecutionProfile, ExecutionProfileError, PROFILE_ENV as EXECUTION_PROFILE_ENV,
+    ProfileSource, perfil_do_env as execution_profile_from_env,
+};
 pub use loader::{ConfigLoader, harden_secret_file};
 pub use model::{
     AUTH_ACCESS_TTL_MAX_SECS, AUTH_ACCESS_TTL_MIN_SECS, AUTH_REFRESH_TTL_MAX_SECS,
@@ -15,10 +32,13 @@ pub use model::{
     MAX_PATCH_BYTES_MIN, McpServerConfig, MemoryConfig, NamedAgentConfig, S3StorageConfig,
     StorageBackend, StorageConfig, TimeoutConfig, TypeTimeout, VoiceConfig,
 };
+// #1225: os tipos de `agent.sandbox` moram no modulo proprio; o re-export
+// no nivel da crate segue o mesmo caminho de antes para os consumidores.
 pub use provider_keys::{
     KeySource, default_vault_path, provider_key_env, resolve_api_key, resolve_api_key_source,
     resolve_provider_key_source, vault_present_but_locked,
 };
+pub use sandbox::{SandboxBackendKind, SandboxConfig, SandboxMode};
 pub use watcher::ConfigWatcher;
 
 /// Crate-wide lock serializing unit tests that mutate process-global

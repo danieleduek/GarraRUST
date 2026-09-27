@@ -8,6 +8,7 @@
 //! - `parallel_execute`: Run agents concurrently via tokio::spawn
 //! - `pipeline_execute`: Chain agents (output A -> input B)
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -116,6 +117,10 @@ pub struct SubAgentConfig {
     pub temperature: Option<f64>,
     /// Timeout in seconds
     pub timeout_secs: u64,
+    /// Sessão (`sessions.id` do `SessionStore`) à qual o run pertence, gravada
+    /// em `agent_runs.session_id` pelo ledger (#1227 slice 3). `None` para run
+    /// avulso — antes o campo não existia e todo run nascia sem sessão.
+    pub session_id: Option<String>,
 }
 
 impl SubAgentConfig {
@@ -128,6 +133,7 @@ impl SubAgentConfig {
             max_tokens: Some(4096),
             temperature: Some(0.7),
             timeout_secs: 60,
+            session_id: None,
         }
     }
 
@@ -142,6 +148,12 @@ impl SubAgentConfig {
         self.timeout_secs = secs;
         self
     }
+
+    /// Associa o run a uma sessão; o ledger grava o id em `agent_runs.session_id`.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
 }
 
 /// AgentCoordinator: manages multiple sub-agents with parallel and pipeline execution
@@ -154,6 +166,128 @@ pub struct AgentCoordinator {
     default_system_prompt: String,
     /// Maximum concurrent agents
     max_concurrent: usize,
+    /// Ledger durável de runs (P1 gap analysis 2026-09-15). Default no-op.
+    ///
+    /// O wiring de produção da #1227 já chegou, mas **por fora deste trait**:
+    /// a subida do gateway/CLI chama `log_interrupted_runs` (slice 1) e o
+    /// scheduler (`execute_scheduled_task`) grava cada execução agendada em
+    /// `agent_runs` com `mode = "heartbeat"` (slice 1), ambos direto no
+    /// `SessionStore`. O que segue sem chamador de produção é **este**
+    /// campo: nenhum caminho de gateway/CLI constrói um `AgentCoordinator`
+    /// hoje, então `with_ledger` só é exercitado em teste.
+    ledger: Arc<dyn RunLedger>,
+}
+
+/// Ledger durável de runs de sub-agentes.
+///
+/// `RunId` é gerado pelo chamador (uuid) e devolvido no `on_start` para o
+/// `on_finish`. Implementação padrão: no-op. O adapter sobre a tabela
+/// `agent_runs` (`garraia-db`, `DbRunLedger`) existe, é testado e aceita o
+/// `Arc<tokio::sync::Mutex<SessionStore>>` que o gateway já guarda em
+/// `AppState`, mas segue sem chamador de produção: a tabela hoje é povoada
+/// pelo scheduler do gateway (#1227 slice 1), que chama
+/// `start_agent_run`/`finish_agent_run` direto no `SessionStore` sem passar
+/// por este trait.
+///
+/// O trait usa [`async_trait`] — exceção documentada à regra "AFIT nativo"
+/// (CLAUDE.md §Rust), pela mesma razão de `garraia_storage::ObjectStore`: é
+/// consumido como `dyn RunLedger` (`AgentCoordinator::ledger`), e AFIT + `dyn`
+/// não fecham em Rust stable. Os métodos precisam ser `async` porque o adapter
+/// real faz `.lock().await` no mutex do tokio; um `std::sync::Mutex` aqui
+/// obrigaria o gateway a manter um segundo store só para o ledger.
+#[async_trait]
+pub trait RunLedger: Send + Sync {
+    /// Grava o início do run e devolve o `run_id` a ser passado ao `on_finish`.
+    async fn on_start(&self, goal: &str, mode: Option<&str>, session_id: Option<&str>) -> String;
+    /// Fecha o run com status terminal (`done`/`error`/`cancelled`).
+    async fn on_finish(
+        &self,
+        run_id: &str,
+        status: garraia_db::RunStatus,
+        result_snippet: Option<&str>,
+        error_snippet: Option<&str>,
+    );
+}
+
+/// Sem ledger (default): comportamento atual, zero custo.
+pub struct NoopLedger;
+
+#[async_trait]
+impl RunLedger for NoopLedger {
+    async fn on_start(
+        &self,
+        _goal: &str,
+        _mode: Option<&str>,
+        _session_id: Option<&str>,
+    ) -> String {
+        String::new()
+    }
+    async fn on_finish(
+        &self,
+        _run_id: &str,
+        _status: garraia_db::RunStatus,
+        _result_snippet: Option<&str>,
+        _error_snippet: Option<&str>,
+    ) {
+    }
+}
+
+/// Adapter sobre a tabela `agent_runs` do `SessionStore` (garraia-db).
+///
+/// Recebe o mesmo `Arc<tokio::sync::Mutex<SessionStore>>` que o gateway guarda
+/// em `AppState::session_store` (#1227 slice 3) — antes exigia
+/// `std::sync::Mutex`, tipo incompatível, e o wiring era impossível. Continua
+/// sem chamador de produção: nenhum caminho do gateway/CLI constrói um
+/// `AgentCoordinator` hoje, então `with_ledger` só é chamado em teste. Quem
+/// povoa `agent_runs` em produção é o scheduler do gateway (#1227 slice 1),
+/// por chamada direta ao `SessionStore` — o `garra runs list` (slice 4) lê
+/// exatamente essas linhas.
+///
+/// Falha de I/O no SQLite vira aviso no log e não derruba o run — o ledger é
+/// auditoria a posteriori, não pré-condição de execução (comportamento
+/// herdado da #1224, inalterado aqui).
+pub struct DbRunLedger {
+    store: Arc<tokio::sync::Mutex<garraia_db::SessionStore>>,
+}
+
+impl DbRunLedger {
+    pub fn new(store: Arc<tokio::sync::Mutex<garraia_db::SessionStore>>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl RunLedger for DbRunLedger {
+    async fn on_start(&self, goal: &str, mode: Option<&str>, session_id: Option<&str>) -> String {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        // O guard morre no fim do statement: o mutex do gateway não fica
+        // segurado enquanto se loga.
+        let started = self
+            .store
+            .lock()
+            .await
+            .start_agent_run(&run_id, session_id, goal, mode);
+        if let Err(e) = started {
+            tracing::warn!(erro = %e, "run ledger: falhou ao gravar início do run");
+        }
+        run_id
+    }
+    async fn on_finish(
+        &self,
+        run_id: &str,
+        status: garraia_db::RunStatus,
+        result_snippet: Option<&str>,
+        error_snippet: Option<&str>,
+    ) {
+        let finished =
+            self.store
+                .lock()
+                .await
+                .finish_agent_run(run_id, status, result_snippet, error_snippet);
+        if let Err(e) = finished {
+            tracing::warn!(erro = %e, "run ledger: falhou ao fechar o run");
+        }
+    }
 }
 
 impl AgentCoordinator {
@@ -166,7 +300,14 @@ impl AgentCoordinator {
                 "You are an AI assistant. Complete the assigned task precisely and concisely."
                     .to_string(),
             max_concurrent: 5,
+            ledger: Arc::new(NoopLedger),
         }
+    }
+
+    /// Define o ledger durável de runs (adapter sobre `agent_runs` no gateway/CLI).
+    pub fn with_ledger(mut self, ledger: Arc<dyn RunLedger>) -> Self {
+        self.ledger = ledger;
+        self
     }
 
     /// Set default system prompt
@@ -190,121 +331,157 @@ impl AgentCoordinator {
         let provider = Arc::clone(&self.provider);
         let model = self.model.clone();
         let default_prompt = self.default_system_prompt.clone();
+        let ledger = Arc::clone(&self.ledger);
 
         let join_handle = tokio::spawn(async move {
-            let start = std::time::Instant::now();
+            // Ledger: todo run nasce auditado; fim grava status terminal. A
+            // sessão vem do config (#1227 slice 3) — antes era sempre `None`.
+            let run_id = ledger
+                .on_start(
+                    &config.task,
+                    Some(config.mode.as_str()),
+                    config.session_id.as_deref(),
+                )
+                .await;
+            let outcome: AgentResult = async {
+                let start = std::time::Instant::now();
 
-            // Send "running" progress
-            let _ = progress_tx
-                .send(AgentProgress {
-                    task: config.task.clone(),
-                    status: AgentStatus::Running,
-                    message: "Agent started".to_string(),
-                })
+                // Send "running" progress
+                let _ = progress_tx
+                    .send(AgentProgress {
+                        task: config.task.clone(),
+                        status: AgentStatus::Running,
+                        message: "Agent started".to_string(),
+                    })
+                    .await;
+
+                // Check for cancellation
+                if *cancel_rx.borrow() {
+                    return AgentResult {
+                        task: config.task,
+                        mode: config.mode.as_str().to_string(),
+                        output: String::new(),
+                        success: false,
+                        error: Some("Cancelled before execution".to_string()),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    };
+                }
+
+                let system_prompt = config.system_prompt.unwrap_or(default_prompt);
+
+                let messages = vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: MessagePart::Text(config.task.clone()),
+                }];
+
+                let request = LlmRequest {
+                    model,
+                    messages,
+                    system: Some(system_prompt),
+                    max_tokens: config.max_tokens,
+                    temperature: config.temperature,
+                    tools: vec![],
+                };
+
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(config.timeout_secs),
+                    provider.complete(&request),
+                )
                 .await;
 
-            // Check for cancellation
-            if *cancel_rx.borrow() {
-                return AgentResult {
-                    task: config.task,
-                    mode: config.mode.as_str().to_string(),
-                    output: String::new(),
-                    success: false,
-                    error: Some("Cancelled before execution".to_string()),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                };
+                let duration_ms = start.elapsed().as_millis() as u64;
+
+                match result {
+                    Ok(Ok(response)) => {
+                        let output = response
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        let _ = progress_tx
+                            .send(AgentProgress {
+                                task: config.task.clone(),
+                                status: AgentStatus::Completed,
+                                message: "Agent completed".to_string(),
+                            })
+                            .await;
+
+                        AgentResult {
+                            task: config.task,
+                            mode: config.mode.as_str().to_string(),
+                            output,
+                            success: true,
+                            error: None,
+                            duration_ms,
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        let _ = progress_tx
+                            .send(AgentProgress {
+                                task: config.task.clone(),
+                                status: AgentStatus::Failed,
+                                message: format!("Agent failed: {}", e),
+                            })
+                            .await;
+
+                        AgentResult {
+                            task: config.task,
+                            mode: config.mode.as_str().to_string(),
+                            output: String::new(),
+                            success: false,
+                            error: Some(format!("LLM error: {}", e)),
+                            duration_ms,
+                        }
+                    }
+                    Err(_) => {
+                        let _ = progress_tx
+                            .send(AgentProgress {
+                                task: config.task.clone(),
+                                status: AgentStatus::Failed,
+                                message: format!("Agent timed out after {}s", config.timeout_secs),
+                            })
+                            .await;
+
+                        AgentResult {
+                            task: config.task,
+                            mode: config.mode.as_str().to_string(),
+                            output: String::new(),
+                            success: false,
+                            error: Some(format!("Timeout after {}s", config.timeout_secs)),
+                            duration_ms,
+                        }
+                    }
+                }
             }
-
-            let system_prompt = config.system_prompt.unwrap_or(default_prompt);
-
-            let messages = vec![ChatMessage {
-                role: ChatRole::User,
-                content: MessagePart::Text(config.task.clone()),
-            }];
-
-            let request = LlmRequest {
-                model,
-                messages,
-                system: Some(system_prompt),
-                max_tokens: config.max_tokens,
-                temperature: config.temperature,
-                tools: vec![],
-            };
-
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(config.timeout_secs),
-                provider.complete(&request),
-            )
             .await;
 
-            let duration_ms = start.elapsed().as_millis() as u64;
-
-            match result {
-                Ok(Ok(response)) => {
-                    let output = response
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    let _ = progress_tx
-                        .send(AgentProgress {
-                            task: config.task.clone(),
-                            status: AgentStatus::Completed,
-                            message: "Agent completed".to_string(),
-                        })
-                        .await;
-
-                    AgentResult {
-                        task: config.task,
-                        mode: config.mode.as_str().to_string(),
-                        output,
-                        success: true,
-                        error: None,
-                        duration_ms,
-                    }
-                }
-                Ok(Err(e)) => {
-                    let _ = progress_tx
-                        .send(AgentProgress {
-                            task: config.task.clone(),
-                            status: AgentStatus::Failed,
-                            message: format!("Agent failed: {}", e),
-                        })
-                        .await;
-
-                    AgentResult {
-                        task: config.task,
-                        mode: config.mode.as_str().to_string(),
-                        output: String::new(),
-                        success: false,
-                        error: Some(format!("LLM error: {}", e)),
-                        duration_ms,
-                    }
-                }
-                Err(_) => {
-                    let _ = progress_tx
-                        .send(AgentProgress {
-                            task: config.task.clone(),
-                            status: AgentStatus::Failed,
-                            message: format!("Agent timed out after {}s", config.timeout_secs),
-                        })
-                        .await;
-
-                    AgentResult {
-                        task: config.task,
-                        mode: config.mode.as_str().to_string(),
-                        output: String::new(),
-                        success: false,
-                        error: Some(format!("Timeout after {}s", config.timeout_secs)),
-                        duration_ms,
-                    }
-                }
-            }
+            // Ledger: status terminal determinado pelo resultado. Run cancelado
+            // antes da execução tem a marca "Cancelled" no erro (contrato acima).
+            let status = if outcome.success {
+                garraia_db::RunStatus::Done
+            } else if outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Cancelled"))
+            {
+                garraia_db::RunStatus::Cancelled
+            } else {
+                garraia_db::RunStatus::Error
+            };
+            ledger
+                .on_finish(
+                    &run_id,
+                    status,
+                    (!outcome.output.is_empty()).then_some(outcome.output.as_str()),
+                    outcome.error.as_deref(),
+                )
+                .await;
+            outcome
         });
 
         AgentHandle {
@@ -470,6 +647,10 @@ mod tests {
         assert_eq!(config.mode, AgentMode::Code);
         assert_eq!(config.system_prompt.as_deref(), Some("Custom prompt"));
         assert_eq!(config.timeout_secs, 120);
+        assert_eq!(config.session_id, None, "run avulso nasce sem sessão");
+
+        let config = config.with_session_id("sess-42");
+        assert_eq!(config.session_id.as_deref(), Some("sess-42"));
     }
 
     #[test]
@@ -514,5 +695,136 @@ mod tests {
         assert_eq!(summary.total_agents, 2);
         assert_eq!(summary.successful, 1);
         assert_eq!(summary.failed, 1);
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+    use garraia_db::SessionStore;
+    // O mesmo tipo que o gateway guarda em `AppState::session_store`: este
+    // módulo é a prova de compilação de que o adapter aceita o mutex do tokio.
+    use tokio::sync::Mutex;
+
+    /// Provider fake: responde texto fixo (sem rede).
+    struct FakeProvider;
+    #[async_trait::async_trait]
+    impl LlmProvider for FakeProvider {
+        fn provider_id(&self) -> &str {
+            "fake"
+        }
+        async fn complete(
+            &self,
+            _request: &LlmRequest,
+        ) -> garraia_common::Result<crate::providers::LlmResponse> {
+            Ok(crate::providers::LlmResponse {
+                content: vec![ContentBlock::Text {
+                    text: "feito".to_string(),
+                }],
+                model: "fake-model".to_string(),
+                stop_reason: None,
+                usage: None,
+            })
+        }
+        async fn health_check(&self) -> garraia_common::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// Ledger de teste que conta chamadas (contrato on_start -> on_finish).
+    struct CountingLedger {
+        starts: std::sync::atomic::AtomicUsize,
+        finishes: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl RunLedger for CountingLedger {
+        async fn on_start(
+            &self,
+            _goal: &str,
+            _mode: Option<&str>,
+            _session_id: Option<&str>,
+        ) -> String {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            format!(
+                "run-{}",
+                self.starts.load(std::sync::atomic::Ordering::SeqCst)
+            )
+        }
+        async fn on_finish(
+            &self,
+            _run_id: &str,
+            _status: garraia_db::RunStatus,
+            _r: Option<&str>,
+            _e: Option<&str>,
+        ) {
+            self.finishes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn fake_provider() -> Arc<dyn LlmProvider> {
+        Arc::new(FakeProvider)
+    }
+
+    #[tokio::test]
+    async fn run_gera_start_e_finish_no_ledger() {
+        let ledger = Arc::new(CountingLedger {
+            starts: std::sync::atomic::AtomicUsize::new(0),
+            finishes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let coord = AgentCoordinator::new(fake_provider(), "m")
+            .with_ledger(Arc::clone(&ledger) as Arc<dyn RunLedger>);
+        let handle = coord.spawn_agent(SubAgentConfig::new("tarefa auditada", AgentMode::Ask));
+        let result = handle.join().await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(ledger.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ledger.finishes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// #1227 slice 3: o adapter aceita o `Arc<tokio::sync::Mutex<SessionStore>>`
+    /// do gateway e grava start + finish com a sessão do `SubAgentConfig`.
+    #[tokio::test]
+    async fn db_ledger_grava_no_store_real_com_session_id() {
+        let store: Arc<Mutex<SessionStore>> =
+            Arc::new(Mutex::new(SessionStore::in_memory().unwrap()));
+        let coord = AgentCoordinator::new(fake_provider(), "m")
+            .with_ledger(Arc::new(DbRunLedger::new(Arc::clone(&store))));
+        let handle = coord.spawn_agent(
+            SubAgentConfig::new("run via db", AgentMode::Ask).with_session_id("sess-1"),
+        );
+        let result = handle.join().await;
+        assert!(result.success, "{:?}", result.error);
+
+        let rows = store.lock().await.list_recent_agent_runs(10).unwrap();
+        assert_eq!(rows.len(), 1, "on_start gravou exatamente uma linha");
+        let row = &rows[0];
+        assert_eq!(row.goal, "run via db");
+        assert_eq!(row.mode.as_deref(), Some("ask"));
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("sess-1"),
+            "session_id vem do config, não mais None fixo"
+        );
+        // on_finish: status terminal + finished_at preenchido pelo UPDATE.
+        assert_eq!(row.status, garraia_db::RunStatus::Done);
+        assert!(row.finished_at.is_some(), "on_finish fechou o run");
+        assert_eq!(row.result_snippet.as_deref(), Some("feito"));
+    }
+
+    /// Run avulso (sem sessão) continua válido: `session_id` fica NULL.
+    #[tokio::test]
+    async fn db_ledger_run_sem_sessao_grava_null() {
+        let store = Arc::new(Mutex::new(SessionStore::in_memory().unwrap()));
+        let coord = AgentCoordinator::new(fake_provider(), "m")
+            .with_ledger(Arc::new(DbRunLedger::new(Arc::clone(&store))));
+        coord
+            .spawn_agent(SubAgentConfig::new("run avulso", AgentMode::Ask))
+            .join()
+            .await;
+        let rows = store.lock().await.list_recent_agent_runs(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, None);
+        assert_eq!(rows[0].status, garraia_db::RunStatus::Done);
     }
 }

@@ -9,6 +9,43 @@ Varredura autônoma do repositório. O `team-coordinator` dirige; os especialist
 
 > **Padrão é propor, não destruir.** O autopilot abre PRs e fecha issues só com evidência. Merge em `main`, deleção de branch e release exigem humano.
 
+
+## Pré-requisitos e modo degradado
+
+Este pipeline **depende de uma ferramenta de spawn de subagente**. Sem ela, a
+sessão só consegue falar com agentes que já existem (`SendMessage`), e a
+independência de julgamento que o roster inteiro pressupõe deixa de existir:
+ela vem de **contexto separado** — agente, prompt e worktree distintos, com o
+Reviewer lendo o diff e nunca o relatório do Implementer.
+
+Verifique antes de prometer um time. Se não houver spawn:
+
+- **R0–R1** seguem normalmente: são trabalho que uma sessão só faz e assina.
+- **R2–R3** seguem com ressalva escrita no PR dizendo que a revisão foi feita
+  pela mesma sessão que implementou.
+- **R4+ não é mergeável por construção.** Não implemente. Diagnostique,
+  documente com file:line, abra a issue e **escale ao humano**. Auto-revisão em
+  superfície sensível é proibida pelo `CLAUDE.md`, e "eu reli com cuidado" não
+  substitui contexto separado.
+
+Descobrir isso no meio da rodada custa a rodada inteira — foi o atrito nº 1 do
+dogfood registrado na #1228.
+
+### Outros pré-requisitos que já morderam
+
+- **`cargo` sem `CARGO_TARGET_DIR` exportado cria uma árvore de build inteira
+  dentro do worktree.** A variável **não persiste entre chamadas de shell**:
+  reexporte em *cada* comando. Numa rodada real isso produziu um `target/` de
+  4,5 GB dentro de um worktree e levou o disco a 100%, travando todos os
+  agentes ao mesmo tempo.
+- **Um `target/` compartilhado entre worktrees serve artefato velho.** Já
+  produziu duas leituras falsas: um "vermelho" que não existia e um erro de
+  compilação logo depois de o clippy passar na mesma lib. Em medição que vai
+  virar decisão, force rebuild.
+- **O `utoipa-swagger-ui` não precisa mais de rede**: desde o #1228 o gateway
+  usa a feature `vendored` e o build script lê o zip embutido. O antigo
+  `SWAGGER_UI_DOWNLOAD_URL=file://...` é ignorado. Ver a skill `steward`.
+
 ## Fases
 
 ### 1. Levantamento
@@ -34,6 +71,15 @@ Classifique risco, monte o grafo de dependências, decida o que paraleliza. **N�
 ### 4. Execução por item
 Worktree isolada por issue. `implementer` → `test-engineer` → `code-reviewer` → (`security-auditor` se R4) → (`doc-writer` se API/setup/CHANGELOG).
 
+### 4a. Antes de comentar um achado
+
+Confirme o achado **contra a branch do PR** (`gh pr checkout <n>` numa
+worktree, ou `git show <head>:<arquivo>`), não contra a `main` nem contra o
+relatório de outro agente. Autorrelato de agente não é prova: na rodada 2 do
+dogfood (#1228) um achado recebido e repassado sem conferência apontava
+código que a branch já não tinha. Comentário público errado custa uma
+retratação.
+
 ### 5. Abertura de PR
 Uma PR por item, com:
 - o que mudou e por quê
@@ -41,6 +87,11 @@ Uma PR por item, com:
 - risco declarado
 - fragmento em `changelog.d/`
 - `Closes #n`
+
+Se as PRs vão entrar por um trem de merge (checks estritos deixam cada uma
+`BEHIND` a cada merge), **desligue o auto-merge de todas antes** de começar
+(`gh pr merge --disable-auto <n>`). Uma PR que fica verde no meio do trem
+entra sozinha e conflita o resto — ver a skill `steward`, §5b.
 
 ### 6. Relatório final
 
@@ -94,6 +145,6 @@ Repository Health: NN/100
 
 ## Custo
 
-Mantenha o `team-coordinator` (hy4) fora do trabalho operacional. Volume de tokens vai para DeepSeek (investigar/testar) e GLM (implementar); Luna julga; Hy4 decide. Se uma etapa puder ser feita por um modelo barato, ela deve ser.
+Mantenha o `team-coordinator` (Fable 5.1) fora do trabalho operacional: ele decide, os demais (Opus 5) investigam, implementam, testam, julgam e documentam. Se uma etapa puder ser feita com menos contexto (um agente `Explore`, um grep), ela deve ser.
 
 Usage: /repo-autopilot [--issues #n,#m] [--max-parallel N] [--dry-run]
