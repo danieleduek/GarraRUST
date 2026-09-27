@@ -77,7 +77,9 @@ pub fn documento_de(s: &LinkedSettings, perfil: ExecutionProfile, revelar: bool)
             obj.insert(
                 "can".into(),
                 json!({
-                    "read": c.leitura, "write": c.escrita, "shell": c.shell,
+                    "read": c.leitura, "write": c.escrita, "web": c.web,
+                    "memory_read": c.memoria_leitura, "memory_write": c.memoria_escrita,
+                    "shell": c.shell,
                     "device_execute": c.dispositivo, "message_send": c.mensagem,
                     "mcp_read": c.mcp_leitura, "mcp_write": c.mcp_escrita,
                 }),

@@ -297,12 +297,19 @@ impl Breaker {
     }
 
     /// Alimenta o breaker com a saida da ferramenta, ja classificada.
-    pub fn registrar(&mut self, tool: &str, saida: &ToolOutput, agora: Instant) {
+    ///
+    /// Devolve `true` quando ESTA saida abriu o breaker da ferramenta
+    /// (fechado -> aberto): e a "ativacao" que a observabilidade conta
+    /// (#1438). Falha que so conta, falha com o breaker ja aberto, sucesso e
+    /// pedido de confirmacao devolvem `false`.
+    pub fn registrar(&mut self, tool: &str, saida: &ToolOutput, agora: Instant) -> bool {
+        let antes = self.estado(tool, agora).esta_aberto();
         match classificar(saida) {
             Veredito::Sucesso => self.registrar_sucesso(tool),
             Veredito::Falha(classe) => self.registrar_falha(tool, classe, agora),
             Veredito::Neutro => {}
         }
+        !antes && self.estado(tool, agora).esta_aberto()
     }
 
     /// Uma chamada que deu certo fecha o breaker da ferramenta e zera a
@@ -468,12 +475,18 @@ impl Breakers {
             .abrir_turno(contexto);
     }
 
-    /// Ver [`Breaker::registrar`].
-    pub fn registrar(&self, session_id: &str, tool: &str, saida: &ToolOutput, agora: Instant) {
+    /// Ver [`Breaker::registrar`]: `true` quando esta saida abriu o breaker.
+    pub fn registrar(
+        &self,
+        session_id: &str,
+        tool: &str,
+        saida: &ToolOutput,
+        agora: Instant,
+    ) -> bool {
         let capacidade = self.capacidade;
         self.lock()
             .entrada(session_id, capacidade)
-            .registrar(tool, saida, agora);
+            .registrar(tool, saida, agora)
     }
 
     /// Ver [`Breaker::registrar_falha`].

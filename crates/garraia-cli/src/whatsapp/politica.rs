@@ -26,17 +26,18 @@ use garraia_gateway::bootstrap::whatsapp_linked_politica::visao::{
 };
 use garraia_gateway::bootstrap::whatsapp_linked_politica::{Admission, Alcance, auditoria};
 use garraia_gateway::bootstrap::{
-    WHATSAPP_LINKED_CONFIG_KEY as CONFIG_KEY, whatsapp_linked_settings,
+    WHATSAPP_LINKED_CONFIG_KEY as CONFIG_KEY, WhatsAppLinkedSettings, whatsapp_linked_settings,
 };
 
 use super::acesso::{
-    EX_DATAERR, EX_USAGE, carregar, dica_do_gateway, normalizar_numero, secao_criando,
+    EX_DATAERR, EX_USAGE, MensagemDeNumero, carregar, dica_do_gateway, final4, normalizar_numero,
+    secao_criando,
 };
 use super::{Context, EX_CANCELLED, EX_SOFTWARE, Lang, t, tb};
 use crate::wizard::prompts::Prompter;
 
 /// Mudanca gravada, audit nao (sysexits `EX_CANTCREAT`).
-const EX_CANTCREAT: i32 = 73;
+pub(crate) const EX_CANTCREAT: i32 = 73;
 
 /// `garraia whatsapp access <subcomando>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +127,65 @@ fn teto_do_audit(config: &AppConfig) -> u64 {
         .unwrap_or(auditoria::MAX_BYTES_DEFAULT)
 }
 
+/// O evento de uma mudanca JA gravada, no audit local: origem `cli`, o
+/// usuario do SO como ator, o alvo mascarado por `Evento::novo` e o resumo
+/// antes/depois pelo mesmo leitor do gateway. `Err` traz a mensagem do SO;
+/// quem chama decide como avisar.
+fn registrar_evento(
+    ctx: &Context,
+    acao: &str,
+    alvo: Option<&str>,
+    antes: &WhatsAppLinkedSettings,
+    depois: &WhatsAppLinkedSettings,
+    teto: u64,
+) -> Result<(), String> {
+    let evento = auditoria::Evento::novo("cli", &ator(), acao, alvo, antes, depois);
+    auditoria::registrar(&ctx.data_dir, &evento, teto)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// A frase de "gravou, mas o audit nao" — a MESMA em todos os comandos que
+/// mexem no acesso, para o operador reconhecer o estado de longe.
+pub(crate) fn aviso_de_audit_falhou(lang: Lang, erro: &str) -> String {
+    match lang {
+        Lang::Pt => format!(
+            "A mudanca foi gravada, mas o audit local nao: {erro} (arquivo `{}`).",
+            auditoria::ARQUIVO
+        ),
+        Lang::En => format!(
+            "The change was written, but the local audit was not: {erro} (file `{}`).",
+            auditoria::ARQUIVO
+        ),
+    }
+}
+
+/// Audita uma mudanca que um comando LEGADO ja gravou por fora do motor de
+/// mutacao — `allow`, `remove`, `owner`, `unowner` e o passo pos-QR do `link`
+/// (#1414).
+///
+/// Ate a #1414 esses comandos gravavam `allow`/`owners` sem deixar rastro, e
+/// a trilha de `access audit` so contava metade da historia. O evento e o
+/// MESMO que [`aplicar`] grava — `acao` e o nome do subcomando, `antes` e
+/// `depois` sao as duas configs (a lida e a gravada), resumidas pelo mesmo
+/// leitor do gateway, e o alvo sai mascarado (`…1234`). Falha vira o mesmo
+/// aviso e o mesmo exit 73 (`Err`, ja impresso): a mudanca ficou, o audit
+/// nao, e o operador tem de saber.
+pub(crate) fn auditar(
+    ctx: &Context,
+    acao: &str,
+    alvo: &str,
+    antes: &AppConfig,
+    depois: &AppConfig,
+) -> Result<(), i32> {
+    let de = whatsapp_linked_settings(antes);
+    let para = whatsapp_linked_settings(depois);
+    registrar_evento(ctx, acao, Some(alvo), &de, &para, teto_do_audit(depois)).map_err(|erro| {
+        eprintln!("{}", aviso_de_audit_falhou(ctx.lang, &erro));
+        EX_CANTCREAT
+    })
+}
+
 /// Aplica uma mutacao a config em disco (ou so simula, com `dry_run`).
 ///
 /// Carrega, aplica pelo motor, calcula o impacto e — fora do `dry_run` e so
@@ -166,16 +226,15 @@ pub fn aplicar(ctx: &Context, mutacao: &Mutacao, dry_run: bool) -> Result<Aplica
         return Err(EX_SOFTWARE);
     }
     aplicacao.gravou = true;
-    let evento = auditoria::Evento::novo(
-        "cli",
-        &ator(),
+    if let Err(erro) = registrar_evento(
+        ctx,
         mutacao.acao(),
         mutacao.alvo(),
         &antes,
         &depois,
-    );
-    if let Err(e) = auditoria::registrar(&ctx.data_dir, &evento, teto_do_audit(&config)) {
-        aplicacao.audit_falhou = Some(e.to_string());
+        teto_do_audit(&config),
+    ) {
+        aplicacao.audit_falhou = Some(erro);
     }
     Ok(aplicacao)
 }
@@ -423,6 +482,146 @@ pub fn json_do_audit(ctx: &Context, limit: usize) -> Result<serde_json::Value, i
         "file": ctx.data_dir.join(auditoria::ARQUIVO).display().to_string(),
         "events": events,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// O wizard `link` (#1429)
+// ---------------------------------------------------------------------------
+
+/// O que `open` significa NESTA config: o alcance que um desconhecido
+/// recebe. Dito antes do aviso de abrir, para a decisao ser sobre o valor
+/// real e nao sobre o `chat` "salvo configurado" da frase generica.
+pub(crate) fn linha_do_default_do_desconhecido(lang: Lang, default: Alcance) -> String {
+    tb(
+        lang,
+        "Com `open`, um número desconhecido entra com o default: {default} (muda com `{bin} whatsapp access default`).",
+        "With `open`, an unknown number gets in with the default: {default} (change it with `{bin} whatsapp access default`).",
+    )
+    .replace("{default}", &default.to_string())
+}
+
+/// As tres opcoes de nivel, na ordem de [`Nivel`]: `chat`, `read`, `full`.
+fn opcoes_de_nivel(lang: Lang) -> [&'static str; 3] {
+    match lang {
+        Lang::Pt => [
+            "chat — só conversa, nenhuma ferramenta",
+            "read — só leitura (arquivos, busca); nunca shell nem escrita (padrão)",
+            "full — sem teto próprio: o modo e o perfil de execução decidem",
+        ],
+        Lang::En => [
+            "chat — conversation only, no tools",
+            "read — read-only (files, search); never shell nor writes (default)",
+            "full — no ceiling of its own: the mode and the execution profile decide",
+        ],
+    }
+}
+
+/// As duas admissoes, na ordem `restricted`, `open`.
+fn opcoes_de_admissao(lang: Lang) -> [&'static str; 2] {
+    match lang {
+        Lang::Pt => [
+            "restricted — só quem você autorizar (padrão)",
+            "open — QUALQUER número, com o default do desconhecido",
+        ],
+        Lang::En => [
+            "restricted — only who you authorize (default)",
+            "open — ANY number, with the unknown-sender default",
+        ],
+    }
+}
+
+/// As perguntas de politica do wizard `link` (#1429), depois do numero.
+///
+/// Pura quanto ao disco: pergunta e devolve o que aplicar, na ordem em que
+/// foi respondido; quem grava e [`aplicar`], mutacao a mutacao, pelo mesmo
+/// motor e com o mesmo audit do `access` — o wizard nao tem uma segunda
+/// forma de escrever politica. Defaults seguros em tudo: `read` sem escrita
+/// para quem acabou de entrar (Enter nao da shell a ninguem), `restricted`
+/// para a admissao, e `open` so depois do MESMO aviso do `access open`, com
+/// default nao.
+///
+/// - `recem_autorizado`: o numero que o passo anterior acabou de gravar em
+///   `allow`, se houve. Nivel e escrita so fazem sentido para ele: dono nao
+///   tem teto (o motor recusaria com `EDono`), e quem ja estava na lista nao
+///   e mexido por um `link`.
+/// - `default_do_desconhecido`: o alcance que um desconhecido receberia em
+///   `open` nesta config, mostrado antes de perguntar se abre.
+///
+/// Escrita nao e perguntada em `chat` (nao ha onde escrever) e so vira
+/// mutacao quando ligada — `off` ja e o estado de quem acabou de entrar.
+pub(crate) fn perguntar_politica(
+    ctx: &Context,
+    prompter: &dyn Prompter,
+    recem_autorizado: Option<&str>,
+    default_do_desconhecido: Alcance,
+) -> Vec<Mutacao> {
+    let lang = ctx.lang;
+    let mut out = Vec::new();
+    if let Some(numero) = recem_autorizado {
+        let fim = final4(numero);
+        let pergunta = match lang {
+            Lang::Pt => {
+                format!("Nível de acesso de …{fim} (o teto do que ele pode pedir ao GarraIA)")
+            }
+            Lang::En => format!("Access level for …{fim} (the ceiling on what it may ask GarraIA)"),
+        };
+        let escolha = prompter
+            .select(&pergunta, &opcoes_de_nivel(lang), 1)
+            .unwrap_or(1);
+        let nivel = match escolha {
+            0 => Nivel::Chat,
+            2 => Nivel::Full,
+            _ => Nivel::Read,
+        };
+        out.push(Mutacao::Nivel {
+            identidade: numero.to_string(),
+            nivel,
+        });
+        if nivel != Nivel::Chat {
+            let pergunta = match lang {
+                Lang::Pt => format!(
+                    "Liberar escrita de arquivo para …{fim}? (só escrita de arquivo, nativa e MCP — nunca shell)"
+                ),
+                Lang::En => format!(
+                    "Allow file writes for …{fim}? (file writes only, native and MCP — never shell)"
+                ),
+            };
+            if prompter.confirm(&pergunta, false).unwrap_or(false) {
+                out.push(Mutacao::Write {
+                    identidade: numero.to_string(),
+                    on: true,
+                });
+            }
+        }
+    }
+    let admissao = prompter
+        .select(
+            t(
+                lang,
+                "Admissão: quem pode falar com o GarraIA por este WhatsApp?",
+                "Admission: who may talk to GarraIA through this WhatsApp?",
+            ),
+            &opcoes_de_admissao(lang),
+            0,
+        )
+        .unwrap_or(0);
+    if admissao == 1 {
+        println!(
+            "{}",
+            linha_do_default_do_desconhecido(lang, default_do_desconhecido)
+        );
+        if prompter
+            .confirm(pergunta_de_abrir(lang), false)
+            .unwrap_or(false)
+        {
+            out.push(Mutacao::Admissao(Admission::Open));
+        }
+    } else {
+        // O que foi respondido e o que vai para o disco — inclusive quando
+        // ja era assim (o motor nao grava nem audita o que nao mudou).
+        out.push(Mutacao::Admissao(Admission::Restricted));
+    }
+    out
 }
 
 fn pergunta_de_abrir(lang: Lang) -> &'static str {
@@ -688,19 +887,7 @@ fn executar(ctx: &Context, prompter: &dyn Prompter, comando: &ComandoDeAcesso) -
         }
     }
     if let Some(erro) = &aplicacao.audit_falhou {
-        eprintln!(
-            "{}",
-            match ctx.lang {
-                Lang::Pt => format!(
-                    "A mudanca foi gravada, mas o audit local nao: {erro} (arquivo `{}`).",
-                    auditoria::ARQUIVO
-                ),
-                Lang::En => format!(
-                    "The change was written, but the local audit was not: {erro} (file `{}`).",
-                    auditoria::ARQUIVO
-                ),
-            }
-        );
+        eprintln!("{}", aviso_de_audit_falhou(ctx.lang, erro));
         return Ok(EX_CANTCREAT);
     }
     Ok(0)

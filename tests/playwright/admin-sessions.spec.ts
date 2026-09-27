@@ -42,9 +42,11 @@ async function login(page: Page) {
 async function goToSessions(page: Page) {
   await page.getByTestId('nav-sessions').click();
   await page.locator('#page-title').waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
-  // The table renders after the fetch; wait for either a row or the empty state.
+  // The page renders after the fetch: the sessions table, or the empty state
+  // when the gateway has no session yet (the order of the specs decides that
+  // in CI, so never assume one or the other).
   await expect
-    .poll(async () => (await page.locator('table').count()) + (await page.getByTestId('session-row').count()), { timeout: 15_000 })
+    .poll(async () => (await page.getByTestId('sessions-table').count()) + (await page.getByTestId('sessions-empty').count()), { timeout: 15_000 })
     .toBeGreaterThan(0);
 }
 
@@ -65,7 +67,9 @@ test.describe('Sessions page: principal, effective mode and capabilities', () =>
   });
 
   test('renders the principal, effective mode and project columns', async ({ page }) => {
-    const headers = page.locator('table thead th');
+    // The columns only exist when there is a table, i.e. at least one session.
+    if (!(await ensureASession(page))) test.skip(true, 'no session in this environment and seeding is not allowed');
+    const headers = page.getByTestId('sessions-table').locator('thead th');
     await expect(headers.filter({ hasText: 'Principal' })).toHaveCount(1);
     await expect(headers.filter({ hasText: 'Effective mode' })).toHaveCount(1);
     await expect(headers.filter({ hasText: 'Project' })).toHaveCount(1);

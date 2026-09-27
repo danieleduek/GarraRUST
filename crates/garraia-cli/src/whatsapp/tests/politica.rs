@@ -655,3 +655,422 @@ fn audit_lista_mais_recente_primeiro_e_e_vazio_sem_arquivo() {
         0
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1414: os comandos legados tambem auditam
+// ---------------------------------------------------------------------------
+
+/// Um evento por escrita que de fato mudou algo, com o nome do subcomando
+/// como acao, `cli` como origem e o alvo mascarado — nunca a identidade.
+fn ultimo_evento(ctx: &Context, acao: &str) -> auditoria::Evento {
+    let eventos = audit(ctx);
+    let e = eventos.first().cloned().expect("ha evento");
+    assert_eq!(e.acao, acao);
+    assert_eq!(e.origem, "cli");
+    assert_eq!(e.alvo.as_deref(), Some("…8888"));
+    assert!(!e.ator.is_empty(), "quem rodou o comando");
+    e
+}
+
+/// A entrada de `…8888` no resumo `depois` de um evento.
+fn entrada_no_depois(e: &auditoria::Evento) -> Option<serde_json::Value> {
+    e.depois["users"]
+        .as_array()
+        .and_then(|us| us.iter().find(|u| u["alvo"] == "…8888").cloned())
+}
+
+/// `allow` e `remove` gravam `allow` por fora do motor de mutacao — e ate a
+/// #1414 gravavam SEM audit. Agora cada escrita que muda algo deixa um
+/// evento; a repeticao idempotente (nada mudou) nao deixa nada.
+#[test]
+fn allow_e_remove_legados_auditam_com_o_nome_do_subcomando() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = preparar(&dir, serde_json::json!({}));
+    let p = ScriptedPrompter::default();
+
+    assert_eq!(
+        run(Action::Allow(pedido(ENTRADA, false, false)), &ctx, &p),
+        0
+    );
+    assert_eq!(lista(&ctx, "allow"), vec![NUMERO.to_string()]);
+    let e = ultimo_evento(&ctx, "allow");
+    assert_eq!(audit(&ctx).len(), 1);
+    let entrada = entrada_no_depois(&e).expect("…8888 no depois");
+    assert_eq!(entrada["owner"], serde_json::json!(false));
+    assert!(
+        entrada_no_depois(&auditoria::Evento {
+            depois: e.antes.clone(),
+            ..e.clone()
+        })
+        .is_none(),
+        "no antes …8888 ainda nao existia"
+    );
+
+    // De novo: ja estava, nada mudou, nada e auditado.
+    assert_eq!(
+        run(Action::Allow(pedido(ENTRADA, false, false)), &ctx, &p),
+        0
+    );
+    assert_eq!(audit(&ctx).len(), 1, "o que nao mudou nao e auditado");
+
+    assert_eq!(run(Action::Remove(remocao(ENTRADA, false)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "remove");
+    assert_eq!(audit(&ctx).len(), 2);
+    assert!(entrada_no_depois(&e).is_none(), "saiu: {}", e.depois);
+
+    // Remover quem nao esta: sai 0 e nao audita.
+    assert_eq!(run(Action::Remove(remocao(ENTRADA, false)), &ctx, &p), 0);
+    assert_eq!(audit(&ctx).len(), 2);
+
+    let bruto = arquivo_de_audit(&ctx);
+    assert!(!bruto.contains(NUMERO), "audit com numero inteiro: {bruto}");
+}
+
+/// `owner` e `unowner` idem: `owner` (so no pod) e `unowner` deixam o nome do
+/// subcomando, e o `depois` diz o papel que ficou.
+#[test]
+fn owner_e_unowner_legados_auditam_com_o_nome_do_subcomando() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, false);
+    grava_config(
+        &ctx,
+        pod(),
+        Some(serde_json::json!({ "allow": [NUMERO] })),
+        Some(true),
+    );
+    let p = ScriptedPrompter::default();
+
+    assert_eq!(run(Action::Owner(papel(ENTRADA, true)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "owner");
+    assert_eq!(audit(&ctx).len(), 1);
+    assert_eq!(
+        entrada_no_depois(&e).expect("…8888")["owner"],
+        serde_json::json!(true)
+    );
+    // Ja era dono: nada muda, nada e auditado.
+    assert_eq!(run(Action::Owner(papel(ENTRADA, true)), &ctx, &p), 0);
+    assert_eq!(audit(&ctx).len(), 1);
+
+    assert_eq!(run(Action::Unowner(papel(ENTRADA, true)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "unowner");
+    assert_eq!(audit(&ctx).len(), 2);
+    let entrada = entrada_no_depois(&e).expect("o acesso sobrevive ao rebaixamento");
+    assert_eq!(entrada["owner"], serde_json::json!(false));
+    // Nao era mais dono: nada muda, nada e auditado.
+    assert_eq!(run(Action::Unowner(papel(ENTRADA, true)), &ctx, &p), 0);
+    assert_eq!(audit(&ctx).len(), 2);
+
+    let bruto = arquivo_de_audit(&ctx);
+    assert!(!bruto.contains(NUMERO), "audit com numero inteiro: {bruto}");
+}
+
+/// `allow --owner` e o subcomando `allow`: a acao e `allow`, e e o resumo
+/// `depois` que diz que o alvo entrou como dono.
+#[test]
+fn allow_owner_audita_como_allow_e_o_depois_diz_dono() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, false);
+    grava_config(&ctx, pod(), Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default();
+    assert_eq!(run(Action::Allow(pedido(ENTRADA, true, true)), &ctx, &p), 0);
+    let e = ultimo_evento(&ctx, "allow");
+    assert_eq!(
+        entrada_no_depois(&e).expect("…8888")["owner"],
+        serde_json::json!(true)
+    );
+    assert!(!arquivo_de_audit(&ctx).contains(NUMERO));
+}
+
+/// A recusa (65) e o cancelamento nao auditam — nada foi gravado.
+#[test]
+fn comandos_legados_recusados_nao_auditam() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = preparar(&dir, serde_json::json!({ "owners": [NUMERO] }));
+    let p = ScriptedPrompter::default();
+    assert_eq!(
+        run(Action::Allow(pedido("abc", false, false)), &ctx, &p),
+        acesso::EX_DATAERR
+    );
+    assert_eq!(
+        run(Action::Remove(remocao(ENTRADA, false)), &ctx, &p),
+        acesso::EX_USAGE,
+        "dono sem terminal e sem --yes"
+    );
+    assert!(audit(&ctx).is_empty());
+    assert!(!ctx.data_dir.join(auditoria::ARQUIVO).exists());
+}
+
+/// O mesmo contrato dos comandos novos: a mudanca gravada com o audit
+/// indisponivel sai 73 — a config ficou, e o operador fica sabendo.
+#[test]
+fn comando_legado_com_audit_indisponivel_grava_e_sai_73() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = preparar(&dir, serde_json::json!({}));
+    // Um ARQUIVO onde o audit quer um diretorio: `registrar` nao consegue
+    // criar `audit/`.
+    std::fs::create_dir_all(&ctx.data_dir).expect("data dir");
+    std::fs::write(ctx.data_dir.join("audit"), b"no lugar do diretorio").expect("arquivo");
+    let p = ScriptedPrompter::default();
+    assert_eq!(
+        run(Action::Allow(pedido(ENTRADA, false, false)), &ctx, &p),
+        73
+    );
+    assert_eq!(
+        lista(&ctx, "allow"),
+        vec![NUMERO.to_string()],
+        "a mudanca foi gravada mesmo assim"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1429: o wizard `link` oferece a politica depois do QR
+// ---------------------------------------------------------------------------
+
+/// As acoes do audit, mais recente primeiro.
+fn acoes(ctx: &Context) -> Vec<String> {
+    audit(ctx).into_iter().map(|e| e.acao).collect()
+}
+
+/// Enter em tudo: o numero entra com `read` sem escrita e a admissao fica
+/// `restricted` — pelo motor e pelo audit, como o `level` faria.
+#[test]
+fn wizard_com_defaults_grava_read_sem_escrita_e_restricted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    grava_config(&ctx, None, Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default().with_inputs(&[ENTRADA]);
+
+    let pos = pos_link(&ctx, &p, None, &Pedido::default()).expect("ok");
+    assert_eq!(pos.autorizados, 1);
+    assert!(p.asked("Nível de acesso"), "{:?}", p.seen_prompts.borrow());
+    assert!(
+        p.asked("escrita de arquivo"),
+        "write e perguntado fora de chat"
+    );
+    assert!(p.asked("Admissão"), "{:?}", p.seen_prompts.borrow());
+    assert_eq!(
+        principal(&ctx, NUMERO),
+        Principal::Usuario(Alcance::LEITURA),
+        "default seguro: read, sem escrita"
+    );
+    assert_eq!(settings_de(&ctx).access.admission, Admission::Restricted);
+    // `write off` e `restricted` nao mudam nada: nao viram evento.
+    assert_eq!(acoes(&ctx), vec!["level", "allow"]);
+    assert!(!arquivo_de_audit(&ctx).contains(NUMERO));
+    let texto = pos.resumo.join("\n");
+    assert!(texto.contains("restricted"), "{texto}");
+    assert!(texto.contains("…8888"), "{texto}");
+    assert!(!texto.contains(NUMERO), "{texto}");
+}
+
+/// `full` + escrita + `open` confirmado: os tres gravados, na ordem, e a
+/// abertura passou pelo MESMO aviso do `access open`.
+#[test]
+fn wizard_com_full_write_e_open_grava_os_tres_e_avisa() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    grava_config(&ctx, None, Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default()
+        .with_inputs(&[ENTRADA])
+        .with_selects(&[2, 1])
+        .and_confirms(&[true, true]);
+
+    let pos = pos_link(&ctx, &p, None, &Pedido::default()).expect("ok");
+    assert_eq!(
+        principal(&ctx, NUMERO),
+        Principal::Usuario(Alcance::COMPLETO)
+    );
+    assert!(
+        p.asked("QUALQUER"),
+        "o aviso de `open`: {:?}",
+        p.seen_prompts.borrow()
+    );
+    assert_eq!(settings_de(&ctx).access.admission, Admission::Open);
+    assert_eq!(
+        principal(&ctx, ESTRANHO),
+        Principal::Desconhecido(Alcance::CHAT),
+        "o desconhecido entra com o default"
+    );
+    assert_eq!(acoes(&ctx), vec!["open", "write", "level", "allow"]);
+    let texto = pos.resumo.join("\n");
+    assert!(texto.contains("open"), "{texto}");
+    assert!(!texto.contains(NUMERO), "{texto}");
+}
+
+/// `open` escolhido na lista, mas nao confirmado no aviso: fica `restricted`.
+#[test]
+fn wizard_open_escolhido_mas_nao_confirmado_fica_restricted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    grava_config(&ctx, None, Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default()
+        .with_inputs(&[ENTRADA])
+        .with_selects(&[1, 1]);
+
+    pos_link(&ctx, &p, None, &Pedido::default()).expect("ok");
+    assert!(p.asked("QUALQUER"));
+    assert_eq!(settings_de(&ctx).access.admission, Admission::Restricted);
+    assert!(!acoes(&ctx).iter().any(|a| a == "open"));
+}
+
+/// `chat` nao tem onde escrever: a pergunta de escrita nem aparece.
+#[test]
+fn wizard_em_chat_nao_pergunta_escrita() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    grava_config(&ctx, None, Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default()
+        .with_inputs(&[ENTRADA])
+        .with_selects(&[0]);
+
+    pos_link(&ctx, &p, None, &Pedido::default()).expect("ok");
+    assert!(
+        !p.asked("escrita de arquivo"),
+        "{:?}",
+        p.seen_prompts.borrow()
+    );
+    assert_eq!(principal(&ctx, NUMERO), Principal::Usuario(Alcance::CHAT));
+    assert_eq!(acoes(&ctx), vec!["level", "allow"]);
+}
+
+/// `link --allow <numero>` continua scriptavel: nenhuma pergunta, o numero
+/// entra como sempre entrou (sem teto), e so o `allow` e auditado.
+#[test]
+fn wizard_com_allow_pre_respondido_nao_pergunta_politica() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    grava_config(&ctx, None, Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default();
+
+    let pos = pos_link(&ctx, &p, None, &pedido(ENTRADA, false, false)).expect("ok");
+    assert_eq!(pos.autorizados, 1);
+    assert!(
+        p.seen_prompts.borrow().is_empty(),
+        "nada e perguntado: {:?}",
+        p.seen_prompts.borrow()
+    );
+    assert_eq!(
+        principal(&ctx, NUMERO),
+        Principal::Usuario(Alcance::COMPLETO),
+        "sem pergunta, sem teto — como o `allow`"
+    );
+    assert_eq!(acoes(&ctx), vec!["allow"]);
+}
+
+/// No pod, quem vira dono nao recebe pergunta de nivel (dono nao tem teto;
+/// o motor recusaria com `EDono`), mas a admissao e oferecida do mesmo jeito.
+#[test]
+fn wizard_dono_no_pod_nao_pergunta_nivel_mas_pergunta_admissao() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    grava_config(&ctx, pod(), Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default()
+        .with_inputs(&[ENTRADA])
+        .and_confirms(&[true]);
+
+    pos_link(&ctx, &p, None, &Pedido::default()).expect("ok");
+    assert!(p.asked("DONO"));
+    assert!(!p.asked("Nível de acesso"), "{:?}", p.seen_prompts.borrow());
+    assert!(!p.asked("escrita de arquivo"));
+    assert!(p.asked("Admissão"));
+    assert_eq!(principal(&ctx, NUMERO), Principal::Dono);
+    assert_eq!(acoes(&ctx), vec!["allow"]);
+}
+
+/// Resposta vazia no numero: nao ha para quem perguntar nivel, mas a
+/// admissao continua sendo decisao do wizard.
+#[test]
+fn wizard_sem_numero_ainda_pergunta_admissao() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    grava_config(&ctx, None, Some(serde_json::json!({})), Some(true));
+    let p = ScriptedPrompter::default().with_inputs(&[""]);
+
+    let pos = pos_link(&ctx, &p, None, &Pedido::default()).expect("ok");
+    assert_eq!(pos.autorizados, 0);
+    assert!(!p.asked("Nível de acesso"));
+    assert!(p.asked("Admissão"));
+    assert!(audit(&ctx).is_empty(), "nada mudou, nada auditado");
+}
+
+/// A funcao pura por tras do wizard: devolve as mutacoes na ordem em que
+/// foram respondidas e nao toca no disco — quem grava e o `aplicar`.
+#[test]
+fn perguntar_politica_devolve_as_mutacoes_na_ordem_sem_tocar_no_disco() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = ctx_in(&dir, true);
+    let antes = std::fs::read_dir(dir.path())
+        .map(|d| d.count())
+        .unwrap_or(0);
+
+    // Tudo no default: read (sem write, que nem e mutacao) e restricted.
+    let p = ScriptedPrompter::default();
+    let mutacoes = acesso_v2::perguntar_politica(&ctx, &p, Some(NUMERO), Alcance::CHAT);
+    assert_eq!(
+        mutacoes,
+        vec![
+            Mutacao::Nivel {
+                identidade: NUMERO.to_string(),
+                nivel: Nivel::Read
+            },
+            Mutacao::Admissao(Admission::Restricted),
+        ]
+    );
+    let prompts = p.seen_prompts.borrow().join("\n");
+    assert!(prompts.contains("…8888"), "{prompts}");
+    assert!(
+        !prompts.contains(NUMERO),
+        "nunca a identidade inteira: {prompts}"
+    );
+
+    // full + write + open confirmado.
+    let p = ScriptedPrompter::default()
+        .with_selects(&[2, 1])
+        .and_confirms(&[true, true]);
+    let mutacoes = acesso_v2::perguntar_politica(&ctx, &p, Some(NUMERO), Alcance::LEITURA);
+    assert_eq!(
+        mutacoes,
+        vec![
+            Mutacao::Nivel {
+                identidade: NUMERO.to_string(),
+                nivel: Nivel::Full
+            },
+            Mutacao::Write {
+                identidade: NUMERO.to_string(),
+                on: true
+            },
+            Mutacao::Admissao(Admission::Open),
+        ]
+    );
+
+    // Sem recem-autorizado: so a admissao. Em ingles tambem.
+    let mut en = ctx_in(&dir, true);
+    en.lang = Lang::En;
+    let p = ScriptedPrompter::default();
+    assert_eq!(
+        acesso_v2::perguntar_politica(&en, &p, None, Alcance::CHAT),
+        vec![Mutacao::Admissao(Admission::Restricted)]
+    );
+    assert!(p.asked("Admission"), "{:?}", p.seen_prompts.borrow());
+
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .map(|d| d.count())
+            .unwrap_or(0),
+        antes,
+        "perguntar nao grava nada"
+    );
+    assert!(!ctx.data_dir.join(auditoria::ARQUIVO).exists());
+}
+
+/// A linha do default do desconhecido diz o valor REAL da config, nas duas
+/// linguas, e aponta o comando que o muda.
+#[test]
+fn a_linha_do_default_do_desconhecido_diz_o_valor_real() {
+    let pt = acesso_v2::linha_do_default_do_desconhecido(Lang::Pt, Alcance::LEITURA);
+    assert!(pt.contains("read, write off"), "{pt}");
+    assert!(pt.contains("whatsapp access default"), "{pt}");
+    let en = acesso_v2::linha_do_default_do_desconhecido(Lang::En, Alcance::CHAT);
+    assert!(en.contains("chat, write off"), "{en}");
+    assert_ne!(pt, en);
+}

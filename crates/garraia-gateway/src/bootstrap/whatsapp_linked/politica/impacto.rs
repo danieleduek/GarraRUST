@@ -8,7 +8,7 @@
 //! duas politicas e nomeia o que cada principal ganha e perde — e o preview
 //! do `--dry-run` e o corpo do audit.
 
-use garraia_agents::capacidades::{capacidades_da_operacao_mcp, capacidades_nativas};
+use garraia_agents::capacidades::{Capacidade, capacidades_da_operacao_mcp, capacidades_nativas};
 use garraia_agents::modes::ToolGate;
 use garraia_config::ExecutionProfile;
 
@@ -23,6 +23,15 @@ pub struct Capacidades {
     pub leitura: bool,
     /// `file_write`
     pub escrita: bool,
+    /// `web_fetch` (classe `network.read`) — #1411.
+    pub web: bool,
+    /// Classe `memory.read`, pelo nome `memory_read` (#1411). Nenhuma
+    /// ferramenta nativa carrega a classe hoje: a coluna diz o que um
+    /// servidor MCP ou plugin de memoria com essa classe teria — e por isso
+    /// e falsa em piso com whitelist por nome (`search`), que nao a nomeia.
+    pub memoria_leitura: bool,
+    /// Classe `memory.write`, pelo nome `memory_write` (#1411). Idem.
+    pub memoria_escrita: bool,
     /// `bash`
     pub shell: bool,
     /// `device_execute`
@@ -41,6 +50,9 @@ impl Capacidades {
         [
             (self.leitura, "leitura de arquivo"),
             (self.escrita, "escrita de arquivo"),
+            (self.web, "web"),
+            (self.memoria_leitura, "memoria leitura"),
+            (self.memoria_escrita, "memoria escrita"),
             (self.shell, "shell"),
             (self.dispositivo, "dispositivo (executar)"),
             (self.mensagem, "enviar mensagem"),
@@ -125,6 +137,10 @@ pub fn efetivo(
         capacidades: Capacidades {
             leitura: nativa("file_read"),
             escrita: nativa("file_write"),
+            web: nativa("web_fetch"),
+            memoria_leitura: gate.permite_com_capacidades("memory_read", &[Capacidade::MemoryRead]),
+            memoria_escrita: gate
+                .permite_com_capacidades("memory_write", &[Capacidade::MemoryWrite]),
             shell: nativa("bash"),
             dispositivo: nativa("device_execute"),
             mensagem: nativa("telegram_send"),

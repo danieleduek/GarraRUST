@@ -72,6 +72,10 @@ use super::config::channel_gates;
 use super::execution::politica_de_execucao;
 
 // ADR 0025 §4: Access Policy v2 — principal, nivel, teto.
+/// #1419/#1420: o motor do `doctor whatsapp` — a tabela pura que a CLI e o
+/// card "Test WhatsApp" do Web Console rodam.
+pub mod doctor;
+pub mod numero;
 pub mod politica;
 pub mod rejeicoes;
 pub use politica::{
@@ -471,7 +475,13 @@ impl LinkedSettings {
     /// Responde em grupo? O `reply_in_groups` legado **ou**
     /// `access.groups.enabled`.
     pub fn responde_em_grupo(&self) -> bool {
-        self.reply_in_groups || self.access.groups.enabled
+        // #1501: `access.groups.enabled` declarado vence o legado nos dois
+        // sentidos; sem ele, o `reply_in_groups` continua ligando.
+        if self.access.groups.declarado {
+            self.access.groups.enabled
+        } else {
+            self.reply_in_groups || self.access.groups.enabled
+        }
     }
 
     /// As chaves de portao de toda identidade declarada, de qualquer fonte.
@@ -1284,13 +1294,17 @@ fn avisar_escolha_do_operador(
 /// - `is_group` sem opt-in: ver [`LinkedSettings::reply_in_groups`].
 /// - sem `text`: midia nao vai ao modelo nesta fatia.
 pub fn deve_responder(msg: &InboundMessage, settings: &LinkedSettings) -> bool {
-    if msg.from_me {
-        return false;
-    }
-    if msg.is_group && !settings.responde_em_grupo() {
-        return false;
-    }
-    msg.text.as_deref().is_some_and(|t| !t.trim().is_empty())
+    merece_turno(msg) && !(msg.is_group && !settings.responde_em_grupo())
+}
+
+/// A parte de [`deve_responder`] que NAO depende da politica: nao e da
+/// propria conta e tem texto. E o que o `deliver` decide sozinho; o filtro de
+/// grupo depende da secao `access`, que muda a quente, e por isso e decidido
+/// no turno com a config VIVA (#1412/#1423) — com os settings do boot, ligar
+/// os grupos a quente nao valia ate o restart, e desliga-los a quente nao
+/// impedia o turno.
+pub fn merece_turno(msg: &InboundMessage) -> bool {
+    !msg.from_me && msg.text.as_deref().is_some_and(|t| !t.trim().is_empty())
 }
 
 /// Os settings que valem para **um turno** (#1345).
@@ -1420,6 +1434,12 @@ impl GatewaySink {
         // #1345: a admissao deste turno sai da config VIVA, nao da do boot.
         // Ver `admissao_vigente` e `settings_do_turno`.
         let settings = settings_do_turno(&state, &settings);
+        // #1412/#1423: o filtro de grupo com a config VIVA (o `deliver` so
+        // conhece o boot). Grupo desligado nao e recusa de remetente: e
+        // silencio, como sempre foi.
+        if !deve_responder(&msg, &settings) {
+            return;
+        }
         // #1422: toda recusa e contada por MOTIVO (so o final da identidade),
         // para o console dizer por que alguem nao recebe resposta.
         let (admissao, pareado, motivo) = if !settings.enabled {
@@ -1664,7 +1684,9 @@ impl GatewaySink {
 
 impl InboundSink for GatewaySink {
     fn deliver(&self, message: InboundMessage) {
-        if !deve_responder(&message, &self.settings) {
+        // So o que nao depende da politica; o filtro de grupo e do turno,
+        // com a config viva (#1412/#1423).
+        if !merece_turno(&message) {
             return;
         }
         let state = Arc::clone(&self.state);

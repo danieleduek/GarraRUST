@@ -70,7 +70,7 @@ use crate::state::SharedState;
 /// rendering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum CheckStatus {
+pub(crate) enum CheckStatus {
     /// All good.
     Ok,
     /// Functional but with a caveat (Ollama optional, etc.).
@@ -85,6 +85,21 @@ enum CheckStatus {
     /// Optional subsystem that this install never configured. Not a defect,
     /// and never the same thing as a configured subsystem that fails (#1437).
     NotConfigured,
+}
+
+impl CheckStatus {
+    /// A grafia serializada (`snake_case`), para quem consome o relatorio em
+    /// processo e compara texto — o mesmo que a rota devolve, byte a byte.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CheckStatus::Ok => "ok",
+            CheckStatus::Warning => "warning",
+            CheckStatus::Error => "error",
+            CheckStatus::Skipped => "skipped",
+            CheckStatus::Disabled => "disabled",
+            CheckStatus::NotConfigured => "not_configured",
+        }
+    }
 }
 
 /// The report's aggregate: `error` > `warning` > `ok`.
@@ -110,20 +125,20 @@ fn status_agregado(checks: &[DiagnosticCheck]) -> &'static str {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct DiagnosticCheck {
+pub(crate) struct DiagnosticCheck {
     /// Stable id ("gateway.responds", "secrets.jwt", ...).
-    id: &'static str,
+    pub(crate) id: &'static str,
     /// Human label rendered in the UI.
-    label: &'static str,
-    status: CheckStatus,
+    pub(crate) label: &'static str,
+    pub(crate) status: CheckStatus,
     /// Short evidence string. Never contains secret values.
-    detail: String,
+    pub(crate) detail: String,
     /// Suggested next step when status != Ok. `None` when not applicable.
     ///
     /// `String` e nao `&'static str` desde a #1238: o passo do
     /// `whatsapp.linked` precisa citar o diretorio real da ponte, e um
     /// "rode `npm ci`" sem dizer onde manda a pessoa procurar.
-    next_step: Option<String>,
+    pub(crate) next_step: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,7 +152,7 @@ pub struct DiagnosticsReport {
     /// Wall-clock timestamp at report generation (server's clock, UTC).
     generated_at: String,
     /// Each per-subsystem check.
-    checks: Vec<DiagnosticCheck>,
+    pub(crate) checks: Vec<DiagnosticCheck>,
 }
 
 fn now_iso8601() -> String {
@@ -1216,6 +1231,15 @@ fn mcp_filesystem_pinned_check(
 
 /// GET /api/diagnostics — full diagnostic report.
 pub async fn diagnostics_handler(State(state): State<SharedState>) -> Json<DiagnosticsReport> {
+    Json(relatorio(&state).await)
+}
+
+/// O relatorio inteiro, em processo — a MESMA funcao por tras do
+/// `GET /api/diagnostics`. Existe para quem ja esta dentro do gateway (#1420:
+/// o `doctor whatsapp` do console) ler o que o proprio processo sabe sem dar
+/// a volta por HTTP — e para o console e a CLI, que le a rota, verem
+/// exatamente as mesmas linhas.
+pub(crate) async fn relatorio(state: &SharedState) -> DiagnosticsReport {
     let mut checks: Vec<DiagnosticCheck> = Vec::new();
 
     // 1. Gateway responds — we are responding right now, so this is OK.
@@ -1367,6 +1391,19 @@ pub async fn diagnostics_handler(State(state): State<SharedState>) -> Json<Diagn
             )),
             _ => None,
         };
+        // #1416: sem sessao, o diagnostico so afirma o que a instalacao
+        // garante: com `SomenteSessao` NENHUMA sessao sem projeto tem raiz
+        // (e o operador precisa saber); repositorio e por sessao — nao se
+        // afirma aqui.
+        // Resolvido no boot, nunca por request (guarda `o_handler_nao_resolve_as_raizes_das_file_tools_por_request`).
+        let fonte = state.raizes_das_file_tools.fonte;
+        let contexto = crate::capacidades_registro::ContextoDaSessao {
+            tem_raiz: Some(!matches!(
+                fonte,
+                crate::bootstrap::FonteDasRaizesDasFileTools::SomenteSessao
+            )),
+            tem_repositorio: None,
+        };
         let registro =
             crate::capacidades_registro::registro(&crate::capacidades_registro::Entradas {
                 inventario: &inventario,
@@ -1375,6 +1412,7 @@ pub async fn diagnostics_handler(State(state): State<SharedState>) -> Json<Diagn
                 mcp: &mcp,
                 bash_desligado,
                 restrito: false,
+                contexto,
             });
         checks.push(tools_capabilities_check(&registro));
     }
@@ -1618,13 +1656,13 @@ pub async fn diagnostics_handler(State(state): State<SharedState>) -> Json<Diagn
     // `not_configured` sao neutros (#1437) — ver `status_agregado`.
     let status = status_agregado(&checks);
 
-    Json(DiagnosticsReport {
+    DiagnosticsReport {
         status,
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: state.boot_time.elapsed().as_secs(),
         generated_at: now_iso8601(),
         checks,
-    })
+    }
 }
 
 #[cfg(test)]

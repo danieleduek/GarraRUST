@@ -20,6 +20,9 @@ use super::npx_cache::{self, McpFailureCause};
 use super::tool_bridge::McpTool;
 use crate::tools::Tool;
 
+/// #1438: quedas e reconexoes para o registro de confiabilidade.
+mod observar;
+
 /// Vet an MCP server URL before dialling it.
 ///
 /// `IpScope::AllowPrivate` is deliberate and load-bearing: MCP servers are
@@ -329,6 +332,10 @@ pub struct McpManager {
     /// Without this, an exhausted server parked in `pending` logged the same
     /// `error!` on every 30s tick, forever.
     exhausted_reported: Arc<RwLock<HashSet<String>>>,
+    /// #1438: o registro de confiabilidade (quedas e reconexoes por
+    /// servidor). `None` ate o dono do processo entregar um — o gateway
+    /// entrega o do `AgentRuntime` no boot. Ver `manager/observar.rs`.
+    observabilidade: std::sync::RwLock<Option<Arc<crate::observabilidade::Observabilidade>>>,
 }
 
 /// `(name, params, allowed_tools)` for one server needing a (re)connect.
@@ -358,6 +365,7 @@ impl McpManager {
             failures: Arc::new(RwLock::new(HashMap::new())),
             npx_recovered: Arc::new(RwLock::new(HashSet::new())),
             exhausted_reported: Arc::new(RwLock::new(HashSet::new())),
+            observabilidade: std::sync::RwLock::new(None),
         }
     }
 
@@ -1609,6 +1617,9 @@ impl McpManager {
     async fn check_and_reconnect(&self) {
         let (to_reconnect, stable): (Vec<ReconnectTarget>, Vec<String>) = {
             let conns = self.connections.read().await;
+            // #1438: vivo/morto de cada transporte; o registro conta a queda
+            // na transicao, e nao a cada tick de backoff.
+            self.observar_transportes(conns.iter().map(|(n, c)| (n.as_str(), c.is_alive())));
             let dead = conns
                 .iter()
                 .filter(|(_, conn)| !conn.is_alive())
@@ -1761,6 +1772,7 @@ impl McpManager {
                 }
             };
 
+            self.observar_reconexao(&name, result.is_ok());
             match result {
                 Ok(()) => {
                     self.exhausted_reported.write().await.remove(&name);

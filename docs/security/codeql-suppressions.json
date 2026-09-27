@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/base.json",
   "schema_version": "1.2.0",
   "repo": "michelbr84/GarraRUST",
-  "last_updated": "2026-09-21",
+  "last_updated": "2026-09-26",
   "audit_expiration": "2026-11-28",
   "policy": "no-bulk-suppression",
   "linear_owner": "GAR-491",
@@ -416,7 +416,7 @@
       "alert_number": 176,
       "rule_id": "rust/cleartext-logging",
       "path": "crates/garraia-cli/src/whatsapp.rs",
-      "line": 1358,
+      "line": 1369,
       "sink_snippet": "store.dir().display()",
       "disposition": "dismissed-false-positive",
       "dismissed_reason": "false_positive",
@@ -425,16 +425,16 @@
       "ledger_md_anchor": "alert-176"
     },
     {
-      "alert_number": 174,
+      "alert_number": 179,
       "rule_id": "rust/path-injection",
       "path": "crates/garraia-channels/src/whatsapp_linked/bridge.rs",
       "line": 639,
       "sink_snippet": "dir.join(\"node_modules\").is_dir()",
       "disposition": "dismissed-false-positive",
       "dismissed_reason": "false_positive",
-      "justification": "Falso-positivo da mesma classe do #173 (caminho sob o data dir da propria maquina). O `dir` que chega a `deps_installed` — e, pela mesma origem, a `materialize` e `npm_ci` — e o diretorio do bridge Node, derivado de `AppConfig::resolved_data_dir()` (crates/garraia-config/src/model.rs: `config.data_dir` do config.yml do operador, ou o diretorio de config padrao + `data`), pelas duas unicas fontes de producao: `bridge_dir(&config.resolved_data_dir())` no gateway (crates/garraia-gateway/src/bootstrap/whatsapp_linked.rs) e `ctx.bridge_dir()` na CLI (crates/garraia-cli/src/whatsapp.rs). Nenhum byte de request HTTP, de mensagem de canal ou de tool call de LLM alcanca esse caminho; quem controla o config.yml ja controla o processo inteiro. O CodeQL marca caminho vindo de config como 'user-provided' porque nao distingue operador local de remetente remoto — a mesma limitacao registrada nos 16 `rust/path-injection` do GAR-490 (#67-#82) e no #173. O unico componente de forma externa em `materialize` era o NOME de cada asset (trait `BridgeAssets`, publico para fontes futuras de bridge), e ele passou a ser validado por allowlist de segmento unico `[A-Za-z0-9._-]{1,255}` ANTES de qualquer efeito colateral (PR #1315, `validar_nome_de_asset`; regressao `materialize_recusa_nome_de_asset_que_escapa_do_dir` cobre `../escapou`, `/etc/passwd`, `a\\\\b`, `..`, `sub/dir.mjs` e NUL, e afirma que o diretorio de destino nem nasce). Quando a #1315 entrou em main (47dea8b, 2026-09-21) o alerta migrou do sink `dir.join(file.name)` de `materialize` para `dir.join(\"node_modules\")` de `deps_installed` — confirmacao de que o dado marcado e o `dir`, nao o nome de arquivo, e de que a correcao de codigo fechou o que era corrigivel. Deixa de valer se o diretorio do bridge (ou `data_dir`) passar a ser derivado de dado de request, de canal ou de LLM: nesse dia a supressao cai e o caminho precisa de canonicalizacao + confinamento, como o `FileJail` das file tools (#1244).",
+      "justification": "Renumerado de #174 em 2026-09-26: o GitHub fechou o #174 como fixed quando deps_installed moveu de :545 para :639 e abriu o #179 no mesmo sink, com o mesmo fluxo (diagnostics_handler -> State -> config.data_dir -> bridge_dir -> deps_installed), conferido no SARIF da analise 1844788717. Falso-positivo da mesma classe do #173 (caminho sob o data dir da propria maquina). O `dir` que chega a `deps_installed` — e, pela mesma origem, a `materialize` e `npm_ci` — e o diretorio do bridge Node, derivado de `AppConfig::resolved_data_dir()` (crates/garraia-config/src/model.rs: `config.data_dir` do config.yml do operador, ou o diretorio de config padrao + `data`), pelas duas unicas fontes de producao: `bridge_dir(&config.resolved_data_dir())` no gateway (crates/garraia-gateway/src/bootstrap/whatsapp_linked.rs) e `ctx.bridge_dir()` na CLI (crates/garraia-cli/src/whatsapp.rs). Nenhum byte de request HTTP, de mensagem de canal ou de tool call de LLM alcanca esse caminho; quem controla o config.yml ja controla o processo inteiro. O CodeQL marca caminho vindo de config como 'user-provided' porque nao distingue operador local de remetente remoto — a mesma limitacao registrada nos 16 `rust/path-injection` do GAR-490 (#67-#82) e no #173. O unico componente de forma externa em `materialize` era o NOME de cada asset (trait `BridgeAssets`, publico para fontes futuras de bridge), e ele passou a ser validado por allowlist de segmento unico `[A-Za-z0-9._-]{1,255}` ANTES de qualquer efeito colateral (PR #1315, `validar_nome_de_asset`; regressao `materialize_recusa_nome_de_asset_que_escapa_do_dir` cobre `../escapou`, `/etc/passwd`, `a\\\\b`, `..`, `sub/dir.mjs` e NUL, e afirma que o diretorio de destino nem nasce). Quando a #1315 entrou em main (47dea8b, 2026-09-21) o alerta migrou do sink `dir.join(file.name)` de `materialize` para `dir.join(\"node_modules\")` de `deps_installed` — confirmacao de que o dado marcado e o `dir`, nao o nome de arquivo, e de que a correcao de codigo fechou o que era corrigivel. Deixa de valer se o diretorio do bridge (ou `data_dir`) passar a ser derivado de dado de request, de canal ou de LLM: nesse dia a supressao cai e o caminho precisa de canonicalizacao + confinamento, como o `FileJail` das file tools (#1244).",
       "gar_ref": "PR-1315",
-      "ledger_md_anchor": "alert-174"
+      "ledger_md_anchor": "alert-179"
     },
     {
       "alert_number": 178,

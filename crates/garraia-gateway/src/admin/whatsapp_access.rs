@@ -28,14 +28,12 @@ use serde_json::{Value, json};
 use super::middleware::{AuthenticatedAdmin, extract_ip};
 use super::rbac::{Action, Resource, check_permission};
 use super::shared::AdminState;
+use crate::bootstrap::whatsapp_linked_numero as numero;
 use crate::bootstrap::whatsapp_linked_politica::mutacao::{
     self, Mutacao, MutacaoInvalida, mascarar,
 };
 use crate::bootstrap::whatsapp_linked_politica::{Admission, Alcance, auditoria, impacto, visao};
-use crate::bootstrap::{
-    WHATSAPP_LINKED_CONFIG_KEY as CONFIG_KEY, whatsapp_linked_normalizar_identidade,
-    whatsapp_linked_settings,
-};
+use crate::bootstrap::{WHATSAPP_LINKED_CONFIG_KEY as CONFIG_KEY, whatsapp_linked_settings};
 
 /// O corpo de `POST /admin/api/whatsapp/access`.
 ///
@@ -126,10 +124,28 @@ pub fn identidade_por_last4(
 /// O que a API muda, traduzido para o motor. Puro; `Err` e o texto do 400.
 /// `identidade_resolvida` e o que [`identidade_por_last4`] achou quando o
 /// pedido veio por `identity_last4`.
+/// Por que um pedido nao vira `Mutacao`: `codigo` estavel para o cliente
+/// (`error_code`), `texto` para o humano. `From<String>` mantem os erros
+/// genericos com `codigo: invalid_request`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PedidoInvalido {
+    pub codigo: &'static str,
+    pub texto: String,
+}
+
+impl From<String> for PedidoInvalido {
+    fn from(texto: String) -> Self {
+        Self {
+            codigo: "invalid_request",
+            texto,
+        }
+    }
+}
+
 pub fn mutacao_do_pedido(
     req: &AccessMutationRequest,
     identidade_resolvida: Option<&str>,
-) -> Result<Mutacao, String> {
+) -> Result<Mutacao, PedidoInvalido> {
     let nivel = || -> Result<Nivel, String> {
         let s = req
             .level
@@ -146,29 +162,33 @@ pub fn mutacao_do_pedido(
             write: req.write.unwrap_or(false),
         })
     };
-    let identidade = || -> Result<String, String> {
-        let raw = req
+    let identidade = || -> Result<String, PedidoInvalido> {
+        // #1403: `identity` crua (o que o console manda) passa pela MESMA
+        // validacao da CLI — `+` e codigo do pais obrigatorios, ou
+        // `<digitos>@lid`. Sem o `+` nao ha como saber se o codigo do pais
+        // veio, e um numero gravado sem ele nunca casa com o remetente.
+        if let Some(raw) = req
             .identity
             .as_deref()
-            .or(identidade_resolvida)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                "`identity` e obrigatoria: numero com codigo do pais (com ou sem `+`) ou JID `@lid`"
-                    .to_string()
-            })?;
-        let id = whatsapp_linked_normalizar_identidade(raw);
-        let numero_ok = id.chars().all(|c| c.is_ascii_digit())
-            && (6..=15).contains(&id.len())
-            && !id.starts_with('0');
-        let lid_ok = id
-            .strip_suffix("@lid")
-            .is_some_and(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_digit()));
-        if numero_ok || lid_ok {
-            Ok(id)
-        } else {
-            Err("`identity` invalida: numero com codigo do pais (6 a 15 digitos, sem zero inicial) ou JID `<digitos>@lid`".to_string())
+        {
+            return numero::normalizar_numero(raw).map_err(|e| PedidoInvalido {
+                codigo: e.codigo(),
+                texto: format!("`identity` invalida: {}", e.descricao()),
+            });
         }
+        // `identity_last4` ja foi resolvida contra a config: identidade
+        // declarada, na forma gravada — nao passa de novo pelo `+`.
+        if let Some(id) = identidade_resolvida {
+            return Ok(id.to_string());
+        }
+        Err(PedidoInvalido {
+            codigo: "identity_required",
+            texto:
+                "`identity` e obrigatoria: numero com `+` e codigo do pais, ou JID `<digitos>@lid`"
+                    .to_string(),
+        })
     };
     let jid = || -> Result<String, String> {
         let j = req
@@ -219,7 +239,7 @@ pub fn mutacao_do_pedido(
             alcance: alcance()?,
         }),
         "reset" => Ok(Mutacao::Reset),
-        outra => Err(format!("`action` desconhecida: `{outra}` (vale {ACOES})")),
+        outra => Err(format!("`action` desconhecida: `{outra}` (vale {ACOES})").into()),
     }
 }
 
@@ -231,6 +251,19 @@ fn carregar() -> Result<(ConfigLoader, AppConfig), String> {
 
 fn erro(status: StatusCode, texto: impl Into<String>) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": texto.into() })))
+}
+
+/// Erro com `error_code` estavel (#1403): o console mostra o texto, o script
+/// decide pelo codigo.
+fn erro_com_codigo(
+    status: StatusCode,
+    texto: impl Into<String>,
+    codigo: &'static str,
+) -> (StatusCode, Json<Value>) {
+    (
+        status,
+        Json(json!({ "error": texto.into(), "error_code": codigo })),
+    )
 }
 
 fn proibido() -> (StatusCode, Json<Value>) {
@@ -309,7 +342,7 @@ pub async fn admin_whatsapp_access_mutate(
     };
     let mutacao = match mutacao_do_pedido(&req, resolvida.as_deref()) {
         Ok(m) => m,
-        Err(texto) => return erro(StatusCode::BAD_REQUEST, texto),
+        Err(e) => return erro_com_codigo(StatusCode::BAD_REQUEST, e.texto, e.codigo),
     };
     let mut config = config;
     let secao = config

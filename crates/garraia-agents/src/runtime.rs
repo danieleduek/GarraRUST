@@ -21,6 +21,7 @@ use crate::embeddings::EmbeddingProvider;
 use crate::exec_context::ExecContext;
 use crate::execution_budget::{ExecutionBudget, VereditoDeLoop};
 use crate::memory_extractor::LlmMemoryExtractor;
+use crate::observabilidade::Desfecho;
 use crate::provider_resilience::ResilienceManager;
 use crate::providers::{
     ChatMessage, ChatRole, ContentBlock, LlmProvider, LlmRequest, LlmResponse, MessagePart,
@@ -308,6 +309,12 @@ pub struct AgentRuntime {
     /// ponto que gateway e CLI compartilham. Toda a logica vive em
     /// `tools::breaker`; aqui so as chamadas.
     breakers: crate::tools::breaker::Breakers,
+    /// #1438: contadores locais de confiabilidade (desfecho e latencia por
+    /// ferramenta, MCP, ponte de canal, tendencia de armazenamento). `Arc`
+    /// porque o gateway entrega o MESMO registro ao `McpManager` e ao
+    /// supervisor da ponte. A logica vive em `crate::observabilidade` e em
+    /// `runtime/observar.rs`; aqui so as chamadas.
+    observabilidade: Arc<crate::observabilidade::Observabilidade>,
 }
 
 /// O TEXTO do aviso de ferramenta MCP escondida pelo whitelist (#1264).
@@ -907,6 +914,7 @@ impl AgentRuntime {
             pending_approvals: crate::tools::pending_approval::PendingApprovals::new(),
             workspace_padrao: None,
             breakers: crate::tools::breaker::Breakers::new(),
+            observabilidade: Arc::new(crate::observabilidade::Observabilidade::new()),
         }
     }
 
@@ -3133,6 +3141,8 @@ impl AgentRuntime {
             // de `saida_sem_marcador_alheio`.
             let recusa =
                 neutralizar_marcadores(&portao.explica_recusa(name, self.capacidades_de(name)));
+            // #1438: rejeicao de politica, contada por ferramenta.
+            self.observar_recusa(name, Desfecho::NegadaPelaPolitica);
             // #1226 (achado de revisao): fecha o `tool_started` de cima.
             // Sem isto, um passo negado dentro de um `tool_program` deixava
             // um inicio sem fim entre o par do proprio programa — a UI de
@@ -3163,6 +3173,7 @@ impl AgentRuntime {
         let disponibilidade = self.disponibilidade_de(name);
         if !disponibilidade.e_disponivel() {
             let recusa = neutralizar_marcadores(&disponibilidade.explicacao(name));
+            self.observar_recusa(name, Desfecho::Indisponivel);
             if let Some(sink) = sink.filter(|s| s.wants_tool_events()) {
                 sink.tool_finished(
                     name,
@@ -3189,6 +3200,7 @@ impl AgentRuntime {
         let breaker = self.breakers.estado(&context.session_id, name, iniciado_em);
         if let Some(recusa) = breaker.explicacao(name, iniciado_em) {
             let recusa = neutralizar_marcadores(&recusa);
+            self.observar_recusa(name, Desfecho::RecusadaPeloBreaker);
             if let Some(sink) = sink.filter(|s| s.wants_tool_events()) {
                 sink.tool_finished(
                     name,
@@ -3341,12 +3353,14 @@ impl AgentRuntime {
         let output = saida_sem_marcador_alheio(output);
         // #1417: toda saida alimenta o breaker da sessao — sucesso fecha,
         // falha classificada abre (ou conta). Pedido de confirmacao e neutro.
-        self.breakers.registrar(
+        let abriu_breaker = self.breakers.registrar(
             &context.session_id,
             name,
             &output,
             std::time::Instant::now(),
         );
+        // #1438: desfecho, latencia e a abertura que esta saida causou.
+        self.observar_saida(name, &output, iniciado_em.elapsed(), abriu_breaker);
 
         // W3 (v0.4.5): o texto de um pedido de confirmacao como o HUMANO o le,
         // sem o marcador interno. Calculado uma vez e usado nos dois lugares
@@ -4165,6 +4179,9 @@ impl Default for AgentRuntime {
         Self::new()
     }
 }
+
+/// #1438: o que o despacho relata ao registro de confiabilidade.
+mod observar;
 
 #[cfg(test)]
 mod tests;
