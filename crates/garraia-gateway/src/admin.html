@@ -748,22 +748,22 @@ function updateSidebarVisibility() {
 var mcpRefreshTimer = null;
 
 // ─── Router ──────────────────────────────────────────────────────────
-var pages = {
+// `Map`, e nao objeto: o nome da pagina vem do `#hash` da URL, e num objeto
+// `pages[page]` alcanca o que Object.prototype herda (`#constructor`,
+// `#toString`) e o chama como se fosse pagina. `Map.has`/`Map.get` so
+// conhecem o que foi declarado (CodeQL js/unvalidated-dynamic-method-call).
+var pages = new Map(Object.entries({
   dashboard: pageDashboard, mcp: pageMcp, providers: pageProviders, secrets: pageSecrets,
   config: pageConfig, memory: pageMemory, tools: pageTools, channels: pageChannels,
   sessions: pageSessions, whatsapp_access: pageWhatsappAccess, logs: pageLogs, metrics: pageMetrics, alerts: pageAlerts,
   templates: pageTemplates, audit: pageAudit, security: pageSecurity, users: pageUsers,
   about: pageAbout, account: pageAccount
-};
+}));
 
 function navigate(page) {
   if (mcpRefreshTimer !== null) { clearInterval(mcpRefreshTimer); mcpRefreshTimer = null; }
   if (auditAutoRefresh !== null) { clearInterval(auditAutoRefresh); auditAutoRefresh = null; }
-  // So pagina DECLARADA em `pages`: `#constructor` ou `#toString` vindo da
-  // URL passava em `!pages[page]` (herdado de Object.prototype) e virava
-  // `pages[page]()` numa funcao que nao e pagina (CodeQL
-  // js/unvalidated-dynamic-method-call).
-  if (!Object.prototype.hasOwnProperty.call(pages, page)) page = 'dashboard';
+  if (!pages.has(page)) page = 'dashboard';
   currentPage = page;
   location.hash = '#' + page;
   document.getElementById('page-title').textContent = pageTitle(page);
@@ -771,7 +771,7 @@ function navigate(page) {
     item.classList.toggle('active', item.getAttribute('data-page') === page);
   });
   renderContent(loading());
-  pages[page]();
+  pages.get(page)();
 }
 
 function pageTitle(page) {
