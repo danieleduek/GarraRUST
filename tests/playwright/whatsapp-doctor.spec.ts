@@ -123,7 +123,10 @@ test.describe('WhatsApp doctor card', () => {
       const step = ((await linkedRow.getByTestId('wa-doctor-next-step').textContent()) ?? '').trim();
       expect(step).toContain('whatsapp');
       let dialogText: string | null = null;
-      page.on('dialog', async (d) => { dialogText = d.message(); await d.accept(); });
+      // The fallback prompt carries the instruction in its message and the
+      // command itself as the default value (`window.prompt(msg, cmd)` in
+      // admin.html) — so the command must be asserted against both fields.
+      page.on('dialog', async (d) => { dialogText = `${d.message()}\n${d.defaultValue()}`; await d.accept(); });
       const action = linkedRow.getByTestId('wa-doctor-action');
       await expect(action).toHaveText(/copy/i);
       await action.click();
@@ -149,7 +152,13 @@ test.describe('WhatsApp doctor card', () => {
     await runDoctor(page);
     const html = await page.getByTestId('wa-doctor').innerHTML();
     for (const re of SECRET_PATTERNS) expect(html).not.toMatch(re);
-    // And no full phone number: the doctor only ever emits counts.
-    expect(html).not.toMatch(/\+?\d{2}[\s()-]*\d{2}[\s()-]*9?\d{4}[\s-]?\d{4}/);
+    // And no full phone number: the doctor only ever emits counts. The
+    // pattern requires at least one separator between the first two groups
+    // plus digit boundaries on both ends — a formatted phone (like the one
+    // whatsapp-access.spec seeds) matches, but an unbroken 13-digit epoch
+    // timestamp inside an MCP server name (mcp-manager.spec creates
+    // `e2e-<verb>-<epochms>`, and the mcp.visibility row lists those names
+    // by design) does not.
+    expect(html).not.toMatch(/(?<!\d)(?:\+\d{1,3}[\s()-]*|\d{2}[\s()-]+)\d{2}[\s()-]*9?\d{4,5}[\s-]?\d{4}(?!\d)/);
   });
 });
