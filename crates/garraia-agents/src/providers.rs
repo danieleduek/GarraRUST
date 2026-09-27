@@ -211,9 +211,151 @@ pub(crate) fn erro_de_envio(contexto: &str, e: &reqwest::Error) -> Error {
     }
 }
 
+// ── Cliente HTTP dos providers de LLM ────────────────────────────────────────
+
+/// Prazo de conexao do cliente de LLM: um host morto tem de falhar rapido.
+pub const CONNECT_TIMEOUT_LLM: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Cliente HTTP para falar com um provider de LLM.
+///
+/// `inatividade` e o prazo maximo **sem nenhum byte chegando**, nao a duracao
+/// total da resposta. `None` desliga o prazo (e o que `timeouts.llm.default_secs
+/// = 0` quer dizer na config).
+///
+/// Ate aqui o bootstrap do gateway construia este cliente com
+/// `ClientBuilder::timeout`, que no reqwest cobre a requisicao INTEIRA, leitura
+/// do corpo inclusa. Uma resposta em streaming que demorasse mais que
+/// `timeouts.llm.default_secs` (120 s por padrao) era cortada no meio mesmo
+/// fluindo normalmente — loop agentico de varias voltas, ou o modelo local
+/// default, um 27B de ~18 GB — e o corte chegava ao runtime como "stream read
+/// error", sem nunca dizer que era um prazo. O alvo do prazo sempre foi
+/// *provedor mudo*, e mudo e ausencia de bytes, nao tempo de parede:
+/// `read_timeout` mede exatamente isso. Os providers dizem, nos dois,
+/// "responses stream for minutes" — e este cliente, passado por
+/// `with_client`, substitui o deles, entao tem de respeitar a mesma regra.
+///
+/// Redirects desligados, como no cliente default de cada provider (#1248,
+/// regra 14): um endpoint de LLM nunca faz 302 legitimo para outro host, e
+/// segui-lo contornaria o SSRF gate. O cliente antigo do bootstrap nao
+/// desligava redirects, entao substituia um cliente que os recusava por um
+/// que os seguia.
+pub fn http_client_para_llm(inatividade: Option<std::time::Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT_LLM)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(prazo) = inatividade {
+        builder = builder.read_timeout(prazo);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Servidor HTTP/1.1 de uma resposta so: manda os cabecalhos na hora e
+    /// depois `pedacos` bytes, um por vez, dormindo `pausa` antes de cada um.
+    /// Devolve a URL. E o formato de um provider vivo porem lento — e, com
+    /// `pausa` maior que o prazo, de um provider mudo.
+    async fn servidor_que_goteja(pedacos: usize, pausa: std::time::Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind efemero");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            // Consome o pedido ate o fim dos cabecalhos; o conteudo nao importa.
+            let mut buf = [0u8; 1024];
+            let mut lido = Vec::new();
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                lido.extend_from_slice(&buf[..n]);
+                if lido.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let cabecalho = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {pedacos}\r\nConnection: close\r\n\r\n"
+            );
+            socket
+                .write_all(cabecalho.as_bytes())
+                .await
+                .expect("cabecalho");
+            socket.flush().await.expect("flush");
+            for _ in 0..pedacos {
+                tokio::time::sleep(pausa).await;
+                if socket.write_all(b"x").await.is_err() {
+                    break;
+                }
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// Regressao do corte aos 120 s: uma resposta que demora mais que o prazo
+    /// no TOTAL, mas nunca fica muda por um prazo inteiro, tem de chegar ao
+    /// fim. O cliente antigo (`ClientBuilder::timeout`) a cortava — a segunda
+    /// metade do teste prova que o contraste e real e nao folga do servidor.
+    #[tokio::test]
+    async fn resposta_lenta_porem_viva_nao_e_cortada() {
+        let pausa = std::time::Duration::from_millis(100);
+        let prazo = std::time::Duration::from_millis(400);
+        // 8 pedacos x 100 ms = 800 ms de duracao total, o dobro do prazo.
+        let url = servidor_que_goteja(8, pausa).await;
+        let corpo = http_client_para_llm(Some(prazo))
+            .get(&url)
+            .send()
+            .await
+            .expect("cabecalhos chegam na hora")
+            .bytes()
+            .await
+            .expect("resposta viva nao pode ser cortada por prazo de inatividade");
+        assert_eq!(corpo.len(), 8, "os 8 pedacos tem de chegar");
+
+        let url = servidor_que_goteja(8, pausa).await;
+        let antigo = reqwest::Client::builder()
+            .timeout(prazo)
+            .build()
+            .expect("cliente");
+        let resultado = match antigo.get(&url).send().await {
+            Ok(resposta) => resposta.bytes().await.map(|b| b.len()),
+            Err(e) => Err(e),
+        };
+        let erro = resultado.expect_err("o prazo total antigo corta a resposta viva");
+        assert!(erro.is_timeout(), "o corte antigo era um timeout: {erro}");
+    }
+
+    /// O outro lado da mesma regra: provider que emudece por um prazo inteiro
+    /// ainda cai, e cai como transporte (timeout), que e o que o runtime
+    /// trata com fallback.
+    #[tokio::test]
+    async fn provedor_mudo_cai_pelo_prazo_de_inatividade() {
+        let prazo = std::time::Duration::from_millis(200);
+        let url = servidor_que_goteja(1, std::time::Duration::from_secs(2)).await;
+        let inicio = std::time::Instant::now();
+        let resultado = match http_client_para_llm(Some(prazo)).get(&url).send().await {
+            Ok(resposta) => resposta.bytes().await.map(|b| b.len()),
+            Err(e) => Err(e),
+        };
+        let erro = resultado.expect_err("silencio de 2 s com prazo de 200 ms tem de falhar");
+        assert!(
+            erro.is_timeout(),
+            "silencio e timeout, nao outra classe: {erro}"
+        );
+        assert!(
+            falha_de_transporte(&erro),
+            "o runtime so faz fallback do que e transporte: {erro}"
+        );
+        assert!(
+            inicio.elapsed() < std::time::Duration::from_secs(2),
+            "tem de cair pelo prazo, nao esperar o servidor terminar"
+        );
+    }
 
     /// Porta fechada em loopback: o unico erro de rede que um teste pode
     /// provocar sem depender de rede de verdade.

@@ -456,12 +456,15 @@ pub fn build_agent_runtime(config: &AppConfig) -> AgentRuntime {
     // early — before the "no API key" warnings that are the *symptom*.
     config::warn_if_vault_locked();
 
-    let llm_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(
-            config.timeouts.llm.default_secs,
-        ))
-        .build()
-        .unwrap_or_default();
+    // `timeouts.llm.default_secs` e prazo de INATIVIDADE (sem bytes chegando),
+    // nao de duracao total: `ClientBuilder::timeout` cobria a requisicao
+    // inteira, corpo em streaming incluso, e cortava aos 120 s um turno que
+    // so era longo. Zero desliga o prazo, como o `config check` ja avisava.
+    // Ver `garraia_agents::providers::http_client_para_llm`.
+    let llm_client = garraia_agents::providers::http_client_para_llm(
+        (config.timeouts.llm.default_secs > 0)
+            .then(|| std::time::Duration::from_secs(config.timeouts.llm.default_secs)),
+    );
 
     // --- LLM Providers ---
     for (name, llm_config) in &config.llm {

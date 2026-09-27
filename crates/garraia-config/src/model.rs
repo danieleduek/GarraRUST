@@ -1036,7 +1036,9 @@ fn default_health_timeout() -> u64 {
 /// ```yaml
 /// timeouts:
 ///   llm:
-///     default_secs: 120  # LLM responses podem demorar; 30s era curto demais
+///     default_secs: 120  # prazo de INATIVIDADE (sem bytes chegando), nao
+///                        # de duracao total; 0 desliga. Um turno longo porem
+///                        # vivo nunca e cortado por ele.
 ///   tts:
 ///     default_secs: 120
 ///   stt:
